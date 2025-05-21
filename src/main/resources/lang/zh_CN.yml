@@ -1,0 +1,43 @@
+command-helper:
+  - '&7'
+  - '  &f&l{pluginId} &7v{pluginVersion}'
+  - '&7'
+  - '  &7命令: &f/{command} &8\[...\]'
+  - '  &7参数:'
+  - '{subCommands}'
+  - '&7'
+command-sub:
+  - '    &8- [&f{name}](h=/{command} {name} {usage}&8- &7{description};suggest=/{command} {name})'
+  - '      &7{description}'
+command-argument-missing:
+  - '&8[&3&l{pluginId}&8] &7指令 &f{name} &7参数不足'
+  - '&8[&3&l{pluginId}&8] &7正确用法:'
+  - '&8[&3&l{pluginId}&8] &7/{command} {name} {usage}&8- &7{description}'
+command-argument-wrong:
+  - '&8[&3&l{pluginId}&8] &7指令 &f{name} &7参数有误'
+  - '&8[&3&l{pluginId}&8] &7正确用法:'
+  - '&8[&3&l{pluginId}&8] &7/{command} {name} {usage}&8- &7{description}'
+command-argument-unknown:
+  - '&8[&3&l{pluginId}&8] &7指令 &f{name} &7不存在'
+  - '&8[&3&l{pluginId}&8] &7你可能想要:'
+  - '&8[&3&l{pluginId}&8] &7/{command} {similar} {usage}&8- &7{description}'
+command-incorrect-sender: '&8[&3&l{pluginId}&8] &7指令 &f{name} &7只能由 &f玩家 &7执行'
+command-no-desc: '没有描述'
+command-subCommands-id-description: '查看手上物品ID'
+command-subCommands-pack-description: '打开创世神背包'
+command-subCommands-set-description: '设置选区内的方块'
+command-subCommands-set-usage: '&7[&8方块ID&7]'
+command-subCommands-replace-description: '替换选区内的方块'
+command-subCommands-replace-usage: '&7[&8原方块ID&7] &7[&8新方块ID&7]'
+command-subCommands-tool-description: '给予自己创世神工具'
+
+message-no-region: '&8[&3&l{pluginId}&8] &7请先选择一个区域'
+message-region-select-pos1: '&8[&3&l{pluginId}&8] &7已选择点1为: {x} {y} {z}'
+message-region-select-pos2: '&8[&3&l{pluginId}&8] &7已选择点2为: {x} {y} {z}'
+message-materialpack-not-enough:  '&8[&3&l{pluginId}&8] &7你的创世神背包没有 {material}x{amount}'
+message-materialpack-add-susses:  '&8[&3&l{pluginId}&8] &7已添加物品到创世神背包'
+message-set-susses:  '&8[&3&l{pluginId}&8] &7设置成功！'
+message-replace-susses:  '&8[&3&l{pluginId}&8] &7替换成功！'
+message-id-hand-empty: '&8[&3&l{pluginId}&8] &7你的手空空如也'
+message-id-info: '&8[&3&l{pluginId}&8] &7{material}的ID是: {id}'
+message-id-insert: "&7[点击复制]"
