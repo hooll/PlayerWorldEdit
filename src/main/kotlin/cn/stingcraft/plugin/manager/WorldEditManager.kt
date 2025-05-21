@@ -1,8 +1,6 @@
 package cn.stingcraft.plugin.manager
 
-import cn.stingcraft.plugin.until.ParticleUtil
 import cn.stingcraft.plugin.until.WorldEditTool
-import cn.stingcraft.plugin.util.getCuboidEdges
 import com.fastasyncworldedit.core.FaweAPI
 import com.sk89q.worldedit.EditSession
 import com.sk89q.worldedit.WorldEdit
@@ -12,21 +10,15 @@ import com.sk89q.worldedit.world.block.BlockTypes
 import org.bukkit.Location
 import org.bukkit.Material
 import org.bukkit.Particle
-import org.bukkit.World
 import org.bukkit.entity.Player
-import org.bukkit.util.Vector
 import taboolib.common.platform.function.submitAsync
 import taboolib.common.platform.service.PlatformExecutor
-import taboolib.module.effect.ParticleSpawner
 import taboolib.module.effect.createCube
 import taboolib.module.nms.ItemTagData
 import taboolib.module.nms.getItemTag
 import taboolib.platform.util.buildItem
 import taboolib.platform.util.toBukkitLocation
 import taboolib.platform.util.toProxyLocation
-import kotlin.math.max
-import kotlin.math.min
-import kotlin.math.sqrt
 
 class WorldEditManager {
 
