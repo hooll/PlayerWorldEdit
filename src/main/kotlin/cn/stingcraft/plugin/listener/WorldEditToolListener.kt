@@ -18,6 +18,7 @@ object WorldEditToolListener {
         val handItem = e.player.inventory.itemInMainHand
         if (handItem.isAir) return
         if (handItem.getItemTag().getDeep("playerworldedit")?.asString() != "true") return
+        e.isCancelled = true
         when(e.action){
             Action.LEFT_CLICK_BLOCK -> {
                 val loc = e.clickedBlock?.boundingBox?.center?.toLocation(e.player.world) ?:return
@@ -26,8 +27,10 @@ object WorldEditToolListener {
                     pluginId to "pluginId",
                     loc.x to "x",
                     loc.y to "y",
-                    loc.z to "z"
-                    )
+                    loc.z to "z",
+                    if (PlayerWorldEdit.worldEditManager.hasRegion(e.player))
+                    PlayerWorldEdit.worldEditManager.getCountInRegion(e.player) to "amount" else return
+                )
             }
             Action.RIGHT_CLICK_BLOCK -> {
                 val loc = e.clickedBlock?.boundingBox?.center?.toLocation(e.player.world) ?:return
@@ -40,12 +43,13 @@ object WorldEditToolListener {
                     pluginId to "pluginId",
                     loc.x to "x",
                     loc.y to "y",
-                    loc.z to "z"
+                    loc.z to "z",
+                    if (PlayerWorldEdit.worldEditManager.hasRegion(e.player))
+                        PlayerWorldEdit.worldEditManager.getCountInRegion(e.player) to "amount" else return
                 )
             }
             else -> { return }
         }
-        e.isCancelled = true
     }
 
 }

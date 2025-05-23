@@ -1,0 +1,20 @@
+material-pack-gui:
+  title: '&f材料背包 &4| 切勿放置其他物品 仅放材料'
+  lore:
+    take-1: "&7| 左键 取出 x1"
+    take-10: "&7| 左键 取出 x10"
+    take-64: "&7| 左键 取出 x64"
+    amount: "&7| 数量: &e%amount%"
+world-edit:
+  tool:
+    name: "&7[&f创世神镐&7]"
+    type: "DIAMOND_PICKAXE"
+    custom-model-data: 0
+    lore:
+      - "&7| 可在生存模式中使用的创世神功能",
+      - "&7| 使用 /pwe 了解使用方式",
+      - " ",
+      - "&f| 左键设置第一个点",
+      - "&f| 右键设置第二个点",
+      - " ",
+  region-particle: "VILLAGER_ANGRY"

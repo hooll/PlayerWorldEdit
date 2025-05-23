@@ -19,6 +19,7 @@ import taboolib.platform.util.giveItem
 object MaterialPackInventory {
 
     private val packManager = PlayerWorldEdit.packManager
+    private val settingManager = PlayerWorldEdit.settingManager
 
     fun open(player: Player) {
         val materialPack = PlayerWorldEdit.packManager.getMaterialPack(player)
@@ -28,18 +29,20 @@ object MaterialPackInventory {
 
 
     private fun build(player: Player,  materialPack: MaterialPack):Inventory{
-        return buildMenu<PageableChestImpl<MaterialEntry>>("&f材料背包 &4| 切勿放置其他物品 仅放材料".colored()) {
+        return buildMenu<PageableChestImpl<MaterialEntry>>(
+            settingManager.getMaterialPackGuiSettings().getString("title")?.colored() ?:"&f材料背包 &4| 切勿放置其他物品 仅放材料") {
             rows(6)
             slots(Slots.CENTER)
             elements { materialPack.materials.toList() }
             onGenerate { _, element, _, _ ->
                 return@onGenerate buildItem(element.material){
-                    lore += "&7| 数量: &e${element.amount}"
-                    lore += "&7| 左键 取出 x1"
+                    lore +=  settingManager.getMaterialPackGuiSettings().getString("lore.amount")
+                        ?.replace("%amount%",element.amount.toString()) ?: "&7| 数量: &e${element.amount}"
+                    lore += settingManager.getMaterialPackGuiSettings().getString("lore.take-1") ?: "&7| 左键 取出 x1"
                     if (element.amount >= 10)
-                    lore += "&7| 右键 取出 x10"
+                    lore += settingManager.getMaterialPackGuiSettings().getString("lore.take-10") ?: "&7| 右键 取出 x10"
                     if (element.amount >= 64)
-                    lore += "&7| shift + 右键 取出 x64"
+                    lore += settingManager.getMaterialPackGuiSettings().getString("lore.take-64") ?: "&7| shift + 右键 取出 x64"
                     colored()
                 }
             }

@@ -1,5 +1,6 @@
 package cn.stingcraft.plugin.manager
 
+import cn.stingcraft.plugin.PlayerWorldEdit
 import cn.stingcraft.plugin.until.WorldEditTool
 import com.fastasyncworldedit.core.FaweAPI
 import com.sk89q.worldedit.EditSession
@@ -13,6 +14,10 @@ import org.bukkit.Particle
 import org.bukkit.entity.Player
 import taboolib.common.platform.function.submitAsync
 import taboolib.common.platform.service.PlatformExecutor
+import taboolib.common5.util.parseUUID
+import taboolib.library.xseries.XMaterial
+import taboolib.library.xseries.XParticle
+import taboolib.library.xseries.parseToXMaterial
 import taboolib.module.effect.createCube
 import taboolib.module.nms.ItemTagData
 import taboolib.module.nms.getItemTag
@@ -26,16 +31,12 @@ class WorldEditManager {
 
     private val particleTasks = mutableMapOf<Player, PlatformExecutor.PlatformTask>()
 
-    private val posTool = buildItem(Material.DIAMOND_PICKAXE){
-        name = "&7[&f创世神镐&7]"
-        lore += listOf(
-            "&7| 可在生存模式中使用的创世神功能",
-            " ",
-            "&f| 左键设置第一个点",
-            "&f| 右键设置第二个点",
-            " ",
-            "&4| 仅可在领域区服使用"
-        )
+    private val settingManager = PlayerWorldEdit.settingManager
+
+    private val posTool = buildItem(settingManager.getWorldEditSettings().getString("tool.type")?.parseToXMaterial() ?:XMaterial.DIAMOND_PICKAXE){
+        name = settingManager.getWorldEditSettings().getString("tool.name") ?: "&7[&f创世神镐&7]"
+        lore += settingManager.getWorldEditSettings().getStringList("tool.lore")
+        customModelData = settingManager.getWorldEditSettings().getInt("tool.custom-model-data")
         colored()
     }.apply {
         val itemTag = getItemTag()
@@ -91,7 +92,11 @@ class WorldEditManager {
         val pos1 = getPlayerPos1(player)?: return
         val pos2 = getPlayerPos2(player) ?: return
         val cube = createCube(pos1.toProxyLocation(), pos2.toProxyLocation(),0.5){
-            player.spawnParticle(Particle.VILLAGER_HAPPY,it.toBukkitLocation(),1)
+            val particle = XParticle.
+            of(settingManager.getWorldEditSettings().getString("region-particle") ?: "VILLAGER_HAPPY")
+                .get().get()
+                ?: XParticle.HAPPY_VILLAGER.get()!!
+            player.spawnParticle(particle,it.toBukkitLocation(),1)
         }
         particleTasks[player] = submitAsync(period = 20) {
             if (tick >= 60*20) {

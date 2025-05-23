@@ -20,23 +20,23 @@ import top.maplex.arim.tools.commandhelper.createTabooLegacyStyleCommandHelper
 @CommandHeader("PlayerWorldEdit", aliases = ["pwe"], permissionDefault = PermissionDefault.TRUE)
 object MainCommand {
 
-    @CommandBody(permissionDefault = PermissionDefault.TRUE)
+    @CommandBody(permission = "PlayerWorldEdit.Use")
     val main = mainCommand {
         createTabooLegacyStyleCommandHelper()
     }
 
-    @CommandBody(permissionDefault = PermissionDefault.TRUE)
+    @CommandBody(permission = "PlayerWorldEdit.Use")
     val pack  = CommandPack.command
 
     @CommandBody(permission = "PlayerWorldEdit.Admin",permissionDefault = PermissionDefault.OP)
     val tool = CommandTool.command
 
-    @CommandBody(permissionDefault = PermissionDefault.TRUE)
+    @CommandBody(permission = "PlayerWorldEdit.Use")
     val set = CommandSet.command
 
-    @CommandBody(permissionDefault = PermissionDefault.TRUE)
+    @CommandBody(permission = "PlayerWorldEdit.Use")
     val replace = CommandReplace.command
 
-    @CommandBody(permissionDefault = PermissionDefault.TRUE)
+    @CommandBody(permission = "PlayerWorldEdit.Use")
     val id = CommandID.command
 }
