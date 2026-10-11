@@ -187,17 +187,17 @@ class WorldEditManager {
     }
 
     /**
-     * 替换区域方块
-     * @param player
-     * @param from
-     * @param to
-     * @return 是否实际执行
+     * 统计替换操作会命中多少方块 (按 WorldEdit 的过滤条件比较)
      */
-    fun replaceAreaBlock(player: Player, from: Material, to: Material): Boolean {
-        val region = getWERegion(player) ?: return false
-        val fromType = resolveBlockType(from) ?: return false
-        val toType = resolveBlockType(to) ?: return false
-        val record = UndoManager.snapshot(player.world.name, region, to)
+    private fun countReplaceTargets(record: UndoRecord?, fromType: BlockType): Int {
+        val fromBaseBlock = fromType.defaultState.toBaseBlock()
+        return record?.states?.count { it.toBaseBlock() == fromBaseBlock } ?: 0
+    }
+
+    /**
+     * 执行替换
+     */
+    private fun applyReplace(player: Player, region: CuboidRegion, fromType: BlockType, toType: BlockType, record: UndoRecord?) {
         val filterSet = setOf(fromType.defaultState.toBaseBlock())
         val weWorld = BukkitAdapter.adapt(player.world)
         WorldEdit.getInstance()
@@ -207,7 +207,6 @@ class WorldEditManager {
             }
         if (record != null) UndoManager.push(player, record, undoLimit())
         clearPlayerPos(player)
-        return true
     }
 
     /**
@@ -270,12 +269,21 @@ class WorldEditManager {
             player.sendLang("message-dominion-denied", pluginId to "pluginId", dominion to "dominion")
             return
         }
-        if (resolveBlockType(from) == null || resolveBlockType(to) == null) {
+        val fromType = resolveBlockType(from)
+        val toType = resolveBlockType(to)
+        if (fromType == null || toType == null) {
             player.sendLang("message-invalid-material", pluginId to "pluginId",
-                (if (resolveBlockType(from) == null) from else to).name to "material")
+                (if (fromType == null) from else to).name to "material")
             return
         }
-        val amount = getCountInRegion(player)
+        val region = getWERegion(player) ?: return
+        // 快照同时用于撤销和统计实际替换数量
+        val record = UndoManager.snapshot(player.world.name, region, to)
+        val amount = if (record == null) getCountInRegion(player) else countReplaceTargets(record, fromType)
+        if (amount <= 0) {
+            player.sendLang("message-replace-none", pluginId to "pluginId", from.displayName() to "material")
+            return
+        }
         if (!PlayerWorldEdit.packManager.hasEnoughMaterial(player, to, amount)) {
             player.sendLang("message-materialpack-not-enough",
                 pluginId to "pluginId",
@@ -284,10 +292,7 @@ class WorldEditManager {
             return
         }
         // 先执行, 成功后再扣材料, 避免扣了材料却没执行
-        if (!replaceAreaBlock(player, from, to)) {
-            player.sendLang("message-invalid-material", pluginId to "pluginId", to.name to "material")
-            return
-        }
+        applyReplace(player, region, fromType, toType, record)
         PlayerWorldEdit.packManager.removeMaterial(player, to, amount)
         player.sendLang("message-replace-susses", pluginId to "pluginId")
     }

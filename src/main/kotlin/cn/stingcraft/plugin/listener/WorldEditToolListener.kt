@@ -39,8 +39,9 @@ object WorldEditToolListener {
                     loc.x to "x",
                     loc.y to "y",
                     loc.z to "z",
-                    if (PlayerWorldEdit.worldEditManager.hasRegion(e.player))
-                    PlayerWorldEdit.worldEditManager.getCountInRegion(e.player) to "amount" else return
+                    // 区域未选完整时数量记 0, 消息照常发送 (原来会直接不发)
+                    (if (PlayerWorldEdit.worldEditManager.hasRegion(e.player))
+                        PlayerWorldEdit.worldEditManager.getCountInRegion(e.player) else 0) to "amount"
                 )
             }
             Action.RIGHT_CLICK_BLOCK -> {
@@ -57,8 +58,9 @@ object WorldEditToolListener {
                     loc.x to "x",
                     loc.y to "y",
                     loc.z to "z",
-                    if (PlayerWorldEdit.worldEditManager.hasRegion(e.player))
-                        PlayerWorldEdit.worldEditManager.getCountInRegion(e.player) to "amount" else return
+                    // 区域未选完整时数量记 0, 消息照常发送 (原来会直接不发)
+                    (if (PlayerWorldEdit.worldEditManager.hasRegion(e.player))
+                        PlayerWorldEdit.worldEditManager.getCountInRegion(e.player) else 0) to "amount"
                 )
             }
             else -> { return }
