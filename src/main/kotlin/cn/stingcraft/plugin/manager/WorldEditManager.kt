@@ -3,6 +3,8 @@ package cn.stingcraft.plugin.manager
 import cn.stingcraft.plugin.PlayerWorldEdit
 import cn.stingcraft.plugin.hook.DominionHook
 import cn.stingcraft.plugin.until.WorldEditTool
+import cn.stingcraft.plugin.until.displayName
+import cn.stingcraft.plugin.until.markAsTool
 import com.sk89q.worldedit.bukkit.BukkitAdapter
 import com.sk89q.worldedit.EditSession
 import com.sk89q.worldedit.WorldEdit
@@ -21,9 +23,6 @@ import taboolib.common5.util.parseUUID
 import taboolib.library.xseries.XMaterial
 import taboolib.library.xseries.parseToXMaterial
 import taboolib.module.effect.createCube
-import taboolib.module.nms.ItemTagData
-import taboolib.module.nms.getI18nName
-import taboolib.module.nms.getItemTag
 import taboolib.platform.util.buildItem
 import taboolib.platform.util.sendLang
 import taboolib.platform.util.submit
@@ -46,9 +45,7 @@ class WorldEditManager {
             customModelData = settingManager.getWorldEditSettings().getInt("tool.custom-model-data")
             colored()
         }.apply {
-            val itemTag = getItemTag()
-            itemTag.putDeep("playerworldedit", ItemTagData("true"))
-            itemTag.saveTo(this)
+            markAsTool()
         }
     }
 
@@ -99,10 +96,8 @@ class WorldEditManager {
         var tick = 0
         val pos1 = getPlayerPos1(player)?: return
         val pos2 = getPlayerPos2(player) ?: return
+        val particle = resolveParticle(settingManager.getWorldEditSettings().getString("region-particle")) ?: return
         val cube = createCube(pos1.toProxyLocation(), pos2.toProxyLocation(),0.5){
-            val particle = runCatching {
-                Particle.valueOf(settingManager.getWorldEditSettings().getString("region-particle")?.uppercase() ?: "VILLAGER_HAPPY")
-            }.getOrDefault(Particle.VILLAGER_HAPPY)
             val bukkitLocation = it.toBukkitLocation()
             bukkitLocation.submit {
                 player.spawnParticle(particle, bukkitLocation, 1)
@@ -226,7 +221,7 @@ class WorldEditManager {
         if (!PlayerWorldEdit.packManager.hasEnoughMaterial(player, material, amount)) {
             player.sendLang("message-materialpack-not-enough",
                 pluginId to "pluginId",
-                material.getI18nName() to "material",
+                material.displayName() to "material",
                 amount to "amount")
             return
         }
@@ -253,7 +248,7 @@ class WorldEditManager {
         if (!PlayerWorldEdit.packManager.hasEnoughMaterial(player, to, amount)) {
             player.sendLang("message-materialpack-not-enough",
                 pluginId to "pluginId",
-                to.getI18nName() to "material",
+                to.displayName() to "material",
                 amount to "amount")
             return
         }
@@ -303,6 +298,55 @@ class WorldEditManager {
         val vec1 = BlockVector3.at(pos1.x, pos1.y, pos1.z)
         val vec2 = BlockVector3.at(pos2.x, pos2.y, pos2.z)
         return CuboidRegion(vec1, vec2)
+    }
+
+    /**
+     * 粒子名跨版本解析
+     *
+     * 1.20.5 起粒子枚举改名 (VILLAGER_HAPPY -> HAPPY_VILLAGER 等), 所以按名字查:
+     * 配置里写新名或旧名都能用, 都解析不到时退回 CRIT (各版本都有)
+     */
+    private fun resolveParticle(rawName: String?): Particle? {
+        val name = rawName?.trim()?.uppercase().orEmpty().ifEmpty { "VILLAGER_HAPPY" }
+        for (candidate in listOfNotNull(name, PARTICLE_ALIASES[name])) {
+            runCatching { Particle.valueOf(candidate) }.getOrNull()?.let { return it }
+        }
+        return runCatching { Particle.valueOf("CRIT") }.getOrNull()
+    }
+
+    private companion object {
+
+        /** 旧名 <-> 新名 (1.20.5 起的粒子枚举改名), 双向可查 */
+        val PARTICLE_ALIASES: Map<String, String> = buildMap {
+            listOf(
+                "VILLAGER_HAPPY" to "HAPPY_VILLAGER",
+                "VILLAGER_ANGRY" to "ANGRY_VILLAGER",
+                "EXPLOSION_NORMAL" to "POOF",
+                "EXPLOSION_LARGE" to "EXPLOSION",
+                "EXPLOSION_HUGE" to "EXPLOSION_EMITTER",
+                "FIREWORKS_SPARK" to "FIREWORK",
+                "SMOKE_NORMAL" to "SMOKE",
+                "SMOKE_LARGE" to "LARGE_SMOKE",
+                "WATER_BUBBLE" to "BUBBLE",
+                "WATER_SPLASH" to "SPLASH",
+                "WATER_WAKE" to "FISHING",
+                "SPELL_INSTANT" to "INSTANT_EFFECT",
+                "SPELL_MOB" to "ENTITY_EFFECT",
+                "SPELL_MOB_AMBIENT" to "AMBIENT_ENTITY_EFFECT",
+                "SPELL_WITCH" to "WITCH",
+                "ENCHANTMENT_TABLE" to "ENCHANT",
+                "CRIT_MAGIC" to "ENCHANTED_HIT",
+                "REDSTONE" to "DUST",
+                "DRIP_WATER" to "DRIPPING_WATER",
+                "DRIP_LAVA" to "DRIPPING_LAVA",
+                "SNOWBALL" to "ITEM_SNOWBALL",
+                "SLIME" to "ITEM_SLIME",
+                "TOTEM" to "TOTEM_OF_UNDYING",
+            ).forEach { (oldName, newName) ->
+                put(oldName, newName)
+                put(newName, oldName)
+            }
+        }
     }
 
 }

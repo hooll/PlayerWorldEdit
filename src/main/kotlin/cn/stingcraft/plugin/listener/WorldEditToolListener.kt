@@ -2,13 +2,13 @@ package cn.stingcraft.plugin.listener
 
 import cn.stingcraft.plugin.PlayerWorldEdit
 import cn.stingcraft.plugin.inventory.WorldEditOpInventory
+import cn.stingcraft.plugin.until.isToolItem
 import org.bukkit.event.block.Action
 import org.bukkit.event.player.PlayerInteractEvent
 import org.bukkit.event.player.PlayerQuitEvent
 import taboolib.common.function.throttle
 import taboolib.common.platform.event.SubscribeEvent
 import taboolib.common.platform.function.pluginId
-import taboolib.module.nms.getItemTag
 import taboolib.platform.util.isAir
 import taboolib.platform.util.sendLang
 
@@ -19,7 +19,7 @@ object WorldEditToolListener {
         if (e.hand != org.bukkit.inventory.EquipmentSlot.HAND) return
         val handItem = e.player.inventory.itemInMainHand
         if (handItem.isAir) return
-        if (handItem.getItemTag().getDeep("playerworldedit")?.asString() != "true") return
+        if (!handItem.isToolItem()) return
         e.isCancelled = true
         if (e.player.isSneaking && (e.action == Action.RIGHT_CLICK_BLOCK || e.action == Action.RIGHT_CLICK_AIR)) {
             WorldEditOpInventory.open(e.player)

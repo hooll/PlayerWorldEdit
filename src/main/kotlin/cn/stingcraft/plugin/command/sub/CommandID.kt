@@ -1,5 +1,6 @@
 package cn.stingcraft.plugin.command.sub
 
+import cn.stingcraft.plugin.until.displayName
 import org.bukkit.entity.Player
 import taboolib.common.platform.command.CommandContext
 import taboolib.common.platform.command.subCommand
@@ -7,7 +8,6 @@ import taboolib.common.platform.function.adaptPlayer
 import taboolib.common.platform.function.pluginId
 import taboolib.module.chat.ComponentText
 import taboolib.module.chat.Components
-import taboolib.module.nms.getI18nName
 import taboolib.platform.util.asLangText
 import taboolib.platform.util.isAir
 import taboolib.platform.util.sendLang
@@ -21,7 +21,7 @@ object CommandID {
                 return@execute
             }
             val material = itemStack.type
-            ComponentText.of(sender.asLangText("message-id-info",  pluginId to "pluginId", material.getI18nName() to "material", material.name to "id"))
+            ComponentText.of(sender.asLangText("message-id-info",  pluginId to "pluginId", material.displayName() to "material", material.name to "id"))
                 .append(sender.asLangText("message-id-insert"))
                 .clickInsertText(material.name)
                 .clickCopyToClipboard(material.name)
