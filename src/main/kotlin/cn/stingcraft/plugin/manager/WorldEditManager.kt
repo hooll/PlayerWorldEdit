@@ -223,6 +223,9 @@ class WorldEditManager {
             PlayerWorldEdit.packManager.addMaterial(player, record.material, record.amount)
             done++
         }
+        if (done > 0) {
+            UndoManager.save()
+        }
         return done
     }
 
