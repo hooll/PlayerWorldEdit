@@ -174,7 +174,7 @@ class WorldEditManager {
         val weBlockType = BlockTypes.get(block.name.lowercase()) ?: return
         val record = UndoManager.snapshot(player.world.name, region, block)
         WorldEditTool.setBlocks(player, region, weBlockType.defaultState)
-        if (record != null) UndoManager.push(player.uniqueId, record, undoLimit())
+        if (record != null) UndoManager.push(player, record, undoLimit())
         clearPlayerPos(player)
     }
 
@@ -196,7 +196,7 @@ class WorldEditManager {
             .use { session: EditSession ->
                 session.replaceBlocks(region,filterSet,toType)
             }
-        if (record != null) UndoManager.push(player.uniqueId, record, undoLimit())
+        if (record != null) UndoManager.push(player, record, undoLimit())
         clearPlayerPos(player)
     }
 
@@ -209,7 +209,7 @@ class WorldEditManager {
     fun undo(player: Player, times: Int): Int {
         var done = 0
         repeat(times) {
-            val record = UndoManager.poll(player.uniqueId) ?: return@repeat
+            val record = UndoManager.poll(player) ?: return@repeat
             val weWorld = FaweAPI.getWorld(record.worldName) ?: return@repeat
             WorldEdit.getInstance()
                 .newEditSession(weWorld)
@@ -222,9 +222,6 @@ class WorldEditManager {
                 }
             PlayerWorldEdit.packManager.addMaterial(player, record.material, record.amount)
             done++
-        }
-        if (done > 0) {
-            UndoManager.save()
         }
         return done
     }

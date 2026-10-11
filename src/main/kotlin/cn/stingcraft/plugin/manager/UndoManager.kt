@@ -7,12 +7,10 @@ import com.sk89q.worldedit.math.BlockVector3
 import com.sk89q.worldedit.regions.CuboidRegion
 import com.sk89q.worldedit.world.block.BlockState
 import org.bukkit.Material
-import taboolib.common.LifeCycle
-import taboolib.common.io.newFile
-import taboolib.common.platform.Awake
-import taboolib.common.platform.function.getDataFolder
-import java.io.File
-import java.util.UUID
+import org.bukkit.entity.Player
+import taboolib.expansion.getAutoDataContainer
+import java.io.ByteArrayOutputStream
+import java.util.Base64
 import java.util.zip.GZIPInputStream
 import java.util.zip.GZIPOutputStream
 
@@ -26,15 +24,7 @@ class UndoRecord(
 
 object UndoManager {
 
-    private val records = mutableMapOf<UUID, ArrayDeque<UndoRecord>>()
-
-    private var storage: File? = null
-
-    @Awake(LifeCycle.ENABLE)
-    fun init() {
-        storage = newFile(getDataFolder(), "undo-data.json.gz")
-        load()
-    }
+    private const val KEY = "undoRecords"
 
     /**
      * 记录区域当前方块快照
@@ -49,74 +39,69 @@ object UndoManager {
         UndoRecord(worldName, region, states, material, region.size)
     }.getOrNull()
 
-    fun push(playerId: UUID, record: UndoRecord, limit: Int) {
-        val deque = records.getOrPut(playerId) { ArrayDeque() }
-        deque.addLast(record)
-        while (deque.size > limit) {
-            deque.removeFirst()
+    fun push(player: Player, record: UndoRecord, limit: Int) {
+        val list = read(player).toMutableList()
+        list.add(record.toStored())
+        while (list.size > limit) {
+            list.removeAt(0)
         }
-        save()
+        write(player, list)
     }
 
-    fun poll(playerId: UUID): UndoRecord? {
-        val deque = records[playerId] ?: return null
-        val record = deque.removeLastOrNull()
-        if (deque.isEmpty()) {
-            records.remove(playerId)
+    fun poll(player: Player): UndoRecord? {
+        val list = read(player).toMutableList()
+        if (list.isEmpty()) {
+            return null
         }
-        return record
+        val stored = list.removeAt(list.size - 1)
+        write(player, list)
+        return runCatching { stored.toRecord() }.getOrNull()
     }
 
     /**
-     * 把撤销记录写入磁盘, 服务器重启后仍然可用
+     * 撤销记录存在玩家数据容器中, 与材料背包共用 data.db
      */
-    fun save() {
-        val file = storage ?: return
-        synchronized(this) {
-            runCatching {
-                val data = records.entries.associate { (id, deque) ->
-                    id.toString() to deque.map { record ->
-                        StoredUndoRecord(
-                            world = record.worldName,
-                            minX = record.region.minimumPoint.x,
-                            minY = record.region.minimumPoint.y,
-                            minZ = record.region.minimumPoint.z,
-                            maxX = record.region.maximumPoint.x,
-                            maxY = record.region.maximumPoint.y,
-                            maxZ = record.region.maximumPoint.z,
-                            material = record.material.name,
-                            amount = record.amount,
-                            states = record.states.map { it.getAsString() }
-                        )
-                    }
-                }
-                GZIPOutputStream(file.outputStream()).use { output ->
-                    output.write(PlayerWorldEdit.gson.toJson(data).toByteArray(Charsets.UTF_8))
-                }
-            }
+    private fun read(player: Player): List<StoredUndoRecord> {
+        val raw = player.uniqueId.getAutoDataContainer()[KEY] ?: return emptyList()
+        return runCatching {
+            val type = object : TypeToken<List<StoredUndoRecord>>() {}.type
+            PlayerWorldEdit.gson.fromJson<List<StoredUndoRecord>>(decompressFromBase64(raw), type)
+        }.getOrDefault(emptyList())
+    }
+
+    private fun write(player: Player, list: List<StoredUndoRecord>) {
+        val container = player.uniqueId.getAutoDataContainer()
+        if (list.isEmpty()) {
+            container[KEY] = ""
+        } else {
+            container[KEY] = compressToBase64(PlayerWorldEdit.gson.toJson(list))
         }
     }
 
-    private fun load() {
-        val file = storage ?: return
-        if (!file.isFile || file.length() == 0L) {
-            return
-        }
-        runCatching {
-            val json = GZIPInputStream(file.inputStream()).bufferedReader(Charsets.UTF_8).use { it.readText() }
-            val type = object : TypeToken<Map<String, List<StoredUndoRecord>>>() {}.type
-            val data: Map<String, List<StoredUndoRecord>> = PlayerWorldEdit.gson.fromJson(json, type)
-            data.forEach { (id, list) ->
-                val playerId = runCatching { UUID.fromString(id) }.getOrNull() ?: return@forEach
-                val deque = ArrayDeque<UndoRecord>()
-                list.forEach { stored ->
-                    runCatching { stored.toRecord() }.getOrNull()?.let { deque.addLast(it) }
-                }
-                if (deque.isNotEmpty()) {
-                    records[playerId] = deque
-                }
-            }
-        }
+    private fun UndoRecord.toStored(): StoredUndoRecord {
+        return StoredUndoRecord(
+            world = worldName,
+            minX = region.minimumPoint.x,
+            minY = region.minimumPoint.y,
+            minZ = region.minimumPoint.z,
+            maxX = region.maximumPoint.x,
+            maxY = region.maximumPoint.y,
+            maxZ = region.maximumPoint.z,
+            material = material.name,
+            amount = amount,
+            states = states.map { it.getAsString() }
+        )
+    }
+
+    private fun compressToBase64(json: String): String {
+        val output = ByteArrayOutputStream()
+        GZIPOutputStream(output).use { it.write(json.toByteArray(Charsets.UTF_8)) }
+        return Base64.getEncoder().encodeToString(output.toByteArray())
+    }
+
+    private fun decompressFromBase64(base64: String): String {
+        val bytes = Base64.getDecoder().decode(base64)
+        return GZIPInputStream(bytes.inputStream()).bufferedReader(Charsets.UTF_8).use { it.readText() }
     }
 }
 
