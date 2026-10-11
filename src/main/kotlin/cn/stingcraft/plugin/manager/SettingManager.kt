@@ -4,7 +4,7 @@ import taboolib.library.configuration.ConfigurationSection
 import taboolib.module.configuration.Config
 import taboolib.module.configuration.Configuration
 
-class SettingManager {
+object SettingManager {
 
     @Config("settings.yml", autoReload = true)
     lateinit var settings: Configuration

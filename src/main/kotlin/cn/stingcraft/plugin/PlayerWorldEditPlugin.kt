@@ -12,11 +12,11 @@ object PlayerWorldEdit : Plugin() {
 
     val gson = GsonBuilder().setPrettyPrinting().create()
 
+    val settingManager = SettingManager
+
     val packManager = MaterialPackManager()
 
     val worldEditManager = WorldEditManager()
-
-    val settingManager = SettingManager()
 
     override fun onEnable() {
         info("Successfully running PlayerWorldEdit!")

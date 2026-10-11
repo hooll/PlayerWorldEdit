@@ -38,22 +38,25 @@ class WorldEditManager {
 
     private val settingManager = PlayerWorldEdit.settingManager
 
-    private val posTool = buildItem(settingManager.getWorldEditSettings().getString("tool.type")?.parseToXMaterial() ?:XMaterial.DIAMOND_PICKAXE){
-        name = settingManager.getWorldEditSettings().getString("tool.name") ?: "&7[&f创世神镐&7]"
-        lore += settingManager.getWorldEditSettings().getStringList("tool.lore")
-        customModelData = settingManager.getWorldEditSettings().getInt("tool.custom-model-data")
-        colored()
-    }.apply {
-        val itemTag = getItemTag()
-        itemTag.putDeep("playerworldedit", ItemTagData("true"))
-        itemTag.saveTo(this)
+    // 配置在 TabooLib 注入阶段才可用, 不能在建类时读取
+    private val posToolItem by lazy {
+        buildItem(settingManager.getWorldEditSettings().getString("tool.type")?.parseToXMaterial() ?:XMaterial.DIAMOND_PICKAXE){
+            name = settingManager.getWorldEditSettings().getString("tool.name") ?: "&7[&f创世神镐&7]"
+            lore += settingManager.getWorldEditSettings().getStringList("tool.lore")
+            customModelData = settingManager.getWorldEditSettings().getInt("tool.custom-model-data")
+            colored()
+        }.apply {
+            val itemTag = getItemTag()
+            itemTag.putDeep("playerworldedit", ItemTagData("true"))
+            itemTag.saveTo(this)
+        }
     }
 
     /**
      * 获取创世神镐
      */
     fun getPosTool(): org.bukkit.inventory.ItemStack {
-        return posTool
+        return posToolItem
     }
 
     /**
