@@ -18,3 +18,4 @@ world-edit:
       - "&f| 右键设置第二个点",
       - " ",
   region-particle: "VILLAGER_ANGRY"
+  undo-limit: 10

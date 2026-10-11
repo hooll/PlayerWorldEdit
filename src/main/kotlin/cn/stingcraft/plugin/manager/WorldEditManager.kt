@@ -172,7 +172,9 @@ class WorldEditManager {
     fun setAreaBlock(player: Player, block: Material){
         val region = getWERegion(player) ?: return
         val weBlockType = BlockTypes.get(block.name.lowercase()) ?: return
+        val record = UndoManager.snapshot(player.world.name, region, block)
         WorldEditTool.setBlocks(player, region, weBlockType.defaultState)
+        if (record != null) UndoManager.push(player.uniqueId, record, undoLimit())
         clearPlayerPos(player)
     }
 
@@ -186,6 +188,7 @@ class WorldEditManager {
         val region = getWERegion(player) ?: return
         val fromType = BlockTypes.get(from.name.lowercase()) ?: return
         val toType = BlockTypes.get(to.name.lowercase()) ?: return
+        val record = UndoManager.snapshot(player.world.name, region, to)
         val filterSet = setOf(fromType.defaultState.toBaseBlock())
         val weWorld = FaweAPI.getWorld(player.world.name)
         WorldEdit.getInstance()
@@ -193,7 +196,38 @@ class WorldEditManager {
             .use { session: EditSession ->
                 session.replaceBlocks(region,filterSet,toType)
             }
+        if (record != null) UndoManager.push(player.uniqueId, record, undoLimit())
         clearPlayerPos(player)
+    }
+
+    /**
+     * 撤销最近的操作
+     * @param player 玩家
+     * @param times 次数
+     * @return 实际撤销次数
+     */
+    fun undo(player: Player, times: Int): Int {
+        var done = 0
+        repeat(times) {
+            val record = UndoManager.poll(player.uniqueId) ?: return@repeat
+            val weWorld = FaweAPI.getWorld(record.worldName) ?: return@repeat
+            WorldEdit.getInstance()
+                .newEditSession(weWorld)
+                .use { session: EditSession ->
+                    var index = 0
+                    for (vector in record.region) {
+                        if (index >= record.states.size) break
+                        session.setBlock(vector, record.states[index++])
+                    }
+                }
+            PlayerWorldEdit.packManager.addMaterial(player, record.material, record.amount)
+            done++
+        }
+        return done
+    }
+
+    private fun undoLimit(): Int {
+        return settingManager.getWorldEditSettings().getInt("undo-limit").takeIf { it > 0 } ?: 10
     }
 
     /**

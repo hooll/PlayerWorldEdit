@@ -38,5 +38,8 @@ object MainCommand {
     val replace = CommandReplace.command
 
     @CommandBody(permission = "PlayerWorldEdit.Use")
+    val undo = CommandUndo.command
+
+    @CommandBody(permission = "PlayerWorldEdit.Use")
     val id = CommandID.command
 }
