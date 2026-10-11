@@ -12,6 +12,7 @@ import org.bukkit.Location
 import org.bukkit.Material
 import org.bukkit.Particle
 import org.bukkit.entity.Player
+import taboolib.common.platform.function.pluginId
 import taboolib.common.platform.function.submitAsync
 import taboolib.common.platform.service.PlatformExecutor
 import taboolib.common5.util.parseUUID
@@ -19,8 +20,10 @@ import taboolib.library.xseries.XMaterial
 import taboolib.library.xseries.parseToXMaterial
 import taboolib.module.effect.createCube
 import taboolib.module.nms.ItemTagData
+import taboolib.module.nms.getI18nName
 import taboolib.module.nms.getItemTag
 import taboolib.platform.util.buildItem
+import taboolib.platform.util.sendLang
 import taboolib.platform.util.submit
 import taboolib.platform.util.toBukkitLocation
 import taboolib.platform.util.toProxyLocation
@@ -198,6 +201,48 @@ class WorldEditManager {
             }
         if (record != null) UndoManager.push(player, record, undoLimit())
         clearPlayerPos(player)
+    }
+
+    /**
+     * 尝试填充选区, 校验区域与材料并发送提示
+     */
+    fun trySetArea(player: Player, material: Material) {
+        if (!hasRegion(player)) {
+            player.sendLang("message-no-region", pluginId to "pluginId")
+            return
+        }
+        val amount = getCountInRegion(player)
+        if (!PlayerWorldEdit.packManager.hasEnoughMaterial(player, material, amount)) {
+            player.sendLang("message-materialpack-not-enough",
+                pluginId to "pluginId",
+                material.getI18nName() to "material",
+                amount to "amount")
+            return
+        }
+        PlayerWorldEdit.packManager.removeMaterial(player, material, amount)
+        setAreaBlock(player, material)
+        player.sendLang("message-set-susses", pluginId to "pluginId")
+    }
+
+    /**
+     * 尝试替换选区方块, 校验区域与材料并发送提示
+     */
+    fun tryReplaceArea(player: Player, from: Material, to: Material) {
+        if (!hasRegion(player)) {
+            player.sendLang("message-no-region", pluginId to "pluginId")
+            return
+        }
+        val amount = getCountInRegion(player)
+        if (!PlayerWorldEdit.packManager.hasEnoughMaterial(player, to, amount)) {
+            player.sendLang("message-materialpack-not-enough",
+                pluginId to "pluginId",
+                to.getI18nName() to "material",
+                amount to "amount")
+            return
+        }
+        PlayerWorldEdit.packManager.removeMaterial(player, to, amount)
+        replaceAreaBlock(player, from, to)
+        player.sendLang("message-replace-susses", pluginId to "pluginId")
     }
 
     /**

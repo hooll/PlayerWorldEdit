@@ -1,6 +1,7 @@
 package cn.stingcraft.plugin.listener
 
 import cn.stingcraft.plugin.PlayerWorldEdit
+import cn.stingcraft.plugin.inventory.WorldEditOpInventory
 import org.bukkit.event.block.Action
 import org.bukkit.event.player.PlayerInteractEvent
 import taboolib.common.function.throttle
@@ -19,6 +20,10 @@ object WorldEditToolListener {
         if (handItem.isAir) return
         if (handItem.getItemTag().getDeep("playerworldedit")?.asString() != "true") return
         e.isCancelled = true
+        if (e.player.isSneaking && (e.action == Action.RIGHT_CLICK_BLOCK || e.action == Action.RIGHT_CLICK_AIR)) {
+            WorldEditOpInventory.open(e.player)
+            return
+        }
         when(e.action){
             Action.LEFT_CLICK_BLOCK -> {
                 val loc = e.clickedBlock?.boundingBox?.center?.toLocation(e.player.world) ?:return
