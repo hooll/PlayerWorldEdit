@@ -21,6 +21,7 @@ import taboolib.module.effect.createCube
 import taboolib.module.nms.ItemTagData
 import taboolib.module.nms.getItemTag
 import taboolib.platform.util.buildItem
+import taboolib.platform.util.submit
 import taboolib.platform.util.toBukkitLocation
 import taboolib.platform.util.toProxyLocation
 
@@ -94,7 +95,10 @@ class WorldEditManager {
             val particle = runCatching {
                 Particle.valueOf(settingManager.getWorldEditSettings().getString("region-particle")?.uppercase() ?: "VILLAGER_HAPPY")
             }.getOrDefault(Particle.VILLAGER_HAPPY)
-            player.spawnParticle(particle,it.toBukkitLocation(),1)
+            val bukkitLocation = it.toBukkitLocation()
+            bukkitLocation.submit {
+                player.spawnParticle(particle, bukkitLocation, 1)
+            }
         }
         particleTasks[player] = submitAsync(period = 20) {
             if (tick >= 60*20) {
