@@ -50,7 +50,7 @@ taboolib {
             name("Sting")
         }
         dependencies {
-            name("FastAsyncWorldEdit")
+            name("WorldEdit")
             name("Dominion").optional(true)
         }
     }

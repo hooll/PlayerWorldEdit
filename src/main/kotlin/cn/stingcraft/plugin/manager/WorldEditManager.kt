@@ -3,12 +3,13 @@ package cn.stingcraft.plugin.manager
 import cn.stingcraft.plugin.PlayerWorldEdit
 import cn.stingcraft.plugin.hook.DominionHook
 import cn.stingcraft.plugin.until.WorldEditTool
-import com.fastasyncworldedit.core.FaweAPI
+import com.sk89q.worldedit.bukkit.BukkitAdapter
 import com.sk89q.worldedit.EditSession
 import com.sk89q.worldedit.WorldEdit
 import com.sk89q.worldedit.math.BlockVector3
 import com.sk89q.worldedit.regions.CuboidRegion
 import com.sk89q.worldedit.world.block.BlockTypes
+import org.bukkit.Bukkit
 import org.bukkit.Location
 import org.bukkit.Material
 import org.bukkit.Particle
@@ -165,7 +166,7 @@ class WorldEditManager {
      */
     fun getCountInRegion(player: Player): Int {
         val region = getWERegion(player) ?: return 0
-        return region.size
+        return region.volume.toInt()
     }
 
     /**
@@ -194,11 +195,11 @@ class WorldEditManager {
         val toType = BlockTypes.get(to.name.lowercase()) ?: return
         val record = UndoManager.snapshot(player.world.name, region, to)
         val filterSet = setOf(fromType.defaultState.toBaseBlock())
-        val weWorld = FaweAPI.getWorld(player.world.name)
+        val weWorld = BukkitAdapter.adapt(player.world)
         WorldEdit.getInstance()
             .newEditSession(weWorld)
             .use { session: EditSession ->
-                session.replaceBlocks(region,filterSet,toType)
+                session.replaceBlocks(region,filterSet,toType.defaultState)
             }
         if (record != null) UndoManager.push(player, record, undoLimit())
         clearPlayerPos(player)
@@ -268,7 +269,7 @@ class WorldEditManager {
         var done = 0
         repeat(times) {
             val record = UndoManager.poll(player) ?: return@repeat
-            val weWorld = FaweAPI.getWorld(record.worldName) ?: return@repeat
+            val weWorld = Bukkit.getWorld(record.worldName)?.let { BukkitAdapter.adapt(it) } ?: return@repeat
             WorldEdit.getInstance()
                 .newEditSession(weWorld)
                 .use { session: EditSession ->

@@ -1,11 +1,14 @@
 package cn.stingcraft.plugin.manager
 
 import cn.stingcraft.plugin.PlayerWorldEdit
-import com.fastasyncworldedit.core.FaweAPI
 import com.google.gson.reflect.TypeToken
+import com.sk89q.worldedit.bukkit.BukkitAdapter
 import com.sk89q.worldedit.math.BlockVector3
 import com.sk89q.worldedit.regions.CuboidRegion
+import com.sk89q.worldedit.registry.state.Property
 import com.sk89q.worldedit.world.block.BlockState
+import com.sk89q.worldedit.world.block.BlockTypes
+import org.bukkit.Bukkit
 import org.bukkit.Material
 import org.bukkit.entity.Player
 import taboolib.expansion.getAutoDataContainer
@@ -31,12 +34,13 @@ object UndoManager {
      * @return 快照, 失败时返回 null
      */
     fun snapshot(worldName: String, region: CuboidRegion, material: Material): UndoRecord? = runCatching {
-        val weWorld = FaweAPI.getWorld(worldName)
-        val states = ArrayList<BlockState>(region.size)
+        val bukkitWorld = Bukkit.getWorld(worldName) ?: return@runCatching null
+        val weWorld = BukkitAdapter.adapt(bukkitWorld)
+        val states = ArrayList<BlockState>(region.volume.toInt())
         for (vector in region) {
             states.add(weWorld.getBlock(vector))
         }
-        UndoRecord(worldName, region, states, material, region.size)
+        UndoRecord(worldName, region, states, material, region.volume.toInt())
     }.getOrNull()
 
     fun push(player: Player, record: UndoRecord, limit: Int) {
@@ -105,6 +109,26 @@ object UndoManager {
     }
 }
 
+/**
+ * 解析 getAsString() 存下的方块状态字符串, 如 "minecraft:oak_log[axis=y]"
+ * 解析失败时抛异常 (与旧版 BlockState.get(String) 行为一致, 由调用方兜底)
+ */
+@Suppress("UNCHECKED_CAST")
+private fun parseBlockState(raw: String): BlockState {
+    val type = BlockTypes.get(raw.substringBefore('['))
+        ?: throw IllegalArgumentException("Unknown block type: $raw")
+    val properties = HashMap<Property<*>, Any>()
+    val propsRaw = raw.substringAfter('[', "").substringBefore(']')
+    if (propsRaw.isNotBlank()) {
+        for (pair in propsRaw.split(',')) {
+            val property = type.propertyMap[pair.substringBefore('=').trim()] ?: continue
+            val value = (property as Property<Any>).getValueFor(pair.substringAfter('=', "").trim()) ?: continue
+            properties[property] = value
+        }
+    }
+    return type.getState(properties)
+}
+
 private data class StoredUndoRecord(
     val world: String,
     val minX: Int,
@@ -122,7 +146,7 @@ private data class StoredUndoRecord(
         return UndoRecord(
             world,
             CuboidRegion(BlockVector3.at(minX, minY, minZ), BlockVector3.at(maxX, maxY, maxZ)),
-            states.map { BlockState.get(it) },
+            states.map { parseBlockState(it) },
             Material.valueOf(material),
             amount
         )
