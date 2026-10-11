@@ -6,7 +6,6 @@ import cn.stingcraft.plugin.until.isToolItem
 import org.bukkit.event.block.Action
 import org.bukkit.event.player.PlayerInteractEvent
 import org.bukkit.event.player.PlayerQuitEvent
-import taboolib.common.function.throttle
 import taboolib.common.platform.event.SubscribeEvent
 import taboolib.common.platform.function.pluginId
 import taboolib.platform.util.isAir
@@ -28,6 +27,12 @@ object WorldEditToolListener {
         when(e.action){
             Action.LEFT_CLICK_BLOCK -> {
                 val loc = e.clickedBlock?.boundingBox?.center?.toLocation(e.player.world) ?:return
+                // 另一个点若已选, 必须与当前世界一致
+                val pos2 = PlayerWorldEdit.worldEditManager.getPlayerPos2(e.player)
+                if (pos2 != null && pos2.world?.name != e.player.world.name) {
+                    e.player.sendLang("message-different-world", pluginId to "pluginId")
+                    return
+                }
                 PlayerWorldEdit.worldEditManager.setPlayerPos1(e.player,loc)
                 e.player.sendLang("message-region-select-pos1",
                     pluginId to "pluginId",
@@ -40,8 +45,10 @@ object WorldEditToolListener {
             }
             Action.RIGHT_CLICK_BLOCK -> {
                 val loc = e.clickedBlock?.boundingBox?.center?.toLocation(e.player.world) ?:return
-                if (PlayerWorldEdit.worldEditManager.getPlayerPos1(e.player)?.world?.name != e.player.world.name){
-                    e.player.sendMessage("两个点不在同一世界！")
+                // 点1未选时允许先选点2; 已选则必须同一世界
+                val pos1 = PlayerWorldEdit.worldEditManager.getPlayerPos1(e.player)
+                if (pos1 != null && pos1.world?.name != e.player.world.name) {
+                    e.player.sendLang("message-different-world", pluginId to "pluginId")
                     return
                 }
                 PlayerWorldEdit.worldEditManager.setPlayerPos2(e.player,loc)

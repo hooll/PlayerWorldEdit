@@ -1,6 +1,7 @@
 package cn.stingcraft.plugin.inventory
 
 import cn.stingcraft.plugin.PlayerWorldEdit
+import cn.stingcraft.plugin.until.displayName
 import org.bukkit.Material
 import org.bukkit.entity.Player
 import org.bukkit.inventory.Inventory
@@ -29,6 +30,8 @@ object WorldEditOpInventory {
         val size = if (hasRegion) worldEditManager.getCountInRegion(player) else 0
         return buildMenu<ChestImpl>("&f创世神操作 &4| 快捷菜单".colored()) {
             rows(3)
+            // 锁定整页点击: 没有注册 onClick 的格子（如信息纸）原本可以把物品拿走
+            onClick(true) { }
             set(4, buildItem(XMaterial.PAPER) {
                 name = "&f| 选区信息"
                 if (hasRegion) {
@@ -86,14 +89,17 @@ object WorldEditOpInventory {
     }
 
     private fun openBlockPicker(player: Player, title: String, callback: (Material) -> Unit) {
-        val blocks = Material.values().filter { it.isBlock }
+        // 只列出材料背包里已有的方块, 外加空气 (用于清空区域)
+        val blocks = (PlayerWorldEdit.packManager.getMaterialPack(player).materials.map { it.material } + Material.AIR)
+            .distinct()
+            .filter { it.isBlock }
         player.openMenu(buildMenu<PageableChestImpl<Material>>(title.colored()) {
             rows(6)
             slots(Slots.CENTER)
             elements { blocks }
             onGenerate { _, element, _, _ ->
                 return@onGenerate buildItem(element) {
-                    name = "&f| ${element.name}"
+                    name = "&f| ${element.displayName()}"
                     colored()
                 }
             }

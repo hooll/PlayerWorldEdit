@@ -4,6 +4,7 @@ import org.bukkit.Material
 import org.bukkit.NamespacedKey
 import org.bukkit.inventory.ItemStack
 import org.bukkit.persistence.PersistentDataType
+import taboolib.library.xseries.XMaterial
 import taboolib.module.nms.getI18nName
 
 /**
@@ -22,6 +23,13 @@ fun ItemStack.markAsTool() {
 
 fun ItemStack.isToolItem(): Boolean =
     itemMeta?.persistentDataContainer?.has(TOOL_KEY, PersistentDataType.STRING) == true
+
+/**
+ * 解析玩家输入的方块名 (支持 "stone" / "minecraft:stone"), 非法或不是方块时返回 null
+ * 不用 XSeries 的 parseToMaterial: 它解析失败会静默退回 STONE
+ */
+fun parseBlockOrNull(input: String): Material? =
+    XMaterial.matchXMaterial(input.lowercase()).orElse(null)?.parseMaterial()?.takeIf { it.isBlock }
 
 /**
  * 物品显示名

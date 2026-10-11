@@ -10,6 +10,7 @@ import com.sk89q.worldedit.EditSession
 import com.sk89q.worldedit.WorldEdit
 import com.sk89q.worldedit.math.BlockVector3
 import com.sk89q.worldedit.regions.CuboidRegion
+import com.sk89q.worldedit.world.block.BlockType
 import com.sk89q.worldedit.world.block.BlockTypes
 import org.bukkit.Bukkit
 import org.bukkit.Location
@@ -28,12 +29,14 @@ import taboolib.platform.util.sendLang
 import taboolib.platform.util.submit
 import taboolib.platform.util.toBukkitLocation
 import taboolib.platform.util.toProxyLocation
+import java.util.concurrent.ConcurrentHashMap
 
 class WorldEditManager {
 
-    private val playerpos = mutableMapOf<Player, Pair<Location?, Location?>>()
+    // 选区与粒子任务会被玩家所在区域线程和异步操作线程同时读写, 用并发容器
+    private val playerpos = ConcurrentHashMap<Player, Pair<Location?, Location?>>()
 
-    private val particleTasks = mutableMapOf<Player, PlatformExecutor.PlatformTask>()
+    private val particleTasks = ConcurrentHashMap<Player, PlatformExecutor.PlatformTask>()
 
     private val settingManager = PlayerWorldEdit.settingManager
 
@@ -171,14 +174,16 @@ class WorldEditManager {
      * 设置区域方块
      * @param player 玩家
      * @param block 方块
+     * @return 是否实际执行
      */
-    fun setAreaBlock(player: Player, block: Material){
-        val region = getWERegion(player) ?: return
-        val weBlockType = BlockTypes.get(block.name.lowercase()) ?: return
+    fun setAreaBlock(player: Player, block: Material): Boolean {
+        val region = getWERegion(player) ?: return false
+        val weBlockType = resolveBlockType(block) ?: return false
         val record = UndoManager.snapshot(player.world.name, region, block)
         WorldEditTool.setBlocks(player, region, weBlockType.defaultState)
         if (record != null) UndoManager.push(player, record, undoLimit())
         clearPlayerPos(player)
+        return true
     }
 
     /**
@@ -186,21 +191,34 @@ class WorldEditManager {
      * @param player
      * @param from
      * @param to
+     * @return 是否实际执行
      */
-    fun replaceAreaBlock(player: Player, from: Material,to: Material){
-        val region = getWERegion(player) ?: return
-        val fromType = BlockTypes.get(from.name.lowercase()) ?: return
-        val toType = BlockTypes.get(to.name.lowercase()) ?: return
+    fun replaceAreaBlock(player: Player, from: Material, to: Material): Boolean {
+        val region = getWERegion(player) ?: return false
+        val fromType = resolveBlockType(from) ?: return false
+        val toType = resolveBlockType(to) ?: return false
         val record = UndoManager.snapshot(player.world.name, region, to)
         val filterSet = setOf(fromType.defaultState.toBaseBlock())
         val weWorld = BukkitAdapter.adapt(player.world)
         WorldEdit.getInstance()
             .newEditSession(weWorld)
             .use { session: EditSession ->
-                session.replaceBlocks(region,filterSet,toType.defaultState)
+                session.replaceBlocks(region, filterSet, toType.defaultState)
             }
         if (record != null) UndoManager.push(player, record, undoLimit())
         clearPlayerPos(player)
+        return true
+    }
+
+    /**
+     * 解析方块类型
+     *
+     * WorldEdit 注册表的键带命名空间 (minecraft:stone), Bukkit 的 Material 名没有,
+     * 直接传裸名会查不到 (注册表不做补全)
+     */
+    private fun resolveBlockType(material: Material): BlockType? {
+        val id = material.name.lowercase()
+        return BlockTypes.get("minecraft:$id") ?: BlockTypes.get(id)
     }
 
     /**
@@ -217,6 +235,10 @@ class WorldEditManager {
             player.sendLang("message-dominion-denied", pluginId to "pluginId", dominion to "dominion")
             return
         }
+        if (resolveBlockType(material) == null) {
+            player.sendLang("message-invalid-material", pluginId to "pluginId", material.name to "material")
+            return
+        }
         val amount = getCountInRegion(player)
         if (!PlayerWorldEdit.packManager.hasEnoughMaterial(player, material, amount)) {
             player.sendLang("message-materialpack-not-enough",
@@ -225,8 +247,12 @@ class WorldEditManager {
                 amount to "amount")
             return
         }
+        // 先执行, 成功后再扣材料, 避免扣了材料却没执行
+        if (!setAreaBlock(player, material)) {
+            player.sendLang("message-invalid-material", pluginId to "pluginId", material.name to "material")
+            return
+        }
         PlayerWorldEdit.packManager.removeMaterial(player, material, amount)
-        setAreaBlock(player, material)
         player.sendLang("message-set-susses", pluginId to "pluginId")
     }
 
@@ -244,6 +270,11 @@ class WorldEditManager {
             player.sendLang("message-dominion-denied", pluginId to "pluginId", dominion to "dominion")
             return
         }
+        if (resolveBlockType(from) == null || resolveBlockType(to) == null) {
+            player.sendLang("message-invalid-material", pluginId to "pluginId",
+                (if (resolveBlockType(from) == null) from else to).name to "material")
+            return
+        }
         val amount = getCountInRegion(player)
         if (!PlayerWorldEdit.packManager.hasEnoughMaterial(player, to, amount)) {
             player.sendLang("message-materialpack-not-enough",
@@ -252,8 +283,12 @@ class WorldEditManager {
                 amount to "amount")
             return
         }
+        // 先执行, 成功后再扣材料, 避免扣了材料却没执行
+        if (!replaceAreaBlock(player, from, to)) {
+            player.sendLang("message-invalid-material", pluginId to "pluginId", to.name to "material")
+            return
+        }
         PlayerWorldEdit.packManager.removeMaterial(player, to, amount)
-        replaceAreaBlock(player, from, to)
         player.sendLang("message-replace-susses", pluginId to "pluginId")
     }
 
@@ -267,7 +302,12 @@ class WorldEditManager {
         var done = 0
         repeat(times) {
             val record = UndoManager.poll(player) ?: return@repeat
-            val weWorld = Bukkit.getWorld(record.worldName)?.let { BukkitAdapter.adapt(it) } ?: return@repeat
+            val weWorld = Bukkit.getWorld(record.worldName)?.let { BukkitAdapter.adapt(it) }
+            if (weWorld == null) {
+                // 世界未加载, 把记录放回去, 避免白丢一条
+                UndoManager.push(player, record, undoLimit())
+                return@repeat
+            }
             WorldEdit.getInstance()
                 .newEditSession(weWorld)
                 .use { session: EditSession ->
