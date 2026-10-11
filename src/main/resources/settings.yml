@@ -2,8 +2,8 @@ material-pack-gui:
   title: '&f材料背包 &4| 切勿放置其他物品 仅放材料'
   lore:
     take-1: "&7| 左键 取出 x1"
-    take-10: "&7| 左键 取出 x10"
-    take-64: "&7| 左键 取出 x64"
+    take-10: "&7| 右键 取出 x10"
+    take-64: "&7| SHIFT+右键 取出 x64"
     amount: "&7| 数量: &e%amount%"
 world-edit:
   tool:
