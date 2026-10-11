@@ -4,6 +4,7 @@ import org.bukkit.Material
 import org.bukkit.NamespacedKey
 import org.bukkit.inventory.ItemStack
 import org.bukkit.persistence.PersistentDataType
+import taboolib.module.nms.getI18nName
 
 /**
  * 创世神镐的标记 key
@@ -23,10 +24,15 @@ fun ItemStack.isToolItem(): Boolean =
     itemMeta?.persistentDataContainer?.has(TOOL_KEY, PersistentDataType.STRING) == true
 
 /**
- * 物品显示名, 如 DIAMOND_PICKAXE -> Diamond Pickaxe (TNT 这类短词保持大写)
- * 不用 NMS 的 getI18nName: 在部分服务端核心上不可用
+ * 物品显示名
+ *
+ * 优先用 NMS 的 I18nName (原版名称, 如 "Diamond Pickaxe"); 个别服务端核心上 NMS 不可用时
+ * 退回本地标题化名称 (DIAMOND_PICKAXE -> Diamond Pickaxe, TNT 这类短词保持大写),
+ * 保证任何版本都不会因为拿不到名字而报错
  */
 fun Material.displayName(): String =
-    name.lowercase().split('_').joinToString(" ") { word ->
-        if (word.length <= 3) word.uppercase() else word.replaceFirstChar { it.uppercaseChar() }
+    runCatching { getI18nName() }.getOrElse {
+        name.lowercase().split('_').joinToString(" ") { word ->
+            if (word.length <= 3) word.uppercase() else word.replaceFirstChar { it.uppercaseChar() }
+        }
     }
