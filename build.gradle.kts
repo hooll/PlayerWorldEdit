@@ -21,7 +21,12 @@ plugins {
     id("org.jetbrains.kotlin.jvm") version "2.1.0"
 }
 
-version = "1.1.0"
+// 版本号 = 语义版本 + git 短哈希, 区分每次构建
+version = runCatching {
+    "1.1.0-" + providers.exec {
+        commandLine("git", "rev-parse", "--short=7", "HEAD")
+    }.standardOutput.asText.map { it.trim() }.get()
+}.getOrDefault("1.1.0")
 
 taboolib {
     env {
