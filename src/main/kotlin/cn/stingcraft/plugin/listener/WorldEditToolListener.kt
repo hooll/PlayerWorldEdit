@@ -4,6 +4,7 @@ import cn.stingcraft.plugin.PlayerWorldEdit
 import cn.stingcraft.plugin.inventory.WorldEditOpInventory
 import org.bukkit.event.block.Action
 import org.bukkit.event.player.PlayerInteractEvent
+import org.bukkit.event.player.PlayerQuitEvent
 import taboolib.common.function.throttle
 import taboolib.common.platform.event.SubscribeEvent
 import taboolib.common.platform.function.pluginId
@@ -55,6 +56,11 @@ object WorldEditToolListener {
             }
             else -> { return }
         }
+    }
+
+    @SubscribeEvent
+    fun onPlayerQuit(e: PlayerQuitEvent) {
+        PlayerWorldEdit.worldEditManager.clearPlayerPos(e.player)
     }
 
 }

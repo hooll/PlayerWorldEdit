@@ -44,18 +44,21 @@ taboolib {
         }
         dependencies {
             name("FastAsyncWorldEdit")
+            name("Dominion").optional(true)
         }
     }
     version { taboolib = "6.3.0-0e3a911" }
 }
 
 repositories {
+    maven("https://maven.aliyun.com/repository/central")
     mavenCentral()
 }
 
 dependencies {
     compileOnly("ink.ptms.core:v12004:12004:mapped")
     compileOnly("ink.ptms.core:v12004:12004:universal")
+    compileOnly("cn.lunadeer:DominionAPI:4.9.6")
     implementation("com.google.code.gson:gson:2.10.1")
     taboo("top.maplex.arim:Arim:1.2.14")
     compileOnly(kotlin("stdlib"))

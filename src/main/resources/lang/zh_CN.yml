@@ -45,3 +45,4 @@ message-id-info: '&8[&3&l{pluginId}&8] &7{material}的ID是: {id}'
 message-id-insert: "&7[点击复制]"
 message-undo-none: '&8[&3&l{pluginId}&8] &7没有可以撤销的操作'
 message-undo-susses: '&8[&3&l{pluginId}&8] &7已撤销 {times} 次操作, 材料已返还'
+message-dominion-denied: '&8[&3&l{pluginId}&8] &7选区包含领地 &f{dominion}&7, 你在此没有编辑权限'

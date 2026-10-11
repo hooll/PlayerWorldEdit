@@ -1,6 +1,7 @@
 package cn.stingcraft.plugin.manager
 
 import cn.stingcraft.plugin.PlayerWorldEdit
+import cn.stingcraft.plugin.hook.DominionHook
 import cn.stingcraft.plugin.until.WorldEditTool
 import com.fastasyncworldedit.core.FaweAPI
 import com.sk89q.worldedit.EditSession
@@ -211,6 +212,12 @@ class WorldEditManager {
             player.sendLang("message-no-region", pluginId to "pluginId")
             return
         }
+        val pos1 = getPlayerPos1(player) ?: return
+        val pos2 = getPlayerPos2(player) ?: return
+        DominionHook.findDeniedDominion(player, pos1, pos2, needBreak = false)?.let { dominion ->
+            player.sendLang("message-dominion-denied", pluginId to "pluginId", dominion to "dominion")
+            return
+        }
         val amount = getCountInRegion(player)
         if (!PlayerWorldEdit.packManager.hasEnoughMaterial(player, material, amount)) {
             player.sendLang("message-materialpack-not-enough",
@@ -230,6 +237,12 @@ class WorldEditManager {
     fun tryReplaceArea(player: Player, from: Material, to: Material) {
         if (!hasRegion(player)) {
             player.sendLang("message-no-region", pluginId to "pluginId")
+            return
+        }
+        val pos1 = getPlayerPos1(player) ?: return
+        val pos2 = getPlayerPos2(player) ?: return
+        DominionHook.findDeniedDominion(player, pos1, pos2, needBreak = true)?.let { dominion ->
+            player.sendLang("message-dominion-denied", pluginId to "pluginId", dominion to "dominion")
             return
         }
         val amount = getCountInRegion(player)
