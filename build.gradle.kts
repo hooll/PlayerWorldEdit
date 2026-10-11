@@ -17,8 +17,8 @@ import io.izzel.taboolib.gradle.DatabasePlayer
 
 plugins {
     java
-    id("io.izzel.taboolib") version "2.0.22"
-    id("org.jetbrains.kotlin.jvm") version "1.8.22"
+    id("io.izzel.taboolib") version "2.0.39"
+    id("org.jetbrains.kotlin.jvm") version "2.1.0"
 }
 
 taboolib {
@@ -46,7 +46,7 @@ taboolib {
             name("FastAsyncWorldEdit")
         }
     }
-    version { taboolib = "6.2.3" }
+    version { taboolib = "6.3.0-0e3a911" }
 }
 
 repositories {

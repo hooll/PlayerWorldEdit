@@ -16,7 +16,6 @@ import taboolib.common.platform.function.submitAsync
 import taboolib.common.platform.service.PlatformExecutor
 import taboolib.common5.util.parseUUID
 import taboolib.library.xseries.XMaterial
-import taboolib.library.xseries.XParticle
 import taboolib.library.xseries.parseToXMaterial
 import taboolib.module.effect.createCube
 import taboolib.module.nms.ItemTagData
@@ -92,10 +91,9 @@ class WorldEditManager {
         val pos1 = getPlayerPos1(player)?: return
         val pos2 = getPlayerPos2(player) ?: return
         val cube = createCube(pos1.toProxyLocation(), pos2.toProxyLocation(),0.5){
-            val particle = XParticle.
-            of(settingManager.getWorldEditSettings().getString("region-particle") ?: "VILLAGER_HAPPY")
-                .get().get()
-                ?: XParticle.HAPPY_VILLAGER.get()!!
+            val particle = runCatching {
+                Particle.valueOf(settingManager.getWorldEditSettings().getString("region-particle")?.uppercase() ?: "VILLAGER_HAPPY")
+            }.getOrDefault(Particle.VILLAGER_HAPPY)
             player.spawnParticle(particle,it.toBukkitLocation(),1)
         }
         particleTasks[player] = submitAsync(period = 20) {
