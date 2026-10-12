@@ -2,13 +2,11 @@ package cn.stingcraft.plugin.manager
 
 import cn.stingcraft.plugin.PlayerWorldEdit
 import com.google.gson.reflect.TypeToken
-import com.sk89q.worldedit.bukkit.BukkitAdapter
 import com.sk89q.worldedit.math.BlockVector3
 import com.sk89q.worldedit.regions.CuboidRegion
 import com.sk89q.worldedit.registry.state.Property
 import com.sk89q.worldedit.world.block.BlockState
 import com.sk89q.worldedit.world.block.BlockTypes
-import org.bukkit.Bukkit
 import org.bukkit.Material
 import org.bukkit.entity.Player
 import taboolib.expansion.getAutoDataContainer
@@ -17,10 +15,18 @@ import java.util.Base64
 import java.util.zip.GZIPInputStream
 import java.util.zip.GZIPOutputStream
 
+/** 一次操作中单个区块的原始方块快照 */
+class UndoBatch(val region: CuboidRegion, val states: List<BlockState>)
+
+/**
+ * 撤销记录
+ *
+ * 按区块分开存: 还原时每个区块要在它自己的区域线程上写入, 而且个别区块执行失败
+ * 也不会让整条记录错位。
+ */
 class UndoRecord(
     val worldName: String,
-    val region: CuboidRegion,
-    val states: List<BlockState>,
+    val batches: List<UndoBatch>,
     val material: Material,
     val amount: Int
 )
@@ -28,20 +34,6 @@ class UndoRecord(
 object UndoManager {
 
     private const val KEY = "undoRecords"
-
-    /**
-     * 记录区域当前方块快照
-     * @return 快照, 失败时返回 null
-     */
-    fun snapshot(worldName: String, region: CuboidRegion, material: Material): UndoRecord? = runCatching {
-        val bukkitWorld = Bukkit.getWorld(worldName) ?: return@runCatching null
-        val weWorld = BukkitAdapter.adapt(bukkitWorld)
-        val states = ArrayList<BlockState>(region.volume.toInt())
-        for (vector in region) {
-            states.add(weWorld.getBlock(vector))
-        }
-        UndoRecord(worldName, region, states, material, region.volume.toInt())
-    }.getOrNull()
 
     fun push(player: Player, record: UndoRecord, limit: Int) {
         val list = read(player).toMutableList()
@@ -85,15 +77,19 @@ object UndoManager {
     private fun UndoRecord.toStored(): StoredUndoRecord {
         return StoredUndoRecord(
             world = worldName,
-            minX = region.minimumPoint.x,
-            minY = region.minimumPoint.y,
-            minZ = region.minimumPoint.z,
-            maxX = region.maximumPoint.x,
-            maxY = region.maximumPoint.y,
-            maxZ = region.maximumPoint.z,
             material = material.name,
             amount = amount,
-            states = states.map { it.getAsString() }
+            batches = batches.map { batch ->
+                StoredUndoBatch(
+                    minX = batch.region.minimumPoint.x,
+                    minY = batch.region.minimumPoint.y,
+                    minZ = batch.region.minimumPoint.z,
+                    maxX = batch.region.maximumPoint.x,
+                    maxY = batch.region.maximumPoint.y,
+                    maxZ = batch.region.maximumPoint.z,
+                    states = batch.states.map { it.getAsString() }
+                )
+            }
         )
     }
 
@@ -129,26 +125,32 @@ private fun parseBlockState(raw: String): BlockState {
     return type.getState(properties)
 }
 
-private data class StoredUndoRecord(
-    val world: String,
+private data class StoredUndoBatch(
     val minX: Int,
     val minY: Int,
     val minZ: Int,
     val maxX: Int,
     val maxY: Int,
     val maxZ: Int,
-    val material: String,
-    val amount: Int,
     val states: List<String>
 ) {
 
-    fun toRecord(): UndoRecord {
-        return UndoRecord(
-            world,
+    fun toBatch(): UndoBatch {
+        return UndoBatch(
             CuboidRegion(BlockVector3.at(minX, minY, minZ), BlockVector3.at(maxX, maxY, maxZ)),
-            states.map { parseBlockState(it) },
-            Material.valueOf(material),
-            amount
+            states.map { parseBlockState(it) }
         )
+    }
+}
+
+private data class StoredUndoRecord(
+    val world: String,
+    val material: String,
+    val amount: Int,
+    val batches: List<StoredUndoBatch>
+) {
+
+    fun toRecord(): UndoRecord {
+        return UndoRecord(world, batches.map { it.toBatch() }, Material.valueOf(material), amount)
     }
 }

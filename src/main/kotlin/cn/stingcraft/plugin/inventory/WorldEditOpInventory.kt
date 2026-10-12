@@ -6,7 +6,6 @@ import org.bukkit.Material
 import org.bukkit.entity.Player
 import org.bukkit.inventory.Inventory
 import taboolib.common.platform.function.pluginId
-import taboolib.common.platform.function.submitAsync
 import taboolib.library.xseries.XMaterial
 import taboolib.module.chat.colored
 import taboolib.module.ui.buildMenu
@@ -56,7 +55,7 @@ object WorldEditOpInventory {
             }) {
                 openBlockPicker(player, "&f选择要设置的方块") { material ->
                     player.closeInventory()
-                    submitAsync { worldEditManager.trySetArea(player, material) }
+                    worldEditManager.trySetArea(player, material)
                 }
             }
             set(14, buildItem(XMaterial.ANVIL) {
@@ -67,7 +66,7 @@ object WorldEditOpInventory {
                 openBlockPicker(player, "&f选择原方块") { from ->
                     openBlockPicker(player, "&f选择新方块") { to ->
                         player.closeInventory()
-                        submitAsync { worldEditManager.tryReplaceArea(player, from, to) }
+                        worldEditManager.tryReplaceArea(player, from, to)
                     }
                 }
             }
@@ -76,13 +75,11 @@ object WorldEditOpInventory {
                 lore += "&7| 撤销最近一次操作并返还材料"
                 colored()
             }) {
-                submitAsync {
-                    val done = worldEditManager.undo(player, 1)
-                    if (done <= 0) {
-                        player.sendLang("message-undo-none", pluginId to "pluginId")
-                    } else {
-                        player.sendLang("message-undo-susses", pluginId to "pluginId", done to "times")
-                    }
+                val done = worldEditManager.undo(player, 1)
+                if (done <= 0) {
+                    player.sendLang("message-undo-none", pluginId to "pluginId")
+                } else {
+                    player.sendLang("message-undo-susses", pluginId to "pluginId", done to "times")
                 }
             }
         }

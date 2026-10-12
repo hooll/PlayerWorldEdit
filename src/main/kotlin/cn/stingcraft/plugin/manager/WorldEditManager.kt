@@ -5,11 +5,12 @@ import cn.stingcraft.plugin.hook.DominionHook
 import cn.stingcraft.plugin.until.WorldEditTool
 import cn.stingcraft.plugin.until.displayName
 import cn.stingcraft.plugin.until.markAsTool
-import com.sk89q.worldedit.bukkit.BukkitAdapter
-import com.sk89q.worldedit.EditSession
-import com.sk89q.worldedit.WorldEdit
+import cn.stingcraft.plugin.until.runOnChunkThreads
+import cn.stingcraft.plugin.until.runOnOwnThread
+import cn.stingcraft.plugin.until.splitByChunk
 import com.sk89q.worldedit.math.BlockVector3
 import com.sk89q.worldedit.regions.CuboidRegion
+import com.sk89q.worldedit.world.block.BlockState
 import com.sk89q.worldedit.world.block.BlockType
 import com.sk89q.worldedit.world.block.BlockTypes
 import org.bukkit.Bukkit
@@ -20,7 +21,6 @@ import org.bukkit.entity.Player
 import taboolib.common.platform.function.pluginId
 import taboolib.common.platform.function.submitAsync
 import taboolib.common.platform.service.PlatformExecutor
-import taboolib.common5.util.parseUUID
 import taboolib.library.xseries.XMaterial
 import taboolib.library.xseries.parseToXMaterial
 import taboolib.module.effect.createCube
@@ -30,6 +30,7 @@ import taboolib.platform.util.submit
 import taboolib.platform.util.toBukkitLocation
 import taboolib.platform.util.toProxyLocation
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicReferenceArray
 
 class WorldEditManager {
 
@@ -171,74 +172,23 @@ class WorldEditManager {
     }
 
     /**
-     * 设置区域方块
-     * @param player 玩家
-     * @param block 方块
-     * @return 是否实际执行
-     */
-    fun setAreaBlock(player: Player, block: Material): Boolean {
-        val region = getWERegion(player) ?: return false
-        val weBlockType = resolveBlockType(block) ?: return false
-        val record = UndoManager.snapshot(player.world.name, region, block)
-        WorldEditTool.setBlocks(player, region, weBlockType.defaultState)
-        if (record != null) UndoManager.push(player, record, undoLimit())
-        clearPlayerPos(player)
-        return true
-    }
-
-    /**
-     * 统计替换操作会命中多少方块 (按 WorldEdit 的过滤条件比较)
-     */
-    private fun countReplaceTargets(record: UndoRecord?, fromType: BlockType): Int {
-        val fromBaseBlock = fromType.defaultState.toBaseBlock()
-        return record?.states?.count { it.toBaseBlock() == fromBaseBlock } ?: 0
-    }
-
-    /**
-     * 执行替换
-     */
-    private fun applyReplace(player: Player, region: CuboidRegion, fromType: BlockType, toType: BlockType, record: UndoRecord?) {
-        val filterSet = setOf(fromType.defaultState.toBaseBlock())
-        val weWorld = BukkitAdapter.adapt(player.world)
-        WorldEdit.getInstance()
-            .newEditSession(weWorld)
-            .use { session: EditSession ->
-                session.replaceBlocks(region, filterSet, toType.defaultState)
-            }
-        if (record != null) UndoManager.push(player, record, undoLimit())
-        clearPlayerPos(player)
-    }
-
-    /**
-     * 解析方块类型
+     * 填充选区。
      *
-     * WorldEdit 注册表的键带命名空间 (minecraft:stone), Bukkit 的 Material 名没有,
-     * 直接传裸名会查不到 (注册表不做补全)
-     */
-    private fun resolveBlockType(material: Material): BlockType? {
-        val id = material.name.lowercase()
-        return BlockTypes.get("minecraft:$id") ?: BlockTypes.get(id)
-    }
-
-    /**
-     * 尝试填充选区, 校验区域与材料并发送提示
+     * Folia 下一个区域线程只能改自己拥有的区块, 越界修改会被 WorldEdit 静默丢弃 (不报错),
+     * 所以选区按区块拆开, 每块在它自己的区域线程上"先读后写"。各区块互不重叠, 读到的
+     * 一定还是填充前的方块, 可以直接当撤销快照。
      */
     fun trySetArea(player: Player, material: Material) {
-        if (!hasRegion(player)) {
-            player.sendLang("message-no-region", pluginId to "pluginId")
-            return
-        }
-        val pos1 = getPlayerPos1(player) ?: return
-        val pos2 = getPlayerPos2(player) ?: return
-        DominionHook.findDeniedDominion(player, pos1, pos2, needBreak = false)?.let { dominion ->
-            player.sendLang("message-dominion-denied", pluginId to "pluginId", dominion to "dominion")
-            return
-        }
-        if (resolveBlockType(material) == null) {
+        val region = validatedRegion(player, needBreak = false) ?: return
+        val blockType = resolveBlockType(material) ?: run {
             player.sendLang("message-invalid-material", pluginId to "pluginId", material.name to "material")
             return
         }
-        val amount = getCountInRegion(player)
+        val amount = region.volume.toInt()
+        if (amount <= 0) {
+            player.sendLang("message-no-region", pluginId to "pluginId")
+            return
+        }
         if (!PlayerWorldEdit.packManager.hasEnoughMaterial(player, material, amount)) {
             player.sendLang("message-materialpack-not-enough",
                 pluginId to "pluginId",
@@ -246,29 +196,39 @@ class WorldEditManager {
                 amount to "amount")
             return
         }
-        // 先执行, 成功后再扣材料, 避免扣了材料却没执行
-        if (!setAreaBlock(player, material)) {
-            player.sendLang("message-invalid-material", pluginId to "pluginId", material.name to "material")
-            return
-        }
-        PlayerWorldEdit.packManager.removeMaterial(player, material, amount)
-        player.sendLang("message-set-susses", pluginId to "pluginId")
+        // 先扣材料, 有区块没执行成功再按体积退还
+        chargeMaterial(player, material, amount)
+        val regions = region.splitByChunk()
+        val snapshots = AtomicReferenceArray<List<BlockState>?>(regions.size)
+        runOnChunkThreads(regions, player.world,
+            work = { index ->
+                snapshots[index] = WorldEditTool.readBlocks(player.world, regions[index])
+                WorldEditTool.setBlocks(player.world, regions[index], blockType.defaultState)
+            },
+            done = {
+                player.runOnOwnThread {
+                    finishEdit(
+                        player,
+                        regions,
+                        regions.indices.map { snapshots[it] },
+                        regions.map { it.volume.toInt() },
+                        material,
+                        amount,
+                        "message-set-susses"
+                    )
+                }
+            }
+        )
     }
 
     /**
-     * 尝试替换选区方块, 校验区域与材料并发送提示
+     * 替换选区内的方块。
+     *
+     * 分两轮逐区块执行: 第一轮只读 (统计实际会被替换的方块数量并留作撤销快照), 校验材料
+     * 扣费后再跑第二轮写入。收费按实际替换数量算, 收费和写入用的是同一份快照。
      */
     fun tryReplaceArea(player: Player, from: Material, to: Material) {
-        if (!hasRegion(player)) {
-            player.sendLang("message-no-region", pluginId to "pluginId")
-            return
-        }
-        val pos1 = getPlayerPos1(player) ?: return
-        val pos2 = getPlayerPos2(player) ?: return
-        DominionHook.findDeniedDominion(player, pos1, pos2, needBreak = true)?.let { dominion ->
-            player.sendLang("message-dominion-denied", pluginId to "pluginId", dominion to "dominion")
-            return
-        }
+        val region = validatedRegion(player, needBreak = true) ?: return
         val fromType = resolveBlockType(from)
         val toType = resolveBlockType(to)
         if (fromType == null || toType == null) {
@@ -276,25 +236,52 @@ class WorldEditManager {
                 (if (fromType == null) from else to).name to "material")
             return
         }
-        val region = getWERegion(player) ?: return
-        // 快照同时用于撤销和统计实际替换数量
-        val record = UndoManager.snapshot(player.world.name, region, to)
-        val amount = if (record == null) getCountInRegion(player) else countReplaceTargets(record, fromType)
-        if (amount <= 0) {
-            player.sendLang("message-replace-none", pluginId to "pluginId", from.displayName() to "material")
-            return
-        }
-        if (!PlayerWorldEdit.packManager.hasEnoughMaterial(player, to, amount)) {
-            player.sendLang("message-materialpack-not-enough",
-                pluginId to "pluginId",
-                to.displayName() to "material",
-                amount to "amount")
-            return
-        }
-        // 先执行, 成功后再扣材料, 避免扣了材料却没执行
-        applyReplace(player, region, fromType, toType, record)
-        PlayerWorldEdit.packManager.removeMaterial(player, to, amount)
-        player.sendLang("message-replace-susses", pluginId to "pluginId")
+        val regions = region.splitByChunk()
+        val snapshots = AtomicReferenceArray<List<BlockState>?>(regions.size)
+        runOnChunkThreads(regions, player.world,
+            work = { index ->
+                snapshots[index] = WorldEditTool.readBlocks(player.world, regions[index])
+            },
+            done = {
+                player.runOnOwnThread {
+                    val targets = regions.indices.filter { snapshots[it] != null }
+                    // 每个区块实际会被替换的数量, 收费和失败退费都以它为准
+                    val costs = targets.map { replaceTargets(snapshots[it]!!, fromType.defaultState) }
+                    val amount = costs.sum()
+                    if (amount <= 0) {
+                        player.sendLang("message-replace-none", pluginId to "pluginId", from.displayName() to "material")
+                        return@runOnOwnThread
+                    }
+                    if (!PlayerWorldEdit.packManager.hasEnoughMaterial(player, to, amount)) {
+                        player.sendLang("message-materialpack-not-enough",
+                            pluginId to "pluginId",
+                            to.displayName() to "material",
+                            amount to "amount")
+                        return@runOnOwnThread
+                    }
+                    chargeMaterial(player, to, amount)
+                    val batchRegions = targets.map { regions[it] }
+                    runOnChunkThreads(batchRegions, player.world,
+                        work = { index ->
+                            WorldEditTool.replaceBlocks(player.world, batchRegions[index], fromType.defaultState, toType.defaultState)
+                        },
+                        done = {
+                            player.runOnOwnThread {
+                                finishEdit(
+                                    player,
+                                    batchRegions,
+                                    targets.map { snapshots[it] },
+                                    costs,
+                                    to,
+                                    amount,
+                                    "message-replace-susses"
+                                )
+                            }
+                        }
+                    )
+                }
+            }
+        )
     }
 
     /**
@@ -307,25 +294,118 @@ class WorldEditManager {
         var done = 0
         repeat(times) {
             val record = UndoManager.poll(player) ?: return@repeat
-            val weWorld = Bukkit.getWorld(record.worldName)?.let { BukkitAdapter.adapt(it) }
-            if (weWorld == null) {
+            val bukkitWorld = Bukkit.getWorld(record.worldName)
+            if (bukkitWorld == null) {
                 // 世界未加载, 把记录放回去, 避免白丢一条
                 UndoManager.push(player, record, undoLimit())
                 return@repeat
             }
-            WorldEdit.getInstance()
-                .newEditSession(weWorld)
-                .use { session: EditSession ->
-                    var index = 0
-                    for (vector in record.region) {
-                        if (index >= record.states.size) break
-                        session.setBlock(vector, record.states[index++])
+            done++
+            val regions = record.batches.map { it.region }
+            runOnChunkThreads(regions, bukkitWorld,
+                work = { index ->
+                    WorldEditTool.restoreBlocks(bukkitWorld, regions[index], record.batches[index].states)
+                },
+                done = {
+                    player.runOnOwnThread {
+                        chargeMaterial(player, record.material, -record.amount)
                     }
                 }
-            PlayerWorldEdit.packManager.addMaterial(player, record.material, record.amount)
-            done++
+            )
         }
         return done
+    }
+
+    /**
+     * 编辑收尾 (必须在玩家所在线程执行): 记录撤销、退还失败部分的材料并提示
+     *
+     * @param snapshots 与 regions 一一对应, null 表示该区块执行失败
+     * @param costs 与 regions 一一对应, 表示该区块已经扣掉的材料数量 (失败时按它退还)
+     */
+    private fun finishEdit(
+        player: Player,
+        regions: List<CuboidRegion>,
+        snapshots: List<List<BlockState>?>,
+        costs: List<Int>,
+        material: Material,
+        amount: Int,
+        successKey: String
+    ) {
+        val succeeded = regions.indices.filter { snapshots[it] != null }
+        val refund = regions.indices.filter { snapshots[it] == null }.sumOf { costs[it] }
+        if (refund > 0) {
+            chargeMaterial(player, material, -refund)
+        }
+        clearPlayerPos(player)
+        if (succeeded.isEmpty()) {
+            player.sendLang("message-edit-failed", pluginId to "pluginId")
+            return
+        }
+        UndoManager.push(
+            player,
+            UndoRecord(
+                player.world.name,
+                succeeded.map { UndoBatch(regions[it], snapshots[it]!!) },
+                material,
+                amount - refund
+            ),
+            undoLimit()
+        )
+        if (refund > 0) {
+            player.sendLang("message-edit-failed", pluginId to "pluginId")
+        } else {
+            player.sendLang(successKey, pluginId to "pluginId")
+        }
+    }
+
+    /**
+     * 选区校验: 区域必须完整, 且没有领地拦截
+     */
+    private fun validatedRegion(player: Player, needBreak: Boolean): CuboidRegion? {
+        if (!hasRegion(player)) {
+            player.sendLang("message-no-region", pluginId to "pluginId")
+            return null
+        }
+        val region = getWERegion(player) ?: return null
+        val pos1 = getPlayerPos1(player) ?: return null
+        val pos2 = getPlayerPos2(player) ?: return null
+        DominionHook.findDeniedDominion(player, pos1, pos2, needBreak = needBreak)?.let { dominion ->
+            player.sendLang("message-dominion-denied", pluginId to "pluginId", dominion to "dominion")
+            return null
+        }
+        return region
+    }
+
+    /**
+     * 增减创世神背包里的材料 (空气不计数)
+     * @param delta 正数为扣除, 负数为退还
+     */
+    private fun chargeMaterial(player: Player, material: Material, delta: Int) {
+        if (material.isAir || delta == 0) return
+        if (delta > 0) {
+            PlayerWorldEdit.packManager.removeMaterial(player, material, delta)
+        } else {
+            PlayerWorldEdit.packManager.addMaterial(player, material, -delta)
+        }
+    }
+
+    /**
+     * 统计快照里有多少方块会被替换
+     */
+    private fun replaceTargets(states: List<BlockState>, from: BlockState): Int {
+        val fromBase = from.toBaseBlock()
+        return states.count { it.toBaseBlock() == fromBase }
+    }
+
+    /**
+     * 解析方块类型
+     *
+     * WorldEdit 注册表的键带命名空间 (minecraft:stone), Bukkit 的 Material 名没有,
+     * 直接传裸名会查不到 (注册表不做补全)
+     */
+    private fun resolveBlockType(material: Material): BlockType? {
+        val id = material.name.lowercase()
+        return BlockTypes.get("minecraft:$id") ?: BlockTypes.get(id)
     }
 
     private fun undoLimit(): Int {

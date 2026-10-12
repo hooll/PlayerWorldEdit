@@ -49,3 +49,4 @@ message-dominion-denied: '&8[&3&l{pluginId}&8] &7选区包含领地 &f{dominion}
 message-invalid-material: '&8[&3&l{pluginId}&8] &7无效的方块: &f{material}'
 message-different-world: '&8[&3&l{pluginId}&8] &7两个点必须选在同一个世界'
 message-replace-none: '&8[&3&l{pluginId}&8] &7选区里没有 &f{material}'
+message-edit-failed: '&8[&3&l{pluginId}&8] &7操作未能完全执行, 失败部分的材料已退还'

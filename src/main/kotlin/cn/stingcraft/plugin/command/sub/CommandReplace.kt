@@ -7,7 +7,6 @@ import org.bukkit.entity.Player
 import taboolib.common.platform.command.CommandContext
 import taboolib.common.platform.command.subCommand
 import taboolib.common.platform.function.pluginId
-import taboolib.common.platform.function.submitAsync
 import taboolib.platform.util.sendLang
 
 object CommandReplace {
@@ -32,9 +31,8 @@ object CommandReplace {
                         sender.sendLang("message-invalid-material", pluginId to "pluginId", context["to"] to "material")
                         return@execute
                     }
-                    submitAsync {
-                        worldEditManager.tryReplaceArea(sender, from, to)
-                    }
+                    // 内部会按区块丢到各自区域线程上执行, 这里不能异步
+                    worldEditManager.tryReplaceArea(sender, from, to)
                 }
             }
         }

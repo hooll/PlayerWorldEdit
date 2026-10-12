@@ -5,7 +5,6 @@ import org.bukkit.entity.Player
 import taboolib.common.platform.command.CommandContext
 import taboolib.common.platform.command.subCommand
 import taboolib.common.platform.function.pluginId
-import taboolib.common.platform.function.submitAsync
 import taboolib.platform.util.sendLang
 
 object CommandUndo {
@@ -25,13 +24,12 @@ object CommandUndo {
     }
 
     private fun undo(player: Player, times: Int) {
-        submitAsync {
-            val done = PlayerWorldEdit.worldEditManager.undo(player, times.coerceIn(1, 10))
-            if (done <= 0) {
-                player.sendLang("message-undo-none", pluginId to "pluginId")
-            } else {
-                player.sendLang("message-undo-susses", pluginId to "pluginId", done to "times")
-            }
+        // 内部会按区块丢到各自区域线程上执行, 这里不能异步
+        val done = PlayerWorldEdit.worldEditManager.undo(player, times.coerceIn(1, 10))
+        if (done <= 0) {
+            player.sendLang("message-undo-none", pluginId to "pluginId")
+        } else {
+            player.sendLang("message-undo-susses", pluginId to "pluginId", done to "times")
         }
     }
 }
