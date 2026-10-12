@@ -7,7 +7,6 @@ import org.bukkit.World
 import org.bukkit.entity.BlockDisplay
 import org.bukkit.entity.Display
 import org.bukkit.entity.Player
-import org.bukkit.plugin.Plugin
 import org.bukkit.util.Transformation
 import taboolib.common.platform.function.warning
 import taboolib.platform.util.runTask
@@ -19,13 +18,15 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * 做法和 Dominion 一样: 在选区最小角放 6 个 [BlockDisplay] —— 底、顶、四个侧面各一片薄板,
  * 缩放成选区的宽高深, 亮度拉满(15/15), 看起来就是一个发光的半透明白玻璃盒。
- * 实体只发给选区主人自己 (`setVisibleByDefault(false)` + `showEntity`), 别人看不到。
+ * 注意: 不要用 `setVisibleByDefault(false)` + `showEntity` 来"只发给主人" —— 实测这样只会
+ * 发出去一个生成包, 方块数据和缩放这些 metadata 不会补发, 客户端拿到的是一条空显示体,
+ * 结果就是"实体在服务端存在但谁都看不见"。实体是不可见的非持久实体, 附近玩家能看到这个盒子。
  *
  * 为什么实体放在选区角上而不是玩家身上: Folia 里实体必须在**拥有它的区域线程**上创建/修改/删除,
  * 选区角所在的区域和玩家所在的区域不一定是同一个, 所以这些操作统一用 `World.runTask(x, z)`
  * 排到对应区域线程; 只有 `showEntity` 这一步回到玩家自己的线程做。
  */
-class AreaDisplay(private val plugin: Plugin) {
+class AreaDisplay {
 
     private class Box(val world: World, val x: Int, val z: Int, val entities: List<BlockDisplay>)
 
@@ -37,7 +38,7 @@ class AreaDisplay(private val plugin: Plugin) {
     /**
      * 画出选区盒子; 选区不完整或实体创建失败时什么都不做 (调用方会退回粒子边框)
      */
-    fun show(player: Player, region: CuboidRegion, material: Material) {
+    fun show(player: Player, region: CuboidRegion, material: Material, onFailure: () -> Unit = {}) {
         if (!player.isOnline) return
         val min = region.minimumPoint
         val max = region.maximumPoint
@@ -45,10 +46,19 @@ class AreaDisplay(private val plugin: Plugin) {
         val sizeX = (max.x - min.x + 1).toFloat()
         val sizeY = (max.y - min.y + 1).toFloat()
         val sizeZ = (max.z - min.z + 1).toFloat()
-        if (sizeX <= 0f || sizeY <= 0f || sizeZ <= 0f) return
+        if (sizeX <= 0f || sizeY <= 0f || sizeZ <= 0f) {
+            onFailure()
+            return
+        }
         val world = player.world
         val origin = Location(world, min.x.toDouble(), min.y.toDouble(), min.z.toDouble())
-        val transformations = runCatching { boxFaces(sizeX, sizeY, sizeZ) }.getOrNull() ?: return
+        val transformations = runCatching { boxFaces(sizeX, sizeY, sizeZ) }.onFailure {
+            warning("[PlayerWorldEdit] 计算选区盒子失败: $it")
+        }.getOrNull()
+        if (transformations == null) {
+            onFailure()
+            return
+        }
         hide(player)
         val generation = nextGeneration(player.uniqueId)
         world.runTask(origin.x, origin.z, Runnable {
@@ -64,7 +74,6 @@ class AreaDisplay(private val plugin: Plugin) {
                         display.isInvulnerable = true
                         display.isSilent = true
                         display.setGravity(false)
-                        display.setVisibleByDefault(false)
                         display.transformation = transformation
                     }
                 }.onSuccess {
@@ -73,18 +82,17 @@ class AreaDisplay(private val plugin: Plugin) {
                     warning("[PlayerWorldEdit] 创建选区显示体失败: $it")
                 }
             }
+            if (spawned.isEmpty()) {
+                warning("[PlayerWorldEdit] 选区盒子一个显示体都没建出来, 退回粒子边框")
+                onFailure()
+                return@Runnable
+            }
             // 选区已经变了或者玩家下线了, 这组实体就不要了
-            if (spawned.isEmpty() || generations[player.uniqueId] != generation || !player.isOnline) {
+            if (generations[player.uniqueId] != generation || !player.isOnline) {
                 spawned.forEach { runCatching { it.remove() } }
                 return@Runnable
             }
             boxes[player.uniqueId] = Box(world, min.x, min.z, spawned)
-            // 只给选区主人看
-            player.runOnOwnThread {
-                runCatching { spawned.forEach { player.showEntity(plugin, it) } }.onFailure {
-                    warning("[PlayerWorldEdit] 显示选区盒子失败: $it")
-                }
-            }
         })
     }
 

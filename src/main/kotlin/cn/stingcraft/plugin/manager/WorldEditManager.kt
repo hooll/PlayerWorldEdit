@@ -30,7 +30,6 @@ import taboolib.common.platform.service.PlatformExecutor
 import taboolib.library.xseries.XMaterial
 import taboolib.library.xseries.parseToXMaterial
 import taboolib.module.effect.createCube
-import taboolib.platform.BukkitPlugin
 import taboolib.platform.util.buildItem
 import taboolib.platform.util.runTask
 import taboolib.platform.util.sendLang
@@ -53,8 +52,7 @@ class WorldEditManager {
     private val editing = ConcurrentHashMap.newKeySet<UUID>()
 
     // 选区可视化 (半透明玻璃盒子), 用不了时退回粒子边框
-    // 必须 lazy: 类初始化阶段 (插件主类还没构造完) BukkitPlugin.getInstance() 还不存在
-    private val areaDisplay by lazy { AreaDisplay(BukkitPlugin.getInstance()) }
+    private val areaDisplay = AreaDisplay()
 
     private val settingManager = PlayerWorldEdit.settingManager
 
@@ -131,7 +129,7 @@ class WorldEditManager {
         }
         if (displayEnabled()) {
             stopParticle(player)
-            areaDisplay.show(player, region, displayMaterial())
+            areaDisplay.show(player, region, displayMaterial()) { showParticle(player) }
         } else {
             areaDisplay.hide(player)
             showParticle(player)
