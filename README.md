@@ -63,6 +63,12 @@
 装了 Dominion 时, 选区里只要碰到你没有放置权限的领地就直接拒绝, 并告诉你被哪个领地拦下;
 替换操作还额外需要破坏权限。
 
+### 记录与回滚
+
+装了 CoreProtect 时, 本插件的编辑会**带上玩家身份**写进 CoreProtect 记录, 所以即使撤销记录
+被删掉, 也能用 `/co rollback` 按玩家 + 时间把改动回滚。可以在 `settings.yml` 里用
+`coreprotect-logging: false` 关掉(大范围操作会因此少写几十万行记录)。
+
 ### 撤销
 
 - 每次填充/替换都会留一条撤销记录, 存成文件: `plugins/PlayerWorldEdit/undo/<玩家UUID>/<时间戳>.json.gz`

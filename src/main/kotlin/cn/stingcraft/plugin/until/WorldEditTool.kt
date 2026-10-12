@@ -3,6 +3,7 @@ package cn.stingcraft.plugin.until
 import com.sk89q.worldedit.EditSession
 import com.sk89q.worldedit.WorldEdit
 import com.sk89q.worldedit.bukkit.BukkitAdapter
+import com.sk89q.worldedit.extension.platform.Actor
 import com.sk89q.worldedit.regions.Region
 import com.sk89q.worldedit.world.block.BlockState
 import org.bukkit.World
@@ -29,22 +30,22 @@ object WorldEditTool {
         }
     }
 
-    fun setBlocks(world: World, region: Region, blockState: BlockState) {
-        newSession(world).use { session ->
+    fun setBlocks(world: World, region: Region, blockState: BlockState, actor: Actor? = null) {
+        newSession(world, actor).use { session ->
             session.setBlocks(region, blockState)
         }
     }
 
-    fun replaceBlocks(world: World, region: Region, from: BlockState, to: BlockState) {
-        newSession(world).use { session ->
+    fun replaceBlocks(world: World, region: Region, from: BlockState, to: BlockState, actor: Actor? = null) {
+        newSession(world, actor).use { session ->
             session.replaceBlocks(region, setOf(from.toBaseBlock()), to)
         }
     }
 
     /** 按 [RegionSlice] 把整块快照里对应的那一段写回这片区域 */
-    fun restoreBlocks(world: World, slice: RegionSlice, states: List<BlockState>) {
+    fun restoreBlocks(world: World, slice: RegionSlice, states: List<BlockState>, actor: Actor? = null) {
         val end = minOf(slice.offset + slice.size, states.size)
-        newSession(world).use { session ->
+        newSession(world, actor).use { session ->
             var index = slice.offset
             for (vector in slice.region) {
                 if (index >= end) break
@@ -53,7 +54,18 @@ object WorldEditTool {
         }
     }
 
-    private fun newSession(world: World): EditSession {
-        return WorldEdit.getInstance().newEditSession(BukkitAdapter.adapt(world))
+    /**
+     * 建 EditSession。
+     *
+     * [actor] 不是可有可无的: CoreProtect 的 WorldEdit 记录只看
+     * `EditSessionEvent.getActor() != null` 这一个条件, session 不带 actor 时它整条跳过 ——
+     * 带上了才会把这些方块改动记到该玩家名下, 出事时还能用 /co rollback 兜底。
+     */
+    private fun newSession(world: World, actor: Actor?): EditSession {
+        val builder = WorldEdit.getInstance().newEditSessionBuilder().world(BukkitAdapter.adapt(world))
+        if (actor != null) {
+            builder.actor(actor)
+        }
+        return builder.build()
     }
 }

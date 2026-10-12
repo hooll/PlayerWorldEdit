@@ -21,3 +21,5 @@ world-edit:
   undo-limit: 10
   # 性能: 全服每 tick 允许改动的方块总数。越小越不卡, 大范围操作耗时越长
   blocks-per-tick: 20000
+  # 编辑时带上玩家身份, 装了 CoreProtect 才会把改动记到玩家名下 (可以用 /co rollback 回滚)
+  coreprotect-logging: true

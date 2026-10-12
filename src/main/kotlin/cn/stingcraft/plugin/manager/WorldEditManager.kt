@@ -9,6 +9,8 @@ import cn.stingcraft.plugin.until.markAsTool
 import cn.stingcraft.plugin.until.runOnChunkThreads
 import cn.stingcraft.plugin.until.runOnOwnThread
 import cn.stingcraft.plugin.until.splitByChunk
+import com.sk89q.worldedit.bukkit.BukkitAdapter
+import com.sk89q.worldedit.extension.platform.Actor
 import com.sk89q.worldedit.math.BlockVector3
 import com.sk89q.worldedit.regions.CuboidRegion
 import com.sk89q.worldedit.world.block.BlockState
@@ -227,6 +229,7 @@ class WorldEditManager {
         // 先扣材料, 有区块没执行成功再按体积退还
         chargeMaterial(player, material, amount)
         prepareEdit(amount, player)
+        val actor = actorOf(player)
         val regions = region.splitByChunk()
         val snapshots = AtomicReferenceArray<Array<BlockState?>?>(regions.size)
         runOnChunkThreads(regions, player.world,
@@ -235,7 +238,7 @@ class WorldEditManager {
                 val states = snapshots.get(index)
                     ?: arrayOfNulls<BlockState>(chunk.volume.toInt()).also { snapshots.set(index, it) }
                 WorldEditTool.readBlocksInto(player.world, slice.region, states, slice.offset)
-                WorldEditTool.setBlocks(player.world, slice.region, blockType.defaultState)
+                WorldEditTool.setBlocks(player.world, slice.region, blockType.defaultState, actor)
             },
             done = {
                 player.runOnOwnThread {
@@ -299,11 +302,12 @@ class WorldEditManager {
                     }
                     chargeMaterial(player, to, amount)
                     prepareEdit(amount, player)
+                    val actor = actorOf(player)
                     val batchRegions = targets.map { regions[it] }
                     val batchSnapshots = targets.map { snapshots[it] }
                     runOnChunkThreads(batchRegions, player.world,
                         work = { index, slice ->
-                            WorldEditTool.replaceBlocks(player.world, slice.region, fromType.defaultState, toType.defaultState)
+                            WorldEditTool.replaceBlocks(player.world, slice.region, fromType.defaultState, toType.defaultState, actor)
                         },
                         done = {
                             player.runOnOwnThread {
@@ -343,10 +347,11 @@ class WorldEditManager {
             }
             done++
             EditBudget.configure(blocksPerTick())
+            val actor = actorOf(player)
             val regions = record.batches.map { it.region }
             runOnChunkThreads(regions, bukkitWorld,
                 work = { index, slice ->
-                    WorldEditTool.restoreBlocks(bukkitWorld, slice, record.batches[index].states)
+                    WorldEditTool.restoreBlocks(bukkitWorld, slice, record.batches[index].states, actor)
                 },
                 done = {
                     player.runOnOwnThread {
@@ -455,6 +460,20 @@ class WorldEditManager {
     }
 
     /**
+     * 给 EditSession 挂的玩家 actor, 关掉时返回 null (改回"不带身份"的编辑)
+     *
+     * CoreProtect 的 WorldEdit 记录只看 `EditSessionEvent.getActor() != null`, 不带 actor 的
+     * session 它整条跳过, 于是插件改了几十万方块 CoreProtect 一条都没记 (2026-10-12 的事故)。
+     * 代价是大范围操作会往 CoreProtect 写同样数量的记录, 觉得吵可以用这个开关关掉。
+     */
+    private fun actorOf(player: Player): Actor? {
+        if (!settingManager.getWorldEditSettings().getBoolean(COREPROTECT_LOGGING_KEY, true)) {
+            return null
+        }
+        return runCatching { BukkitAdapter.adapt(player) }.getOrNull()
+    }
+
+    /**
      * 增减创世神背包里的材料 (空气不计数)
      * @param delta 正数为扣除, 负数为退还
      */
@@ -523,6 +542,9 @@ class WorldEditManager {
     }
 
     private companion object {
+
+        /** 是否让外部 WE 记录插件 (CoreProtect 等) 按玩家身份记录本插件的编辑 */
+        const val COREPROTECT_LOGGING_KEY = "coreprotect-logging"
 
         /** 选区粒子边框在最长边上画多少个点 (其余边按同样步长, 总点数因此有上限) */
         const val PARTICLE_POINTS_PER_EDGE = 100.0
