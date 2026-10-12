@@ -15,14 +15,18 @@ import org.bukkit.World
  */
 object WorldEditTool {
 
-    /** 读出区域内的全部方块, 顺序就是 [Region] 的迭代顺序, [restoreBlocks] 按同样顺序写回 */
-    fun readBlocks(world: World, region: Region): List<BlockState> {
+    /**
+     * 读出一片方块, 直接写进 [target] 的下标 [offset] 开始的位置
+     *
+     * 顺序就是 [Region] 的迭代顺序 (y -> z -> x), [restoreBlocks] 按同样顺序写回。
+     * 大选区不用先建临时 List 再拷一遍, 少一次分配和复制。
+     */
+    fun readBlocksInto(world: World, region: Region, target: Array<BlockState?>, offset: Int) {
         val weWorld = BukkitAdapter.adapt(world)
-        val states = ArrayList<BlockState>(region.volume.toInt())
+        var index = offset
         for (vector in region) {
-            states += weWorld.getBlock(vector)
+            target[index++] = weWorld.getBlock(vector)
         }
-        return states
     }
 
     fun setBlocks(world: World, region: Region, blockState: BlockState) {
@@ -37,11 +41,13 @@ object WorldEditTool {
         }
     }
 
-    fun restoreBlocks(world: World, region: Region, states: List<BlockState>) {
+    /** 按 [RegionSlice] 把整块快照里对应的那一段写回这片区域 */
+    fun restoreBlocks(world: World, slice: RegionSlice, states: List<BlockState>) {
+        val end = minOf(slice.offset + slice.size, states.size)
         newSession(world).use { session ->
-            var index = 0
-            for (vector in region) {
-                if (index >= states.size) break
+            var index = slice.offset
+            for (vector in slice.region) {
+                if (index >= end) break
                 session.setBlock(vector, states[index++])
             }
         }

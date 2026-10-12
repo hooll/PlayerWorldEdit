@@ -2,6 +2,7 @@ package cn.stingcraft.plugin.manager
 
 import cn.stingcraft.plugin.PlayerWorldEdit
 import cn.stingcraft.plugin.hook.DominionHook
+import cn.stingcraft.plugin.until.EditBudget
 import cn.stingcraft.plugin.until.WorldEditTool
 import cn.stingcraft.plugin.until.displayName
 import cn.stingcraft.plugin.until.markAsTool
@@ -26,12 +27,15 @@ import taboolib.library.xseries.XMaterial
 import taboolib.library.xseries.parseToXMaterial
 import taboolib.module.effect.createCube
 import taboolib.platform.util.buildItem
+import taboolib.platform.util.runTask
 import taboolib.platform.util.sendLang
-import taboolib.platform.util.submit
 import taboolib.platform.util.toBukkitLocation
 import taboolib.platform.util.toProxyLocation
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReferenceArray
+import kotlin.math.abs
+import kotlin.math.max
 
 class WorldEditManager {
 
@@ -39,6 +43,9 @@ class WorldEditManager {
     private val playerpos = ConcurrentHashMap<Player, Pair<Location?, Location?>>()
 
     private val particleTasks = ConcurrentHashMap<Player, PlatformExecutor.PlatformTask>()
+
+    // 正在执行编辑的玩家, 避免同一玩家并发跑两个选区操作
+    private val editing = ConcurrentHashMap.newKeySet<UUID>()
 
     private val settingManager = PlayerWorldEdit.settingManager
 
@@ -101,33 +108,43 @@ class WorldEditManager {
 
     /**
      * 显示粒子
+     *
+     * 边框粒度随选区尺寸自适应 (最长边固定 100 个点), 而且**按区块合并成一次任务**:
+     * 原来是每个粒子点提交一个区域任务, 一个百来格的选区每秒钟会提交两千多个任务,
+     * 区域线程光排队就卡住了。
+     *
      * @param player 玩家
      */
     fun showParticle(player: Player) {
-        if (particleTasks[player] != null) {
-            particleTasks[player]?.cancel()
-            particleTasks.remove(player)
-        }
-        var tick = 0
-        val pos1 = getPlayerPos1(player)?: return
+        stopParticle(player)
+        val pos1 = getPlayerPos1(player) ?: return
         val pos2 = getPlayerPos2(player) ?: return
         val particle = resolveParticle(settingManager.getWorldEditSettings().getString("region-particle")) ?: return
-        val cube = createCube(pos1.toProxyLocation(), pos2.toProxyLocation(),0.5){
-            val bukkitLocation = it.toBukkitLocation()
-            bukkitLocation.submit {
-                player.spawnParticle(particle, bukkitLocation, 1)
-            }
-        }
+        val world = player.world
+        val step = max(0.5, max(abs(pos1.x - pos2.x), max(abs(pos1.y - pos2.y), abs(pos1.z - pos2.z))) / PARTICLE_POINTS_PER_EDGE)
+        val points = createCube(pos1.toProxyLocation(), pos2.toProxyLocation(), step).calculateLocations()
+            .map { it.toBukkitLocation() }
+        // 按区块分组, 每秒每个区块只提交一个任务
+        val pointsByChunk = points.groupBy { (it.blockX shr 4) to (it.blockZ shr 4) }
+        var tick = 0
         particleTasks[player] = submitAsync(period = 20) {
-            if (tick >= 60*20) {
+            if (tick >= 60*20 || !player.isOnline) {
                 cancel()
                 particleTasks.remove(player)
                 return@submitAsync
             }
-            cube.show()
+            pointsByChunk.forEach { (chunk, locations) ->
+                world.runTask(chunk.first * 16.0, chunk.second * 16.0, Runnable {
+                    if (!player.isOnline) return@Runnable
+                    locations.forEach { player.spawnParticle(particle, it, 1) }
+                })
+            }
             tick += 20
         }
+    }
 
+    private fun stopParticle(player: Player) {
+        particleTasks.remove(player)?.cancel()
     }
 
 
@@ -157,10 +174,8 @@ class WorldEditManager {
      */
     fun clearPlayerPos(player: Player) {
         playerpos.remove(player)
-        if (particleTasks[player] != null) {
-            particleTasks[player]?.cancel()
-            particleTasks.remove(player)
-        }
+        stopParticle(player)
+        endEdit(player)
     }
 
     /**
@@ -187,7 +202,8 @@ class WorldEditManager {
      *
      * Folia 下一个区域线程只能改自己拥有的区块, 越界修改会被 WorldEdit 静默丢弃 (不报错),
      * 所以选区按区块拆开, 每块在它自己的区域线程上"先读后写"。各区块互不重叠, 读到的
-     * 一定还是填充前的方块, 可以直接当撤销快照。
+     * 一定还是填充前的方块, 可以直接当撤销快照。大选区再按 [EditBudget] 一片一片来,
+     * 不会把区域线程一次占住。
      */
     fun trySetArea(player: Player, material: Material) {
         val region = validatedRegion(player, needBreak = false) ?: return
@@ -207,14 +223,19 @@ class WorldEditManager {
                 amount to "amount")
             return
         }
+        if (!beginEdit(player)) return
         // 先扣材料, 有区块没执行成功再按体积退还
         chargeMaterial(player, material, amount)
+        prepareEdit(amount, player)
         val regions = region.splitByChunk()
-        val snapshots = AtomicReferenceArray<List<BlockState>?>(regions.size)
+        val snapshots = AtomicReferenceArray<Array<BlockState?>?>(regions.size)
         runOnChunkThreads(regions, player.world,
-            work = { index ->
-                snapshots[index] = WorldEditTool.readBlocks(player.world, regions[index])
-                WorldEditTool.setBlocks(player.world, regions[index], blockType.defaultState)
+            work = { index, slice ->
+                val chunk = regions[index]
+                val states = snapshots.get(index)
+                    ?: arrayOfNulls<BlockState>(chunk.volume.toInt()).also { snapshots.set(index, it) }
+                WorldEditTool.readBlocksInto(player.world, slice.region, states, slice.offset)
+                WorldEditTool.setBlocks(player.world, slice.region, blockType.defaultState)
             },
             done = {
                 player.runOnOwnThread {
@@ -247,20 +268,25 @@ class WorldEditManager {
                 (if (fromType == null) from else to).name to "material")
             return
         }
+        if (!beginEdit(player)) return
         val regions = region.splitByChunk()
-        val snapshots = AtomicReferenceArray<List<BlockState>?>(regions.size)
+        val snapshots = AtomicReferenceArray<Array<BlockState?>?>(regions.size)
         runOnChunkThreads(regions, player.world,
-            work = { index ->
-                snapshots[index] = WorldEditTool.readBlocks(player.world, regions[index])
+            work = { index, slice ->
+                val chunk = regions[index]
+                val states = snapshots.get(index)
+                    ?: arrayOfNulls<BlockState>(chunk.volume.toInt()).also { snapshots.set(index, it) }
+                WorldEditTool.readBlocksInto(player.world, slice.region, states, slice.offset)
             },
             done = {
                 player.runOnOwnThread {
-                    val targets = regions.indices.filter { snapshots[it] != null }
+                    val targets = regions.indices.filter { isComplete(snapshots[it]) }
                     // 每个区块实际会被替换的数量, 收费和失败退费都以它为准
                     val costs = targets.map { replaceTargets(snapshots[it]!!, fromType.defaultState) }
                     val amount = costs.sum()
                     if (amount <= 0) {
                         player.sendLang("message-replace-none", pluginId to "pluginId", from.displayName(player) to "material")
+                        endEdit(player)
                         return@runOnOwnThread
                     }
                     if (!PlayerWorldEdit.packManager.hasEnoughMaterial(player, to, amount)) {
@@ -268,20 +294,23 @@ class WorldEditManager {
                             pluginId to "pluginId",
                             to.displayName(player) to "material",
                             amount to "amount")
+                        endEdit(player)
                         return@runOnOwnThread
                     }
                     chargeMaterial(player, to, amount)
+                    prepareEdit(amount, player)
                     val batchRegions = targets.map { regions[it] }
+                    val batchSnapshots = targets.map { snapshots[it] }
                     runOnChunkThreads(batchRegions, player.world,
-                        work = { index ->
-                            WorldEditTool.replaceBlocks(player.world, batchRegions[index], fromType.defaultState, toType.defaultState)
+                        work = { index, slice ->
+                            WorldEditTool.replaceBlocks(player.world, slice.region, fromType.defaultState, toType.defaultState)
                         },
                         done = {
                             player.runOnOwnThread {
                                 finishEdit(
                                     player,
                                     batchRegions,
-                                    targets.map { snapshots[it] },
+                                    batchSnapshots,
                                     costs,
                                     to,
                                     amount,
@@ -302,6 +331,7 @@ class WorldEditManager {
      * @return 实际撤销次数
      */
     fun undo(player: Player, times: Int): Int {
+        if (!beginEdit(player)) return 0
         var done = 0
         repeat(times) {
             val record = UndoManager.poll(player) ?: return@repeat
@@ -312,10 +342,11 @@ class WorldEditManager {
                 return@repeat
             }
             done++
+            EditBudget.configure(blocksPerTick())
             val regions = record.batches.map { it.region }
             runOnChunkThreads(regions, bukkitWorld,
-                work = { index ->
-                    WorldEditTool.restoreBlocks(bukkitWorld, regions[index], record.batches[index].states)
+                work = { index, slice ->
+                    WorldEditTool.restoreBlocks(bukkitWorld, slice, record.batches[index].states)
                 },
                 done = {
                     player.runOnOwnThread {
@@ -324,26 +355,28 @@ class WorldEditManager {
                 }
             )
         }
+        endEdit(player)
         return done
     }
 
     /**
      * 编辑收尾 (必须在玩家所在线程执行): 记录撤销、退还失败部分的材料并提示
      *
-     * @param snapshots 与 regions 一一对应, null 表示该区块执行失败
+     * @param snapshots 与 regions 一一对应, null 或含 null 表示该区块没跑完
      * @param costs 与 regions 一一对应, 表示该区块已经扣掉的材料数量 (失败时按它退还)
      */
     private fun finishEdit(
         player: Player,
         regions: List<CuboidRegion>,
-        snapshots: List<List<BlockState>?>,
+        snapshots: List<Array<BlockState?>?>,
         costs: List<Int>,
         material: Material,
         amount: Int,
         successKey: String
     ) {
-        val succeeded = regions.indices.filter { snapshots[it] != null }
-        val refund = regions.indices.filter { snapshots[it] == null }.sumOf { costs[it] }
+        endEdit(player)
+        val succeeded = regions.indices.filter { isComplete(snapshots[it]) }
+        val refund = regions.indices.filter { !isComplete(snapshots[it]) }.sumOf { costs[it] }
         if (refund > 0) {
             chargeMaterial(player, material, -refund)
         }
@@ -352,16 +385,22 @@ class WorldEditManager {
             player.sendLang("message-edit-failed", pluginId to "pluginId")
             return
         }
-        UndoManager.push(
-            player,
-            UndoRecord(
-                player.world.name,
-                succeeded.map { UndoBatch(regions[it], snapshots[it]!!) },
-                material,
-                amount - refund
-            ),
-            undoLimit()
-        )
+        val changed = amount - refund
+        if (changed > undoMaxBlocks()) {
+            // 撤销记录会按方块数写进玩家数据, 太大的不记, 免得把 data.db 撑爆
+            player.sendLang("message-undo-too-large", pluginId to "pluginId", changed to "amount")
+        } else {
+            UndoManager.pushAsync(
+                player,
+                UndoRecord(
+                    player.world.name,
+                    succeeded.map { UndoBatch(regions[it], snapshots[it]!!.filterNotNull()) },
+                    material,
+                    changed
+                ),
+                undoLimit()
+            )
+        }
         if (refund > 0) {
             player.sendLang("message-edit-failed", pluginId to "pluginId")
         } else {
@@ -388,6 +427,39 @@ class WorldEditManager {
     }
 
     /**
+     * 标记玩家开始编辑; 已经在跑别的选区操作就拒绝
+     *
+     * 大选区现在会跨很多个 tick 才做完, 玩家容易以为没生效而重复点, 两个操作叠在一起
+     * 会重复扣材料、撤销记录也会错位。
+     */
+    private fun beginEdit(player: Player): Boolean {
+        if (!editing.add(player.uniqueId)) {
+            player.sendLang("message-edit-busy", pluginId to "pluginId")
+            return false
+        }
+        return true
+    }
+
+    private fun endEdit(player: Player) {
+        editing.remove(player.uniqueId)
+    }
+
+    /**
+     * 按当前配置准备这次编辑: 套用每 tick 预算, 大操作提前给玩家一个"在处理"的提示
+     */
+    private fun prepareEdit(amount: Int, player: Player) {
+        EditBudget.configure(blocksPerTick())
+        if (amount > EditBudget.perTick) {
+            player.sendLang("message-edit-processing", pluginId to "pluginId", amount to "amount")
+        }
+    }
+
+    /** 区块快照是否完整 (跑失败了会留下 null) */
+    private fun isComplete(states: Array<BlockState?>?): Boolean {
+        return states != null && states.none { it == null }
+    }
+
+    /**
      * 增减创世神背包里的材料 (空气不计数)
      * @param delta 正数为扣除, 负数为退还
      */
@@ -403,9 +475,9 @@ class WorldEditManager {
     /**
      * 统计快照里有多少方块会被替换
      */
-    private fun replaceTargets(states: List<BlockState>, from: BlockState): Int {
+    private fun replaceTargets(states: Array<BlockState?>, from: BlockState): Int {
         val fromBase = from.toBaseBlock()
-        return states.count { it.toBaseBlock() == fromBase }
+        return states.count { it != null && it.toBaseBlock() == fromBase }
     }
 
     /**
@@ -421,6 +493,16 @@ class WorldEditManager {
 
     private fun undoLimit(): Int {
         return settingManager.getWorldEditSettings().getInt("undo-limit").takeIf { it > 0 } ?: 10
+    }
+
+    /** 超过这个方块数的操作不记撤销记录 */
+    private fun undoMaxBlocks(): Int {
+        return settingManager.getWorldEditSettings().getInt("undo-max-blocks").takeIf { it > 0 } ?: 500000
+    }
+
+    /** 全服每 tick 允许改动的方块总数 */
+    private fun blocksPerTick(): Int {
+        return settingManager.getWorldEditSettings().getInt("blocks-per-tick").takeIf { it > 0 } ?: EditBudget.perTick
     }
 
     /**
@@ -451,6 +533,9 @@ class WorldEditManager {
     }
 
     private companion object {
+
+        /** 选区粒子边框在最长边上画多少个点 (其余边按同样步长, 总点数因此有上限) */
+        const val PARTICLE_POINTS_PER_EDGE = 100.0
 
         /** 旧名 <-> 新名 (1.20.5 起的粒子枚举改名), 双向可查 */
         val PARTICLE_ALIASES: Map<String, String> = buildMap {

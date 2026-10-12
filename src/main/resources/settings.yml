@@ -19,3 +19,7 @@ world-edit:
       - " "
   region-particle: "VILLAGER_ANGRY"
   undo-limit: 10
+  # 性能: 全服每 tick 允许改动的方块总数。越小越不卡, 大范围操作耗时越长
+  blocks-per-tick: 20000
+  # 超过这个方块数的操作不记录撤销 (撤销记录会写进玩家数据)
+  undo-max-blocks: 500000
