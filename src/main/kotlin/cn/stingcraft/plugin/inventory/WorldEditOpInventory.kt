@@ -5,7 +5,6 @@ import cn.stingcraft.plugin.until.displayName
 import org.bukkit.Material
 import org.bukkit.entity.Player
 import org.bukkit.inventory.Inventory
-import org.bukkit.inventory.ItemStack
 import taboolib.common.platform.function.pluginId
 import taboolib.library.xseries.XMaterial
 import taboolib.module.chat.colored
@@ -87,36 +86,27 @@ object WorldEditOpInventory {
     }
 
     private fun openBlockPicker(player: Player, title: String, callback: (Material) -> Unit) {
-        // 空气放第一个, 界面上渲染成屏障, 玩家一眼就知道是清空
-        // 其余只列材料背包里已有的方块; 空位补上空气凑满整页 —— 没有元素的格子 TabooLib 不会派发点击,
-        // 补位之后点到空位也等于选了空气
-        val pageSize = Slots.CENTER.size
-        val blocks = ArrayList<Material>()
-        blocks += Material.AIR
-        blocks += PlayerWorldEdit.packManager.getMaterialPack(player).materials
+        // 空气放第一个, 渲染成屏障物品, 玩家一眼就知道是清空; 其余只列材料背包里已有的方块
+        // (没有元素的空格子 TabooLib 不会派发点击, 点了不会有反应)
+        val blocks = listOf(Material.AIR) + PlayerWorldEdit.packManager.getMaterialPack(player).materials
             .map { it.material }
             .distinct()
             .filter { it.isBlock && it != Material.AIR }
-        while (blocks.size % pageSize != 0) {
-            blocks += Material.AIR
-        }
         player.openMenu(buildMenu<PageableChestImpl<Material>>(title.colored()) {
             rows(6)
             slots(Slots.CENTER)
             elements { blocks }
-            onGenerate { _, element, index, _ ->
-                when {
-                    // 只有列表第一个空气是"清空"选项, 补位的空槽保持空白
-                    element == Material.AIR && index == 0 -> buildItem(XMaterial.BARRIER) {
+            onGenerate { _, element, _, _ ->
+                if (element == Material.AIR) {
+                    return@onGenerate buildItem(XMaterial.BARRIER) {
                         name = "&f| 空气"
                         lore += "&7| 清空选区内的所有方块"
                         colored()
                     }
-                    element == Material.AIR -> ItemStack(Material.AIR)
-                    else -> buildItem(element) {
-                        name = "&f| ${element.displayName()}"
-                        colored()
-                    }
+                }
+                return@onGenerate buildItem(element) {
+                    name = "&f| ${element.displayName(player)}"
+                    colored()
                 }
             }
             onClick { _, element ->

@@ -192,7 +192,7 @@ class WorldEditManager {
         if (!PlayerWorldEdit.packManager.hasEnoughMaterial(player, material, amount)) {
             player.sendLang("message-materialpack-not-enough",
                 pluginId to "pluginId",
-                material.displayName() to "material",
+                material.displayName(player) to "material",
                 amount to "amount")
             return
         }
@@ -249,13 +249,13 @@ class WorldEditManager {
                     val costs = targets.map { replaceTargets(snapshots[it]!!, fromType.defaultState) }
                     val amount = costs.sum()
                     if (amount <= 0) {
-                        player.sendLang("message-replace-none", pluginId to "pluginId", from.displayName() to "material")
+                        player.sendLang("message-replace-none", pluginId to "pluginId", from.displayName(player) to "material")
                         return@runOnOwnThread
                     }
                     if (!PlayerWorldEdit.packManager.hasEnoughMaterial(player, to, amount)) {
                         player.sendLang("message-materialpack-not-enough",
                             pluginId to "pluginId",
-                            to.displayName() to "material",
+                            to.displayName(player) to "material",
                             amount to "amount")
                         return@runOnOwnThread
                     }

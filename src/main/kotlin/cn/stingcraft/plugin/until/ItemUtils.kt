@@ -2,10 +2,13 @@ package cn.stingcraft.plugin.until
 
 import org.bukkit.Material
 import org.bukkit.NamespacedKey
+import org.bukkit.entity.Player
 import org.bukkit.inventory.ItemStack
 import org.bukkit.persistence.PersistentDataType
 import taboolib.library.xseries.XMaterial
-import taboolib.module.nms.getI18nName
+import taboolib.module.nms.MinecraftLanguage
+import taboolib.module.nms.getMinecraftLanguageFile
+import java.lang.reflect.Method
 
 /**
  * 创世神镐的标记 key
@@ -32,15 +35,32 @@ fun parseBlockOrNull(input: String): Material? =
     XMaterial.matchXMaterial(input.lowercase()).orElse(null)?.parseMaterial()?.takeIf { it.isBlock }
 
 /**
- * 物品显示名
+ * Material 的原版语言键, 如 `block.minecraft.jungle_leaves`
  *
- * 优先用 NMS 的 I18nName (原版名称, 如 "Diamond Pickaxe"); 个别服务端核心上 NMS 不可用时
- * 退回本地标题化名称 (DIAMOND_PICKAXE -> Diamond Pickaxe, TNT 这类短词保持大写),
- * 保证任何版本都不会因为拿不到名字而报错
+ * 反射取: Translatable 接口是 Paper 1.19.3+ 才给 Material 加的, 编译用的 API 里不一定有
  */
-fun Material.displayName(): String =
-    runCatching { getI18nName() }.getOrElse {
-        name.lowercase().split('_').joinToString(" ") { word ->
-            if (word.length <= 3) word.uppercase() else word.replaceFirstChar { it.uppercaseChar() }
+private val translationKeyMethod: Method? by lazy {
+    runCatching { Material::class.java.getMethod("getTranslationKey") }.getOrNull()
+}
+
+/**
+ * 物品显示名, 跟随语言 (不传玩家用默认的 zh_cn, 传了就按该玩家客户端语言)
+ *
+ * 不用 TabooLib 的 getI18nName: 它拿语言键要经 CraftItemStack/NMS, 在 Lophine 这类 fork 上会抛
+ * NoSuchMethodError, 异常被吃掉之后就只剩英文标题化名字了 ("Jungle Leaves")。
+ * 这里直接拿 Material 的语言键去查 TabooLib 下好的语言文件, 不碰 NMS。
+ */
+fun Material.displayName(player: Player? = null): String {
+    val key = translationKeyMethod?.let { runCatching { it.invoke(this) as? String }.getOrNull() }
+    if (key != null) {
+        val file = player?.getMinecraftLanguageFile() ?: MinecraftLanguage.getDefaultLanguageFile()
+        val name = runCatching { file?.get(key) }.getOrNull()
+        if (!name.isNullOrBlank()) {
+            return name
         }
     }
+    // 语言文件缺失时的兜底: DIAMOND_PICKAXE -> Diamond Pickaxe, TNT 这类短词保持大写
+    return name.lowercase().split('_').joinToString(" ") { word ->
+        if (word.length <= 3) word.uppercase() else word.replaceFirstChar { it.uppercaseChar() }
+    }
+}

@@ -21,7 +21,7 @@ object CommandID {
                 return@execute
             }
             val material = itemStack.type
-            ComponentText.of(sender.asLangText("message-id-info",  pluginId to "pluginId", material.displayName() to "material", material.name to "id"))
+            ComponentText.of(sender.asLangText("message-id-info",  pluginId to "pluginId", material.displayName(sender) to "material", material.name to "id"))
                 .append(sender.asLangText("message-id-insert"))
                 .clickInsertText(material.name)
                 .clickCopyToClipboard(material.name)
