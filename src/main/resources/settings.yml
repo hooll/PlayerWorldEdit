@@ -18,6 +18,9 @@ world-edit:
       - "&f| 右键设置第二个点"
       - " "
   region-particle: "VILLAGER_ANGRY"
+  # 选区可视化: 半透明玻璃盒子 (仿 Dominion)。关掉则用上面的粒子边框
+  region-display: true
+  region-display-material: "WHITE_STAINED_GLASS"
   undo-limit: 10
   # 性能: 全服每 tick 允许改动的方块总数。越小越不卡, 大范围操作耗时越长
   blocks-per-tick: 20000

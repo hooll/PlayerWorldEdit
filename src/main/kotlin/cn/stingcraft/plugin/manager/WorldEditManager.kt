@@ -2,10 +2,12 @@ package cn.stingcraft.plugin.manager
 
 import cn.stingcraft.plugin.PlayerWorldEdit
 import cn.stingcraft.plugin.hook.DominionHook
+import cn.stingcraft.plugin.until.AreaDisplay
 import cn.stingcraft.plugin.until.EditBudget
 import cn.stingcraft.plugin.until.WorldEditTool
 import cn.stingcraft.plugin.until.displayName
 import cn.stingcraft.plugin.until.markAsTool
+import cn.stingcraft.plugin.until.parseBlockOrNull
 import cn.stingcraft.plugin.until.runOnChunkThreads
 import cn.stingcraft.plugin.until.runOnOwnThread
 import cn.stingcraft.plugin.until.splitByChunk
@@ -28,6 +30,7 @@ import taboolib.common.platform.service.PlatformExecutor
 import taboolib.library.xseries.XMaterial
 import taboolib.library.xseries.parseToXMaterial
 import taboolib.module.effect.createCube
+import taboolib.platform.BukkitPlugin
 import taboolib.platform.util.buildItem
 import taboolib.platform.util.runTask
 import taboolib.platform.util.sendLang
@@ -48,6 +51,9 @@ class WorldEditManager {
 
     // 正在执行编辑的玩家, 避免同一玩家并发跑两个选区操作
     private val editing = ConcurrentHashMap.newKeySet<UUID>()
+
+    // 选区可视化 (半透明玻璃盒子), 用不了时退回粒子边框
+    private val areaDisplay = AreaDisplay(BukkitPlugin.getInstance())
 
     private val settingManager = PlayerWorldEdit.settingManager
 
@@ -91,7 +97,7 @@ class WorldEditManager {
             return
         }
         playerpos[player] = Pair(pos1,playerpos[player]!!.second)
-        showParticle(player)
+        showSelection(player)
     }
 
     /**
@@ -105,7 +111,38 @@ class WorldEditManager {
             return
         }
         playerpos[player] = Pair(playerpos[player]?.first,pos2)
-        showParticle(player)
+        showSelection(player)
+    }
+
+    /**
+     * 刷新选区可视化
+     *
+     * 默认用半透明玻璃盒子 (见 [AreaDisplay]), 关掉 `region-display` 或盒子建不出来时退回
+     * 粒子边框。
+     *
+     * @param player 玩家
+     */
+    fun showSelection(player: Player) {
+        val region = getWERegion(player)
+        if (region == null) {
+            hideSelection(player)
+            return
+        }
+        if (displayEnabled()) {
+            stopParticle(player)
+            areaDisplay.show(player, region, displayMaterial())
+        } else {
+            areaDisplay.hide(player)
+            showParticle(player)
+        }
+    }
+
+    /**
+     * 收掉选区可视化 (盒子和粒子都收)
+     */
+    fun hideSelection(player: Player) {
+        stopParticle(player)
+        areaDisplay.hide(player)
     }
 
     /**
@@ -117,7 +154,7 @@ class WorldEditManager {
      *
      * @param player 玩家
      */
-    fun showParticle(player: Player) {
+    private fun showParticle(player: Player) {
         stopParticle(player)
         val pos1 = getPlayerPos1(player) ?: return
         val pos2 = getPlayerPos2(player) ?: return
@@ -176,8 +213,16 @@ class WorldEditManager {
      */
     fun clearPlayerPos(player: Player) {
         playerpos.remove(player)
-        stopParticle(player)
+        hideSelection(player)
         endEdit(player)
+    }
+
+    /**
+     * 收掉所有玩家的选区显示体 (关插件/重载时用, 免得留下孤儿实体)
+     */
+    fun clearDisplays() {
+        particleTasks.keys.toList().forEach { stopParticle(it) }
+        areaDisplay.hideAll()
     }
 
     /**
@@ -514,6 +559,16 @@ class WorldEditManager {
         return settingManager.getWorldEditSettings().getInt("blocks-per-tick").takeIf { it > 0 } ?: EditBudget.perTick
     }
 
+    /** 是否用半透明玻璃盒子做选区可视化 (关掉则用粒子边框) */
+    private fun displayEnabled(): Boolean {
+        return settingManager.getWorldEditSettings().getBoolean(DISPLAY_KEY, true)
+    }
+
+    private fun displayMaterial(): Material {
+        val raw = settingManager.getWorldEditSettings().getString(DISPLAY_MATERIAL_KEY)
+        return raw?.let { parseBlockOrNull(it) } ?: Material.WHITE_STAINED_GLASS
+    }
+
     /**
      * 获取区域
      * @param player 玩家
@@ -542,6 +597,12 @@ class WorldEditManager {
     }
 
     private companion object {
+
+        /** 是否用半透明玻璃盒子做选区可视化 */
+        const val DISPLAY_KEY = "region-display"
+
+        /** 盒子材质 (默认白色染色玻璃) */
+        const val DISPLAY_MATERIAL_KEY = "region-display-material"
 
         /** 是否让外部 WE 记录插件 (CoreProtect 等) 按玩家身份记录本插件的编辑 */
         const val COREPROTECT_LOGGING_KEY = "coreprotect-logging"

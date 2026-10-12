@@ -23,6 +23,11 @@ object PlayerWorldEdit : Plugin() {
         info("Successfully running PlayerWorldEdit!")
     }
 
+    override fun onDisable() {
+        // 选区显示体是实体, 插件卸载/关服时收掉, 免得留下孤儿实体
+        worldEditManager.clearDisplays()
+    }
+
     /**
      * 重载配置文件与语言文件, 并丢弃依赖配置的缓存
      */
