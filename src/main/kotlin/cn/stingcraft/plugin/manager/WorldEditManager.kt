@@ -129,7 +129,13 @@ class WorldEditManager {
         }
         if (displayEnabled()) {
             stopParticle(player)
-            areaDisplay.show(player, region, displayMaterial()) { showParticle(player) }
+            areaDisplay.show(
+                player,
+                region,
+                displayMaterial(),
+                ownerOnly = displayOwnerOnly(),
+                durationTicks = displayDurationTicks()
+            ) { showParticle(player) }
         } else {
             areaDisplay.hide(player)
             showParticle(player)
@@ -568,6 +574,17 @@ class WorldEditManager {
         return raw?.let { parseBlockOrNull(it) } ?: Material.WHITE_STAINED_GLASS
     }
 
+    /** 选区盒子是否只发给选区主人 */
+    private fun displayOwnerOnly(): Boolean {
+        return settingManager.getWorldEditSettings().getBoolean(DISPLAY_OWNER_ONLY_KEY, true)
+    }
+
+    /** 选区盒子显示多少秒后自动收掉 (0 表示不自动收) */
+    private fun displayDurationTicks(): Long {
+        val seconds = settingManager.getWorldEditSettings().getInt(DISPLAY_DURATION_KEY, DISPLAY_DURATION_DEFAULT)
+        return seconds.coerceAtLeast(0) * 20L
+    }
+
     /**
      * 获取区域
      * @param player 玩家
@@ -602,6 +619,14 @@ class WorldEditManager {
 
         /** 盒子材质 (默认白色染色玻璃) */
         const val DISPLAY_MATERIAL_KEY = "region-display-material"
+
+        /** 是否只把盒子发给选区主人 */
+        const val DISPLAY_OWNER_ONLY_KEY = "region-display-owner-only"
+
+        /** 盒子显示的秒数 */
+        const val DISPLAY_DURATION_KEY = "region-display-duration"
+
+        const val DISPLAY_DURATION_DEFAULT = 10
 
         /** 是否让外部 WE 记录插件 (CoreProtect 等) 按玩家身份记录本插件的编辑 */
         const val COREPROTECT_LOGGING_KEY = "coreprotect-logging"

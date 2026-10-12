@@ -7,8 +7,12 @@ import org.bukkit.World
 import org.bukkit.entity.BlockDisplay
 import org.bukkit.entity.Display
 import org.bukkit.entity.Player
+import org.bukkit.plugin.Plugin
 import org.bukkit.util.Transformation
+import taboolib.common.platform.function.submitAsync
 import taboolib.common.platform.function.warning
+import taboolib.common.platform.service.PlatformExecutor
+import taboolib.platform.BukkitPlugin
 import taboolib.platform.util.runTask
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -18,9 +22,8 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * 做法和 Dominion 一样: 在选区最小角放 6 个 [BlockDisplay] —— 底、顶、四个侧面各一片薄板,
  * 缩放成选区的宽高深, 亮度拉满(15/15), 看起来就是一个发光的半透明白玻璃盒。
- * 注意: 不要用 `setVisibleByDefault(false)` + `showEntity` 来"只发给主人" —— 实测这样只会
- * 发出去一个生成包, 方块数据和缩放这些 metadata 不会补发, 客户端拿到的是一条空显示体,
- * 结果就是"实体在服务端存在但谁都看不见"。实体是不可见的非持久实体, 附近玩家能看到这个盒子。
+ * 默认只发给选区主人自己看 (`setVisibleByDefault(false)` + `showEntity`), 别人收不到这个实体;
+ * 也可以在配置里关掉"仅自己可见", 那样附近的人都能看到盒子。
  *
  * 为什么实体放在选区角上而不是玩家身上: Folia 里实体必须在**拥有它的区域线程**上创建/修改/删除,
  * 选区角所在的区域和玩家所在的区域不一定是同一个, 所以这些操作统一用 `World.runTask(x, z)`
@@ -35,10 +38,27 @@ class AreaDisplay {
     // 每次变更都 +1; 排队中的旧任务发现代号变了就自己把实体收掉, 免得快速连点留下孤儿实体
     private val generations = ConcurrentHashMap<UUID, Int>()
 
+    // 自动收盒子的定时任务
+    private val hideTasks = ConcurrentHashMap<UUID, PlatformExecutor.PlatformTask>()
+
+    /** 需要 Bukkit 插件实例做 showEntity, 必须在运行期取 (类初始化阶段它是空的) */
+    private val plugin: Plugin
+        get() = BukkitPlugin.getInstance()
+
     /**
      * 画出选区盒子; 选区不完整或实体创建失败时什么都不做 (调用方会退回粒子边框)
+     *
+     * @param ownerOnly 只发给选区主人
+     * @param durationTicks 多少 tick 后自动收掉, <= 0 表示不自动收
      */
-    fun show(player: Player, region: CuboidRegion, material: Material, onFailure: () -> Unit = {}) {
+    fun show(
+        player: Player,
+        region: CuboidRegion,
+        material: Material,
+        ownerOnly: Boolean,
+        durationTicks: Long,
+        onFailure: () -> Unit = {}
+    ) {
         if (!player.isOnline) return
         val min = region.minimumPoint
         val max = region.maximumPoint
@@ -74,6 +94,9 @@ class AreaDisplay {
                         display.isInvulnerable = true
                         display.isSilent = true
                         display.setGravity(false)
+                        if (ownerOnly) {
+                            display.setVisibleByDefault(false)
+                        }
                         display.transformation = transformation
                     }
                 }.onSuccess {
@@ -93,18 +116,42 @@ class AreaDisplay {
                 return@Runnable
             }
             boxes[player.uniqueId] = Box(world, min.x, min.z, spawned)
+            if (ownerOnly) {
+                // 实体默认不可见, 只把这一条单独发给选区主人
+                player.runOnOwnThread {
+                    runCatching { spawned.forEach { player.showEntity(plugin, it) } }.onFailure {
+                        warning("[PlayerWorldEdit] 单独显示选区盒子失败: $it")
+                    }
+                }
+            }
+            scheduleHide(player, durationTicks)
         })
     }
 
     /** 收掉这个玩家的盒子 */
     fun hide(player: Player) {
         nextGeneration(player.uniqueId)
+        hideTasks.remove(player.uniqueId)?.cancel()
         remove(boxes.remove(player.uniqueId))
     }
 
     /** 收掉所有盒子 (关插件/重载时用, 免得留下孤儿实体) */
     fun hideAll() {
+        hideTasks.values.forEach { runCatching { it.cancel() } }
+        hideTasks.clear()
         boxes.keys.toList().forEach { uuid -> remove(boxes.remove(uuid)) }
+    }
+
+    /**
+     * 到点自动收掉 (选区本身不受影响, 只是不显示了)
+     */
+    private fun scheduleHide(player: Player, durationTicks: Long) {
+        hideTasks.remove(player.uniqueId)?.cancel()
+        if (durationTicks <= 0) return
+        hideTasks[player.uniqueId] = submitAsync(delay = durationTicks) {
+            hideTasks.remove(player.uniqueId)
+            hide(player)
+        }
     }
 
     private fun remove(box: Box?) {

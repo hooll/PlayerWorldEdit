@@ -21,6 +21,10 @@ world-edit:
   # 选区可视化: 半透明玻璃盒子 (仿 Dominion)。关掉则用上面的粒子边框
   region-display: true
   region-display-material: "WHITE_STAINED_GLASS"
+  # 盒子只发给选区主人自己看 (false = 附近所有人都能看到)
+  region-display-owner-only: true
+  # 盒子显示多少秒后自动收掉, 0 = 不自动收
+  region-display-duration: 10
   undo-limit: 10
   # 性能: 全服每 tick 允许改动的方块总数。越小越不卡, 大范围操作耗时越长
   blocks-per-tick: 20000
