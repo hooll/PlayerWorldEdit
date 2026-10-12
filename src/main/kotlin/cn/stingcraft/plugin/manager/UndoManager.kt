@@ -9,13 +9,14 @@ import com.sk89q.worldedit.world.block.BlockState
 import com.sk89q.worldedit.world.block.BlockTypes
 import org.bukkit.Material
 import org.bukkit.entity.Player
-import taboolib.expansion.getAutoDataContainer
+import taboolib.common.platform.function.getDataFolder
 import taboolib.common.platform.function.submitAsync
 import taboolib.common.platform.function.warning
-import java.io.ByteArrayOutputStream
-import java.util.Base64
+import taboolib.expansion.getAutoDataContainer
+import java.io.File
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import java.util.zip.GZIPInputStream
 import java.util.zip.GZIPOutputStream
 
@@ -35,18 +36,32 @@ class UndoRecord(
     val amount: Int
 )
 
+/**
+ * 撤销记录
+ *
+ * 一条记录一个文件: `plugins/PlayerWorldEdit/undo/<uuid>/<时间戳>.json.gz`。
+ *
+ * 以前存在玩家数据 (data.db) 里, 于是有两个绕不过去的问题: 几十万方块的操作会把玩家那一行
+ * 撑爆, 而且每次读写都要把**整段历史**解析+重新序列化一遍。所以那时只能加"操作过大就不记"
+ * 的上限 —— 代价是操作不可逆。改成文件之后只读写当前这一条, 也就没有上限了。
+ */
 object UndoManager {
 
-    private const val KEY = "undoRecords"
+    /** 旧版本把记录写在玩家数据的这个键里, 第一次用到时会迁移过来 */
+    private const val LEGACY_KEY = "undoRecords"
 
-    // 撤销记录的读写都在异步线程上做, 同一玩家的两次操作不能交叉
+    // 同一个玩家的读写不能交叉
     private val locks = ConcurrentHashMap<UUID, Any>()
+    private val migrated = ConcurrentHashMap.newKeySet<UUID>()
+
+    /** 同一毫秒内写多条时用来区分文件名 */
+    private val sequence = AtomicLong()
 
     /**
-     * 把撤销记录写进玩家数据 —— 序列化 + gzip + 写库都在异步线程完成
+     * 把撤销记录写下来 —— 序列化 + gzip + 落盘都在异步线程完成
      *
-     * 大选区一次几万个方块, 之前是在玩家线程上把这些方块全转成字符串再压缩写库,
-     * 玩家所在区域那一 tick 会被卡住一两秒。
+     * 大选区动辄几十万个方块, 在玩家线程上把这些方块全转成字符串再压缩, 玩家所在区域
+     * 那一 tick 会被卡住好几秒。
      */
     fun pushAsync(player: Player, record: UndoRecord, limit: Int) {
         val uuid = player.uniqueId
@@ -64,47 +79,99 @@ object UndoManager {
         synchronized(lockOf(uuid)) { push(uuid, record, limit) }
     }
 
-    private fun push(uuid: UUID, record: UndoRecord, limit: Int) {
-        val list = read(uuid).toMutableList()
-        list.add(record.toStored())
-        while (list.size > limit) {
-            list.removeAt(0)
-        }
-        write(uuid, list)
-    }
-
+    /**
+     * 取出最近一条撤销记录 (取走即删除), 没有则返回 null
+     */
     fun poll(player: Player): UndoRecord? {
         val uuid = player.uniqueId
         return synchronized(lockOf(uuid)) {
-            val list = read(uuid).toMutableList()
-            if (list.isEmpty()) {
-                return@synchronized null
-            }
-            val stored = list.removeAt(list.size - 1)
-            write(uuid, list)
-            runCatching { stored.toRecord() }.getOrNull()
+            migrateLegacy(uuid)
+            val newest = listRecords(uuid).lastOrNull() ?: return@synchronized null
+            val record = runCatching {
+                GZIPInputStream(newest.inputStream()).bufferedReader(Charsets.UTF_8).use { reader ->
+                    PlayerWorldEdit.gson.fromJson(reader, StoredUndoRecord::class.java).toRecord()
+                }
+            }.onFailure {
+                warning("[PlayerWorldEdit] 读取撤销记录失败 ${newest.name}: $it")
+            }.getOrNull()
+            newest.delete()
+            record
         }
     }
+
+    private fun push(uuid: UUID, record: UndoRecord, limit: Int) {
+        migrateLegacy(uuid)
+        val dir = dirOf(uuid).apply { mkdirs() }
+        val file = newRecordFile(dir)
+        runCatching {
+            GZIPOutputStream(file.outputStream()).bufferedWriter(Charsets.UTF_8).use { writer ->
+                // 流式写, 不先拼一个几十 MB 的字符串出来
+                PlayerWorldEdit.gson.toJson(record.toStored(), writer)
+            }
+        }.onFailure {
+            warning("[PlayerWorldEdit] 写入撤销记录失败: $it")
+            file.delete()
+            return
+        }
+        trim(dir, limit)
+    }
+
+    /**
+     * 只保留最近 [limit] 条
+     */
+    private fun trim(dir: File, limit: Int) {
+        val keep = limit.coerceAtLeast(1)
+        listFiles(dir).dropLast(keep).forEach { it.delete() }
+    }
+
+    private fun listRecords(uuid: UUID): List<File> = listFiles(dirOf(uuid))
+
+    /** 按文件名排序 (文件名以 13 位时间戳开头), 也就是从旧到新 */
+    private fun listFiles(dir: File): List<File> {
+        return dir.listFiles { file -> file.isFile && file.name.endsWith(".json.gz") }
+            ?.sortedBy { it.name }
+            ?: emptyList()
+    }
+
+    private fun newRecordFile(dir: File): File {
+        val stamp = "%013d-%05d".format(System.currentTimeMillis(), sequence.incrementAndGet() % 100000)
+        return File(dir, "$stamp.json.gz")
+    }
+
+    private fun dirOf(uuid: UUID): File = File(File(getDataFolder(), "undo"), uuid.toString())
 
     private fun lockOf(uuid: UUID): Any = locks.computeIfAbsent(uuid) { Any() }
 
     /**
-     * 撤销记录存在玩家数据容器中, 与材料背包共用 data.db
+     * 把旧版本存在玩家数据里的记录搬成文件, 每个玩家只做一次
      */
-    private fun read(uuid: UUID): List<StoredUndoRecord> {
-        val raw = uuid.getAutoDataContainer()[KEY] ?: return emptyList()
-        return runCatching {
+    private fun migrateLegacy(uuid: UUID) {
+        if (!migrated.add(uuid)) {
+            return
+        }
+        runCatching {
+            val container = uuid.getAutoDataContainer()
+            val raw = container[LEGACY_KEY] ?: return@runCatching
+            if (raw.isEmpty()) {
+                return@runCatching
+            }
             val type = object : TypeToken<List<StoredUndoRecord>>() {}.type
-            PlayerWorldEdit.gson.fromJson<List<StoredUndoRecord>>(decompressFromBase64(raw), type)
-        }.getOrDefault(emptyList())
-    }
-
-    private fun write(uuid: UUID, list: List<StoredUndoRecord>) {
-        val container = uuid.getAutoDataContainer()
-        if (list.isEmpty()) {
-            container[KEY] = ""
-        } else {
-            container[KEY] = compressToBase64(PlayerWorldEdit.gson.toJson(list))
+            val legacy: List<StoredUndoRecord> = PlayerWorldEdit.gson.fromJson(raw, type)
+            if (legacy.isEmpty()) {
+                return@runCatching
+            }
+            val dir = dirOf(uuid).apply { mkdirs() }
+            legacy.forEach { stored ->
+                runCatching {
+                    val file = newRecordFile(dir)
+                    GZIPOutputStream(file.outputStream()).bufferedWriter(Charsets.UTF_8).use { writer ->
+                        PlayerWorldEdit.gson.toJson(stored, writer)
+                    }
+                }
+            }
+            container[LEGACY_KEY] = ""
+        }.onFailure {
+            warning("[PlayerWorldEdit] 迁移旧撤销记录失败: $it")
         }
     }
 
@@ -125,17 +192,6 @@ object UndoManager {
                 )
             }
         )
-    }
-
-    private fun compressToBase64(json: String): String {
-        val output = ByteArrayOutputStream()
-        GZIPOutputStream(output).use { it.write(json.toByteArray(Charsets.UTF_8)) }
-        return Base64.getEncoder().encodeToString(output.toByteArray())
-    }
-
-    private fun decompressFromBase64(base64: String): String {
-        val bytes = Base64.getDecoder().decode(base64)
-        return GZIPInputStream(bytes.inputStream()).bufferedReader(Charsets.UTF_8).use { it.readText() }
     }
 }
 

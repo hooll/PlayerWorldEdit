@@ -65,9 +65,9 @@
 
 ### 撤销
 
-- 每次填充/替换都会留一条撤销记录, 存在玩家数据里(`plugins/PlayerWorldEdit/data.db`)
-- 默认保留最近 10 条, 数量在 `settings.yml` 里改
-- 操作过大时不记录撤销, 并会提前告诉你
+- 每次填充/替换都会留一条撤销记录, 存成文件: `plugins/PlayerWorldEdit/undo/<玩家UUID>/<时间戳>.json.gz`
+- 操作多大都会记录, 没有体积上限
+- 默认保留最近 10 条, 数量在 `settings.yml` 的 `undo-limit` 里改, 超出的旧记录自动删除
 
 ## 配置文件
 

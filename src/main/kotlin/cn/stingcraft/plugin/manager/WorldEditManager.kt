@@ -386,21 +386,16 @@ class WorldEditManager {
             return
         }
         val changed = amount - refund
-        if (changed > undoMaxBlocks()) {
-            // 撤销记录会按方块数写进玩家数据, 太大的不记, 免得把 data.db 撑爆
-            player.sendLang("message-undo-too-large", pluginId to "pluginId", changed to "amount")
-        } else {
-            UndoManager.pushAsync(
-                player,
-                UndoRecord(
-                    player.world.name,
-                    succeeded.map { UndoBatch(regions[it], snapshots[it]!!.filterNotNull()) },
-                    material,
-                    changed
-                ),
-                undoLimit()
-            )
-        }
+        UndoManager.pushAsync(
+            player,
+            UndoRecord(
+                player.world.name,
+                succeeded.map { UndoBatch(regions[it], snapshots[it]!!.filterNotNull()) },
+                material,
+                changed
+            ),
+            undoLimit()
+        )
         if (refund > 0) {
             player.sendLang("message-edit-failed", pluginId to "pluginId")
         } else {
@@ -493,11 +488,6 @@ class WorldEditManager {
 
     private fun undoLimit(): Int {
         return settingManager.getWorldEditSettings().getInt("undo-limit").takeIf { it > 0 } ?: 10
-    }
-
-    /** 超过这个方块数的操作不记撤销记录 */
-    private fun undoMaxBlocks(): Int {
-        return settingManager.getWorldEditSettings().getInt("undo-max-blocks").takeIf { it > 0 } ?: 500000
     }
 
     /** 全服每 tick 允许改动的方块总数 */
