@@ -10,6 +10,13 @@ object SettingManager {
     lateinit var settings: Configuration
         private set
 
+    /**
+     * 重新读取 settings.yml
+     */
+    fun reload() {
+        settings.reload()
+    }
+
     fun getMaterialPackGuiSettings():ConfigurationSection{
         return settings.getConfigurationSection("material-pack-gui")!!
     }

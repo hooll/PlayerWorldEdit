@@ -31,6 +31,9 @@ object MainCommand {
     @CommandBody(permission = "PlayerWorldEdit.Admin",permissionDefault = PermissionDefault.OP)
     val tool = CommandTool.command
 
+    @CommandBody(permission = "PlayerWorldEdit.Admin",permissionDefault = PermissionDefault.OP)
+    val reload = CommandReload.command
+
     @CommandBody(permission = "PlayerWorldEdit.Use")
     val set = CommandSet.command
 

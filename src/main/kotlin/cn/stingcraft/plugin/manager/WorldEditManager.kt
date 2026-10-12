@@ -18,6 +18,7 @@ import org.bukkit.Location
 import org.bukkit.Material
 import org.bukkit.Particle
 import org.bukkit.entity.Player
+import org.bukkit.inventory.ItemStack
 import taboolib.common.platform.function.pluginId
 import taboolib.common.platform.function.submitAsync
 import taboolib.common.platform.service.PlatformExecutor
@@ -41,9 +42,26 @@ class WorldEditManager {
 
     private val settingManager = PlayerWorldEdit.settingManager
 
-    // 配置在 TabooLib 注入阶段才可用, 不能在建类时读取
-    private val posToolItem by lazy {
-        buildItem(settingManager.getWorldEditSettings().getString("tool.type")?.parseToXMaterial() ?:XMaterial.DIAMOND_PICKAXE){
+    // 配置在 TabooLib 注入阶段才可用, 不能在建类时读取; 重载后由 reloadCache() 丢弃重建
+    @Volatile
+    private var posToolCache: ItemStack? = null
+
+    /**
+     * 获取创世神镐 (返回副本, 避免玩家修改到插件缓存的实例)
+     */
+    fun getPosTool(): ItemStack {
+        return (posToolCache ?: buildPosTool().also { posToolCache = it }).clone()
+    }
+
+    /**
+     * 配置重载后丢弃缓存的创世神镐, 下次取用时按新配置重建
+     */
+    fun reloadCache() {
+        posToolCache = null
+    }
+
+    private fun buildPosTool(): ItemStack {
+        return buildItem(settingManager.getWorldEditSettings().getString("tool.type")?.parseToXMaterial() ?:XMaterial.DIAMOND_PICKAXE){
             name = settingManager.getWorldEditSettings().getString("tool.name") ?: "&7[&f创世神镐&7]"
             lore += settingManager.getWorldEditSettings().getStringList("tool.lore")
             customModelData = settingManager.getWorldEditSettings().getInt("tool.custom-model-data")
@@ -51,13 +69,6 @@ class WorldEditManager {
         }.apply {
             markAsTool()
         }
-    }
-
-    /**
-     * 获取创世神镐
-     */
-    fun getPosTool(): org.bukkit.inventory.ItemStack {
-        return posToolItem
     }
 
     /**
