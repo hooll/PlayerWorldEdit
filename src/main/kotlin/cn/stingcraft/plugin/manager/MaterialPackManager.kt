@@ -41,6 +41,9 @@ class MaterialPackManager {
      */
     fun load(player: Player) {
         synchronized(lockOf(player.uniqueId)) {
+            // 登录加载是异步的, 跑完时玩家可能已经退出: 那就不再往缓存里塞, 否则会留下一条
+            // 永远不会落盘的缓存 (退出事件已经过去, 不会再有 unload 来 flush 它)
+            if (!player.isOnline) return
             if (caches.containsKey(player.uniqueId)) return
             caches[player.uniqueId] = MaterialPackDataBase.getMaterialPack(player.uniqueId)
         }
