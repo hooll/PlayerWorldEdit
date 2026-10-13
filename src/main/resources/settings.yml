@@ -24,8 +24,8 @@ world-edit:
   region-display-material: "WHITE_STAINED_GLASS"
   # 盒子只发给选区主人自己看 (false = 附近所有人都能看到)
   region-display-owner-only: true
-  # 盒子显示多少秒后自动收掉, 0 = 不自动收
-  region-display-duration: 10
+  # 盒子显示多少秒后自动收掉, 0 = 不自动收 (默认跟着选区走: 选区清除或退出登录时才收)
+  region-display-duration: 0
   undo-limit: 10
   # 性能: 全服每 tick 允许改动的方块总数。越小越不卡, 大范围操作耗时越长
   blocks-per-tick: 20000

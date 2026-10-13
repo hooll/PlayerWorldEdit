@@ -155,7 +155,7 @@ class WorldEditManager {
     /**
      * 显示粒子
      *
-     * 边框粒度随选区尺寸自适应 (最长边固定 100 个点), 而且**按区块合并成一次任务**:
+     * 边框粒度随选区尺寸自适应 (最长边固定 100 个点, 总点数另有上限), 而且**按区块合并成一次任务**:
      * 原来是每个粒子点提交一个区域任务, 一个百来格的选区每秒钟会提交两千多个任务,
      * 区域线程光排队就卡住了。
      *
@@ -168,8 +168,15 @@ class WorldEditManager {
         val particle = resolveParticle(settingManager.getWorldEditSettings().getString("region-particle")) ?: return
         val world = player.world
         val step = max(0.5, max(abs(pos1.x - pos2.x), max(abs(pos1.y - pos2.y), abs(pos1.z - pos2.z))) / PARTICLE_POINTS_PER_EDGE)
-        val points = createCube(pos1.toProxyLocation(), pos2.toProxyLocation(), step).calculateLocations()
-            .map { it.toBukkitLocation() }
+        val cube = createCube(pos1.toProxyLocation(), pos2.toProxyLocation(), step)
+        var points = cube.calculateLocations().map { it.toBukkitLocation() }
+        // "最长边 100 点"只约束了单条边, 立方体有 12 条边, 大选区算出来的总点数还是很多 ——
+        // 每 20 tick 要给每个有粒子的区块排一个任务, 点数就是任务数。总点数超上限就加大步长重算。
+        var reductions = 0
+        while (points.size > PARTICLE_MAX_POINTS && reductions++ < PARTICLE_MAX_REDUCTIONS) {
+            cube.step = cube.step * points.size / PARTICLE_MAX_POINTS.toDouble()
+            points = cube.calculateLocations().map { it.toBukkitLocation() }
+        }
         // 按区块分组, 每秒每个区块只提交一个任务
         val pointsByChunk = points.groupBy { (it.blockX shr 4) to (it.blockZ shr 4) }
         var tick = 0
@@ -501,7 +508,9 @@ class WorldEditManager {
         if (refund > 0) {
             chargeMaterial(player, material, -refund)
         }
-        clearPlayerPos(player)
+        // 成功后**保留选区** (和 WorldEdit 的手感一致): 想接着改同一块地方不用重新选点。
+        // 选区只在玩家退出或主动清除时清 —— 原来这里调 clearPlayerPos, 而 tryReplaceArea 的
+        // "没有可替换方块"分支只 endEdit 不清选区, 两条路行为不一致。
         if (succeeded.isEmpty()) {
             player.sendLang("message-edit-failed", pluginId to "pluginId")
             return
@@ -701,13 +710,26 @@ class WorldEditManager {
         /** 盒子显示的秒数 */
         const val DISPLAY_DURATION_KEY = "region-display-duration"
 
-        const val DISPLAY_DURATION_DEFAULT = 10
+        /**
+         * 盒子显示时长的默认值: 0 = 不自动收
+         *
+         * 成功后保留选区 (8A) 之后, 盒子应该跟着选区一起存在 —— 选区被清除或玩家退出时才收,
+         * 否则玩家会看到"选区还在、盒子没了"。这是默认行为的变更 (原来是 10 秒)。
+         * 服务器配置里显式写了值的仍以配置为准。
+         */
+        const val DISPLAY_DURATION_DEFAULT = 0
 
         /** 是否让外部 WE 记录插件 (CoreProtect 等) 按玩家身份记录本插件的编辑 */
         const val COREPROTECT_LOGGING_KEY = "coreprotect-logging"
 
         /** 选区粒子边框在最长边上画多少个点 (其余边按同样步长, 总点数因此有上限) */
         const val PARTICLE_POINTS_PER_EDGE = 100.0
+
+        /** 粒子边框的总点数上限 (超过就加大步长) —— 点数直接决定每 20 tick 提交多少个区块任务 */
+        const val PARTICLE_MAX_POINTS = 2000
+
+        /** 为了压到总点数上限, 最多重算几次 (防止步长算法意外不收敛时死循环) */
+        const val PARTICLE_MAX_REDUCTIONS = 5
 
         /** 旧名 <-> 新名 (1.20.5 起的粒子枚举改名), 双向可查 */
         val PARTICLE_ALIASES: Map<String, String> = buildMap {
