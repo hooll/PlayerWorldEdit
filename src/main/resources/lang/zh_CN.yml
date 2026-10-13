@@ -46,6 +46,7 @@ message-id-info: '&8[&3&l{pluginId}&8] &7{material}的ID是: {id}'
 message-id-insert: "&7[点击复制]"
 message-undo-none: '&8[&3&l{pluginId}&8] &7没有可以撤销的操作'
 message-undo-susses: '&8[&3&l{pluginId}&8] &7已撤销 {times} 次操作, 材料已返还'
+message-undo-timeout: '&8[&3&l{pluginId}&8] &7已撤销 {times} 次操作, 但有一次还原超时未完成 (已放回, 可重试)'
 message-dominion-denied: '&8[&3&l{pluginId}&8] &7选区包含领地 &f{dominion}&7, 你在此没有编辑权限'
 message-dominion-check-failed: '&8[&3&l{pluginId}&8] &7领地校验失败, 本次操作已被拒绝 (请联系管理员查看控制台)'
 message-invalid-material: '&8[&3&l{pluginId}&8] &7无效的方块: &f{material}'

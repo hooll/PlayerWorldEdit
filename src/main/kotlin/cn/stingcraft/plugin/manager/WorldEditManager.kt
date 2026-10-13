@@ -408,30 +408,30 @@ class WorldEditManager {
      *
      * @param player 玩家
      * @param times 次数
-     * @param onDone 整轮结束时回调一次, 参数是实际撤销的条数
+     * @param onDone 整轮结束时回调一次, 参数是实际撤销的条数和"这轮是不是因为超时提前收的尾"
      */
-    fun undo(player: Player, times: Int, onDone: (Int) -> Unit) {
+    fun undo(player: Player, times: Int, onDone: (done: Int, timedOut: Boolean) -> Unit) {
         if (!beginEdit(player)) {
             // 和其它出口一样走 finishUndo, 保证回调线程一致 (endEdit 对没进过集合的玩家是空操作)
-            finishUndo(player, 0, onDone)
+            finishUndo(player, 0, timedOut = false, onDone)
             return
         }
         // 第一次取记录要读文件, 丢到异步线程; 之后每一步由链自己挑线程
         submitAsync { undoStep(player, times, 0, onDone) }
     }
 
-    private fun undoStep(player: Player, times: Int, done: Int, onDone: (Int) -> Unit) {
+    private fun undoStep(player: Player, times: Int, done: Int, onDone: (done: Int, timedOut: Boolean) -> Unit) {
         if (done >= times) {
-            finishUndo(player, done, onDone)
+            finishUndo(player, done, timedOut = false, onDone)
             return
         }
         // poll 要读撤销记录文件, 这一步在异步线程上跑
-        val record = UndoManager.poll(player) ?: return finishUndo(player, done, onDone)
+        val record = UndoManager.poll(player) ?: return finishUndo(player, done, timedOut = false, onDone)
         val bukkitWorld = Bukkit.getWorld(record.worldName)
         if (bukkitWorld == null) {
             // 世界未加载: 把记录放回去并**中止整轮** —— 跳过后面的记录只会让撤销顺序错乱
             UndoManager.push(player, record, undoLimit())
-            return finishUndo(player, done, onDone)
+            return finishUndo(player, done, timedOut = false, onDone)
         }
         EditBudget.configure(blocksPerTick())
         val actor = actorOf(player)
@@ -453,7 +453,8 @@ class WorldEditManager {
                             warning("[PlayerWorldEdit] 撤销超时 (${player.name}), 本条记录已放回队列, 可重试")
                             submitAsync {
                                 UndoManager.push(player, record, undoLimit())
-                                finishUndo(player, done, onDone)
+                                // 告诉调用方这轮是被超时截断的: 记录已经放回去, 不是"没有可撤销的"
+                                finishUndo(player, done, timedOut = true, onDone)
                             }
                         } else {
                             // 返还先落库, 再取吓一条: 两条的返还都是同一份材料包的读改写, 不能并发
@@ -469,7 +470,7 @@ class WorldEditManager {
             warning("[PlayerWorldEdit] 撤销失败: $it")
         }.isSuccess
         if (!started) {
-            finishUndo(player, done, onDone)
+            finishUndo(player, done, timedOut = false, onDone)
         }
     }
 
@@ -480,15 +481,15 @@ class WorldEditManager {
      * 碰玩家会抛线程归属异常。玩家已经下线时没有玩家线程可回, 只能就地回调 —— 调用方那句
      * 消息发给离线玩家本来就是空操作。
      */
-    private fun finishUndo(player: Player, done: Int, onDone: (Int) -> Unit) {
+    private fun finishUndo(player: Player, done: Int, timedOut: Boolean, onDone: (done: Int, timedOut: Boolean) -> Unit) {
         endEdit(player)
         if (!player.isOnline) {
-            onDone(done)
+            onDone(done, timedOut)
             return
         }
         // runOnOwnThread 自身失败 (实体已退役等) 时也不能让调用方永远等不到结果
-        if (runCatching { player.runOnOwnThread { onDone(done) } }.isFailure) {
-            onDone(done)
+        if (runCatching { player.runOnOwnThread { onDone(done, timedOut) } }.isFailure) {
+            onDone(done, timedOut)
         }
     }
 

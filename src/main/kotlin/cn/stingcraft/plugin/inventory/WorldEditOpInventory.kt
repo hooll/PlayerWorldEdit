@@ -75,11 +75,12 @@ object WorldEditOpInventory {
                 lore += "&7| 撤销最近一次操作并返还材料"
                 colored()
             }) {
-                worldEditManager.undo(player, 1) { done ->
-                    if (done <= 0) {
-                        player.sendLang("message-undo-none", pluginId to "pluginId")
-                    } else {
-                        player.sendLang("message-undo-susses", pluginId to "pluginId", done to "times")
+                worldEditManager.undo(player, 1) { done, timedOut ->
+                    when {
+                        // 超时不等于"没有可撤销的": 那条记录已经放回队列, 玩家可以重试
+                        timedOut -> player.sendLang("message-undo-timeout", pluginId to "pluginId", done to "times")
+                        done <= 0 -> player.sendLang("message-undo-none", pluginId to "pluginId")
+                        else -> player.sendLang("message-undo-susses", pluginId to "pluginId", done to "times")
                     }
                 }
             }
