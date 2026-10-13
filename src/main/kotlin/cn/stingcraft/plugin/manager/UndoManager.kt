@@ -97,6 +97,25 @@ object UndoManager {
     }
 
     /**
+     * 玩家退出: 丢掉他内存队列里**已经落盘**的那部分
+     *
+     * 队列按 UUID 只增不删, 不清的话每个进过服的玩家都会在这里留一个 ArrayDeque (队列里
+     * 还可能压着几 MB 的方块快照 —— 写盘失败时快照会一直留在内存里)。已经落盘的条目丢掉
+     * 没有损失: poll 空了会回落到磁盘, 那条回落路径本来就是"从磁盘重建队列"。
+     *
+     * 还没落盘的条目不丢: 万一那次写盘失败, 玩家回来还能撤销它 (丢了就真没了)。
+     */
+    fun forget(uuid: UUID) {
+        synchronized(lockOf(uuid)) {
+            val queue = queues[uuid] ?: return
+            queue.removeIf { it.record == null }
+            if (queue.isEmpty()) {
+                queues.remove(uuid)
+            }
+        }
+    }
+
+    /**
      * 取出最近一条撤销记录 (取走即删除), 没有则返回 null
      *
      * 优先从内存队列拿; 队列空了才回落到磁盘 —— 服务端重启后队列是空的, 记录仍然在文件里,

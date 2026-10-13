@@ -2,6 +2,7 @@ package cn.stingcraft.plugin.listener
 
 import cn.stingcraft.plugin.PlayerWorldEdit
 import cn.stingcraft.plugin.inventory.WorldEditOpInventory
+import cn.stingcraft.plugin.manager.UndoManager
 import cn.stingcraft.plugin.until.isToolItem
 import org.bukkit.event.block.Action
 import org.bukkit.event.player.PlayerInteractEvent
@@ -70,6 +71,8 @@ object WorldEditToolListener {
     @SubscribeEvent
     fun onPlayerQuit(e: PlayerQuitEvent) {
         PlayerWorldEdit.worldEditManager.clearPlayerPos(e.player)
+        // 撤销队列按 UUID 只增不删, 退出时清掉 (记录本身在磁盘上, 下次登录会重建)
+        UndoManager.forget(e.player.uniqueId)
     }
 
 }
