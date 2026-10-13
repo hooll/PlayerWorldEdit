@@ -27,9 +27,14 @@ sealed interface DominionCheck {
 
 object DominionHook {
 
-    private val available: Boolean by lazy {
-        runCatching { Bukkit.getPluginManager().isPluginEnabled("Dominion") }.getOrDefault(false)
-    }
+    /**
+     * Dominion 现在装没装 / 启没启用。
+     *
+     * 每次现查, 不能用 lazy: Dominion 比本插件晚启用时, 第一次求值会把结果永久钉死成
+     * "没装", 之后领地保护就再也不生效了。isPluginEnabled 只是查一下插件表, 很便宜。
+     */
+    private val available: Boolean
+        get() = runCatching { Bukkit.getPluginManager().isPluginEnabled("Dominion") }.getOrDefault(false)
 
     /**
      * 检查玩家是否有权编辑选区范围内的所有领地
