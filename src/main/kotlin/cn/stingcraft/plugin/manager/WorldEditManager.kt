@@ -397,6 +397,180 @@ class WorldEditManager {
     }
 
     /**
+     * 生成墙: 选区四周的四面竖墙 (等同 WorldEdit 的 //walls, 不含顶和底)
+     *
+     * @param player 玩家
+     * @param material 方块 (空气 = 清空这些位置)
+     */
+    fun tryGenerateWall(player: Player, material: Material) {
+        generateShape(player, ShapeKind.WALL, material, radius = 0, height = 0, successKey = "message-wall-susses")
+    }
+
+    /**
+     * 形状生成的公共流程 —— 和 [trySetArea] 走**同一条写方块链路**:
+     * validatedRegion (含 Dominion fail-closed) → beginEdit → 计费 → tryConsume →
+     * runOnChunkThreads → finishEdit (撤销记录 + 成功保留选区)。
+     *
+     * 计费在玩家线程上做, 但只是纯算术数一遍 X/Z 每列 (见 [ShapeVolume.countIn]): 不读世界、
+     * 不遍历体积。真正的写入全部丢进 [runOnChunkThreads], 在区块所属区域线程上执行并受
+     * [EditBudget] 每 tick 限流, 与 /pwe set 的开销特征一致。
+     */
+    private fun generateShape(
+        player: Player,
+        kind: ShapeKind,
+        material: Material,
+        radius: Int,
+        height: Int,
+        successKey: String
+    ) {
+        val region = validatedRegion(player, needBreak = false) ?: return
+        val blockType = resolveBlockType(material) ?: run {
+            player.sendLang("message-invalid-material", pluginId to "pluginId", material.name to "material")
+            return
+        }
+        // 用 BlockVector3.x()/y()/z(): getX()/getY()/getZ() 在 7.4.6 已经标记弃用, 新代码别再添警告
+        val min = region.minimumPoint
+        val max = region.maximumPoint
+        val shape = ShapeVolume(
+            kind,
+            min.x(), max.x(),
+            min.y(), max.y(),
+            min.z(), max.z(),
+            radius,
+            // 墙的高度就是整个选区 (//walls 取全部 Y 范围); 圆柱用玩家给的高度
+            if (kind == ShapeKind.WALL) max.y() - min.y() + 1 else height
+        )
+        val regions = region.splitByChunk()
+        // 计费: 每个区块各数自己那一块里的形状方块, 加总就是总量。失败退费按区块退, 口径一致。
+        // 这里数的是"列 × 层", 与下面 work 里逐块判定的结果严格相等 (见 ShapeVolume.countIn)
+        val costs = regions.map { chunk ->
+            shape.countIn(chunk.minimumPoint.x(), chunk.maximumPoint.x(), chunk.minimumPoint.z(), chunk.maximumPoint.z())
+        }
+        val amount = costs.sum()
+        if (amount <= 0) {
+            // 形状一点都没落在选区里 (例如 1x1 的选区放半径 1 的空心圆柱): 别白留一条 0 材料的撤销记录
+            player.sendLang("message-shape-none", pluginId to "pluginId")
+            return
+        }
+        if (!beginEdit(player)) return
+        // 同 trySetArea: 查与扣合成一次原子操作; 先扣, 有区块没跑成再按区块退
+        if (!PlayerWorldEdit.packManager.tryConsume(player, material, amount)) {
+            player.sendLang("message-materialpack-not-enough",
+                pluginId to "pluginId",
+                material.displayName(player) to "material",
+                amount to "amount")
+            endEdit(player)
+            return
+        }
+        prepareEdit(amount, player)
+        val actor = actorOf(player)
+        val snapshots = AtomicReferenceArray<Array<BlockState?>?>(regions.size)
+        // 绑定一次, 别在每个切片里现建函数引用
+        val inShape: (Int, Int, Int) -> Boolean = shape::contains
+        runOnChunkThreads(regions, player.world,
+            work = { index, slice ->
+                val chunk = regions[index]
+                val states = snapshots.get(index)
+                    ?: arrayOfNulls<BlockState>(chunk.volume.toInt()).also { snapshots.set(index, it) }
+                // 快照照旧读整块: 撤销要把整块还原回去, 没改过的方块还原回去也没有副作用
+                WorldEditTool.readBlocksInto(player.world, slice.region, states, slice.offset)
+                WorldEditTool.setBlocksIf(player.world, slice.region, blockType.defaultState, actor, inShape)
+            },
+            done = { _ ->
+                onPlayerThread(player) {
+                    finishEdit(
+                        player,
+                        regions,
+                        regions.indices.map { snapshots[it] },
+                        costs,
+                        material,
+                        amount,
+                        successKey
+                    )
+                }
+            }
+        )
+    }
+
+    /** 形状的水平投影种类 */
+    private enum class ShapeKind { WALL, CYLINDER, HOLLOW_CYLINDER }
+
+    /**
+     * 一次形状生成的几何定义。
+     *
+     * **写入判定 ([contains]) 与计费 ([countIn]) 共用同一份判定** —— 任务 9C 的教训是"统计口径 ≠
+     * 执行口径"就会多扣/少扣材料, 所以这里只留 [columnContains] 一个谓词, 计费只是把它按 X/Z
+     * 每列数一遍。全部是纯算术, 一次世界访问都没有。
+     *
+     * 坐标全部取整到方块坐标 (和 /pwe set 一样按方块算), 不引入小数偏移。
+     */
+    private class ShapeVolume(
+        private val kind: ShapeKind,
+        private val minX: Int,
+        private val maxX: Int,
+        private val minY: Int,
+        private val maxY: Int,
+        private val minZ: Int,
+        private val maxZ: Int,
+        radius: Int,
+        height: Int
+    ) {
+        /** 形状最上面一层的 Y; 可以超出选区顶, 计费与写入时再按选区裁掉 */
+        private val topY = minY + height - 1
+
+        // 选区的水平中心。选区覆盖 [minX, maxX+1), 方块 x 的中心是 x+0.5, 所以方块到中心的水平
+        // 距离正好是 x - (minX+maxX)/2 —— 直接用方块坐标算就行, 不需要再 +0.5
+        private val centerX = (minX + maxX) / 2.0
+        private val centerZ = (minZ + maxZ) / 2.0
+        private val outerRadiusSquared = (radius * radius).toDouble()
+        private val innerRadiusSquared = (radius - 1).toDouble().let { it * it }
+
+        /**
+         * 这一列 (x, z) 的水平投影在不在形状里 (纯算术, 与 Y 无关)
+         *
+         * 墙按"贴到选区某一条边"算, 所以 1 格宽的选区整条都算墙 (和 //walls 一致)。
+         */
+        fun columnContains(x: Int, z: Int): Boolean {
+            return when (kind) {
+                ShapeKind.WALL -> x == minX || x == maxX || z == minZ || z == maxZ
+                ShapeKind.CYLINDER -> distanceSquared(x, z) <= outerRadiusSquared
+                // 空心 = 半径 r 的圆盘减去半径 r-1 的圆盘, 也就是最外那一圈 (径向厚度 1)。
+                // r=1 时内圈半径为 0, 只剩中心列的正交邻居 —— 这是"壳"的定义, 不是漏算。
+                ShapeKind.HOLLOW_CYLINDER ->
+                    distanceSquared(x, z).let { it > innerRadiusSquared && it <= outerRadiusSquared }
+            }
+        }
+
+        /** 方块在不在形状里 —— 写入判定用的就是它 */
+        fun contains(x: Int, y: Int, z: Int): Boolean = y in minY..topY && columnContains(x, z)
+
+        /**
+         * 选区 (X/Z 取 [x1]..[x2] / [z1]..[z2]) 里有多少方块落在形状里, 纯算术
+         *
+         * = 落在形状里的列数 × 每列落在形状里的层数。因为 [contains] 是"列判定 AND Y ∈
+         * [minY, topY]", 每列的层数是同一个常数, 所以这个乘积与逐块调用 [contains] 数出来的
+         * 结果**严格相等** —— 但不用遍历整个体积, 也不读世界。
+         */
+        fun countIn(x1: Int, x2: Int, z1: Int, z2: Int): Int {
+            val layers = (minOf(topY, maxY) - minY + 1).coerceAtLeast(0)
+            if (layers == 0) return 0
+            var columns = 0
+            for (x in x1..x2) {
+                for (z in z1..z2) {
+                    if (columnContains(x, z)) columns++
+                }
+            }
+            return columns * layers
+        }
+
+        private fun distanceSquared(x: Int, z: Int): Double {
+            val dx = x - centerX
+            val dz = z - centerZ
+            return dx * dx + dz * dz
+        }
+    }
+
+    /**
      * 朝玩家朝向的那一面扩 / 缩选区
      *
      * 这是**选区编辑**, 不是方块编辑: 一个方块都不写, 所以不扣材料、不记撤销, 也因此不碰

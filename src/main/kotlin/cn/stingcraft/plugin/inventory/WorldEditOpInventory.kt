@@ -107,6 +107,18 @@ object WorldEditOpInventory {
                 // 同上: 重开菜单让第 4 槽的方块数跟上新的选区
                 open(player)
             }
+            // 形状生成: 墙一步到底 (选完方块直接生成)
+            set(20, buildItem(XMaterial.BRICKS) {
+                name = "&f| 生成墙"
+                lore += "&7| 沿选区四周生成四面竖墙"
+                lore += "&7| 不含顶和底"
+                colored()
+            }) {
+                openBlockPicker(player, "&f选择墙的方块") { material ->
+                    player.closeInventory()
+                    worldEditManager.tryGenerateWall(player, material)
+                }
+            }
         }
     }
 

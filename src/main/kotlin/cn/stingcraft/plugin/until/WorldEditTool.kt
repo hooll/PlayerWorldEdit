@@ -42,6 +42,29 @@ object WorldEditTool {
         }
     }
 
+    /**
+     * 只写区域里满足 [contains] 的方块 (形状生成用)
+     *
+     * 形状不是长方体, 用不了 `setBlocks(Region)` 那条快路径, 只能逐个 [EditSession.setBlock] ——
+     * 和 [restoreBlocks] 是同一条写入路径, 所以形状生成的开销特征和撤销一致: 都在区块所属的
+     * 区域线程上跑, 都受每 tick 预算限流。[contains] 是纯算术判定, 不读世界。
+     */
+    fun setBlocksIf(
+        world: World,
+        region: Region,
+        blockState: BlockState,
+        actor: Actor?,
+        contains: (x: Int, y: Int, z: Int) -> Boolean
+    ) {
+        newSession(world, actor).use { session ->
+            for (vector in region) {
+                if (contains(vector.x(), vector.y(), vector.z())) {
+                    session.setBlock(vector, blockState)
+                }
+            }
+        }
+    }
+
     /** 按 [RegionSlice] 把整块快照里对应的那一段写回这片区域 */
     fun restoreBlocks(world: World, slice: RegionSlice, states: List<BlockState>, actor: Actor? = null) {
         val end = minOf(slice.offset + slice.size, states.size)
