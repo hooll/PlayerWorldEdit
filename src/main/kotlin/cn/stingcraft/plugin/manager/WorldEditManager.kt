@@ -305,7 +305,7 @@ class WorldEditManager {
                 WorldEditTool.setBlocks(player.world, slice.region, blockType.defaultState, actor)
             },
             done = { _ ->
-                player.runOnOwnThread {
+                onPlayerThread(player) {
                     finishEdit(
                         player,
                         regions,
@@ -346,7 +346,7 @@ class WorldEditManager {
                 WorldEditTool.readBlocksInto(player.world, slice.region, states, slice.offset)
             },
             done = { _ ->
-                player.runOnOwnThread {
+                onPlayerThread(player) {
                     val targets = regions.indices.filter { isComplete(snapshots[it]) }
                     // 每个区块实际会被替换的数量, 收费和失败退费都以它为准
                     val costs = targets.map { replaceTargets(snapshots[it]!!, fromType.defaultState) }
@@ -354,7 +354,7 @@ class WorldEditManager {
                     if (amount <= 0) {
                         player.sendLang("message-replace-none", pluginId to "pluginId", from.displayName(player) to "material")
                         endEdit(player)
-                        return@runOnOwnThread
+                        return@onPlayerThread
                     }
                     // 同 trySetArea: 查与扣合成一次原子操作
                     if (!PlayerWorldEdit.packManager.tryConsume(player, to, amount)) {
@@ -363,7 +363,7 @@ class WorldEditManager {
                             to.displayName(player) to "material",
                             amount to "amount")
                         endEdit(player)
-                        return@runOnOwnThread
+                        return@onPlayerThread
                     }
                     prepareEdit(amount, player)
                     val actor = actorOf(player)
@@ -374,7 +374,7 @@ class WorldEditManager {
                             WorldEditTool.replaceBlocks(player.world, slice.region, fromType.defaultState, toType.defaultState, actor)
                         },
                         done = { _ ->
-                            player.runOnOwnThread {
+                            onPlayerThread(player) {
                                 finishEdit(
                                     player,
                                     batchRegions,
@@ -442,7 +442,9 @@ class WorldEditManager {
                     WorldEditTool.restoreBlocks(bukkitWorld, slice, record.batches[index].states, actor)
                 },
                 done = { timedOut ->
-                    player.runOnOwnThread {
+                    // 同样不能只依赖 runOnOwnThread: 玩家中途退出时这里不执行的话,
+                    // 这一条的返还就丢了, 而且整条撤销链会断在半路
+                    onPlayerThread(player) {
                         if (timedOut) {
                             // 超时: 这条记录只还原了一部分, 不能按"已撤销"退还材料 (那等于白送),
                             // 也不能就这么丢掉 (剩下的区块就再也撤不回去了)。还原到快照是幂等的,
@@ -491,7 +493,26 @@ class WorldEditManager {
     }
 
     /**
-     * 编辑收尾 (必须在玩家所在线程执行): 记录撤销、退还失败部分的材料并提示
+     * 需要玩家数据的收尾都从这里跑: 玩家在线就切回他自己的线程 (要发消息、碰玩家对象),
+     * 已经下线就地在当前线程跑完。
+     *
+     * 不能只依赖 [runOnOwnThread]: 玩家中途退出时那个任务不会再执行, 收尾就整个丢了 ——
+     * 材料扣了不退、撤销记录也不落库 (2026-10-13 的任务 9D)。退费和落库只依赖 uuid 和
+     * 世界数据, 本来就不需要玩家对象; 给一个已经离开的玩家发提示是空操作。
+     * [runOnOwnThread] 自身失败 (实体已退役等) 时同样就地跑, 否则收尾一样会丢。
+     */
+    private fun onPlayerThread(player: Player, block: () -> Unit) {
+        if (!player.isOnline) {
+            block()
+            return
+        }
+        if (runCatching { player.runOnOwnThread(block) }.isFailure) {
+            block()
+        }
+    }
+
+    /**
+     * 编辑收尾 (走 [onPlayerThread]): 记录撤销、退还失败部分的材料并提示
      *
      * @param snapshots 与 regions 一一对应, null 或含 null 表示该区块没跑完
      * @param costs 与 regions 一一对应, 表示该区块已经扣掉的材料数量 (失败时按它退还)
