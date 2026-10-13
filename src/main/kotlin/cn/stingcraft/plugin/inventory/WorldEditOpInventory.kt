@@ -28,7 +28,7 @@ object WorldEditOpInventory {
         val hasRegion = worldEditManager.hasRegion(player)
         val size = if (hasRegion) worldEditManager.getCountInRegion(player) else 0
         return buildMenu<ChestImpl>("&f创世神操作 &4| 快捷菜单".colored()) {
-            rows(3)
+            rows(5)
             // 锁定整页点击: 没有注册 onClick 的格子（如信息纸）原本可以把物品拿走
             onClick(true) { }
             set(4, buildItem(XMaterial.PAPER) {
@@ -83,6 +83,29 @@ object WorldEditOpInventory {
                         else -> player.sendLang("message-undo-susses", pluginId to "pluginId", done to "times")
                     }
                 }
+            }
+            // 选区编辑: 每次点击 1 格 (要更多格数用命令的 [格数] 参数)。
+            // 菜单扩到 5 行, 这两个按钮排在第 4 行的对称位置; 第 3 行与第 5 行留空给下一轮的墙/圆柱按钮。
+            set(29, buildItem(XMaterial.LIME_STAINED_GLASS_PANE) {
+                name = "&f| 扩展选区"
+                lore += "&7| 朝你视线的那一面外扩 1 格"
+                lore += "&7| 不消耗材料"
+                colored()
+            }) {
+                worldEditManager.resizeSelection(player, 1, expand = true)
+                // 第 4 槽的方块数是 build() 那一刻算的, 不重开菜单就会一直显示旧值
+                // (MaterialPackInventory 每次取物后同样 open(player) 刷新)
+                open(player)
+            }
+            set(33, buildItem(XMaterial.RED_STAINED_GLASS_PANE) {
+                name = "&f| 收缩选区"
+                lore += "&7| 朝你视线的那一面内缩 1 格"
+                lore += "&7| 不消耗材料"
+                colored()
+            }) {
+                worldEditManager.resizeSelection(player, 1, expand = false)
+                // 同上: 重开菜单让第 4 槽的方块数跟上新的选区
+                open(player)
             }
         }
     }

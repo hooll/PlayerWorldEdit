@@ -45,4 +45,10 @@ object MainCommand {
 
     @CommandBody(permission = "PlayerWorldEdit.Use")
     val id = CommandID.command
+
+    @CommandBody(permission = "PlayerWorldEdit.Use")
+    val expand = CommandExpand.command
+
+    @CommandBody(permission = "PlayerWorldEdit.Use")
+    val contract = CommandContract.command
 }

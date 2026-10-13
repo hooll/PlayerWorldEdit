@@ -25,6 +25,7 @@ import org.bukkit.Material
 import org.bukkit.Particle
 import org.bukkit.entity.Player
 import org.bukkit.inventory.ItemStack
+import org.bukkit.util.Vector
 import taboolib.common.platform.function.pluginId
 import taboolib.common.platform.function.submitAsync
 import taboolib.common.platform.function.warning
@@ -41,6 +42,7 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReferenceArray
 import kotlin.math.abs
+import kotlin.math.floor
 import kotlin.math.max
 
 class WorldEditManager {
@@ -392,6 +394,126 @@ class WorldEditManager {
                 }
             }
         )
+    }
+
+    /**
+     * 朝玩家朝向的那一面扩 / 缩选区
+     *
+     * 这是**选区编辑**, 不是方块编辑: 一个方块都不写, 所以不扣材料、不记撤销, 也因此不碰
+     * [beginEdit]/[tryConsume]/[runOnChunkThreads]/[finishEdit] 那条写方块链路 —— 那条链路
+     * 的每一个环节都以"要改的方块"为对象, 这里没有对象; 白走一遍反而会扣掉一次材料。
+     *
+     * 只动视线吸附轴 (|分量|最大的 ±X/±Y/±Z) 上对应的那一面, 另外 5 个面的坐标原样保留;
+     * pos1/pos2 哪个大哪个小都行, 每次现算 —— 注意 CuboidRegion 的构造器**不会**把两点摆成
+     * 最小/最大 (它只在**持有世界时**把 Y 夹进世界高度; [getWERegion] 走的是 2 参构造器, 世界为
+     * null, 此时 clampY 拿到的是 Integer.MIN/MAX_VALUE, 等于没夹), 但 getMinimumPoint()/
+     * getMaximumPoint()/getVolume() 都是现算两点的 min/max, 所以上下颠倒的选区在 WorldEdit 侧依旧算得对。
+     *
+     * @param player 玩家
+     * @param blocks 扩缩的格数, 内部 clamp 到 1..[SELECTION_EDIT_MAX_BLOCKS]
+     * @param expand true=扩展, false=收缩
+     */
+    fun resizeSelection(player: Player, blocks: Int, expand: Boolean) {
+        // 和 set/replace 同一个前置校验: 没选齐两点 -> message-no-region; 有领地且没权限 -> 拒绝
+        validatedRegion(player, needBreak = false) ?: return
+        val pos1 = getPlayerPos1(player) ?: return
+        val pos2 = getPlayerPos2(player) ?: return
+        val steps = blocks.coerceIn(1, SELECTION_EDIT_MAX_BLOCKS)
+        // 选区本来就按方块坐标存 (点的中心 5.5 落到方块 5), 这里同样取整: 全程按方块算, 不引入小数偏移
+        val first = intArrayOf(floor(pos1.x).toInt(), floor(pos1.y).toInt(), floor(pos1.z).toInt())
+        val second = intArrayOf(floor(pos2.x).toInt(), floor(pos2.y).toInt(), floor(pos2.z).toInt())
+        val (axis, positive) = snapAxis(player.eyeLocation.direction)
+        // 大小关系现算, 不假设 pos1 就是小的一头。
+        // pos1IsFirst 必须在这里定下来: lower/upper 是 first/second 的别名, 下面的扩缩会就地改掉
+        // 数组内容, 等移动完再比较就只能读到改后的值 —— 收缩把该轴压成单层时两点在该轴上相等,
+        // pos1/pos2 的标签归属会跟着互换
+        val pos1IsFirst = first[axis] <= second[axis]
+        val lower = if (pos1IsFirst) first else second
+        val upper = if (pos1IsFirst) second else first
+        if (expand) {
+            val moved = if (positive) upper else lower
+            // 记下被移动这个点移动前的 Y, 用来区分"被世界高度完全挡住"和"只被吃掉几格"
+            val movedYBefore = moved[AXIS_Y]
+            moved[axis] += if (positive) steps else -steps
+            // 世界高度夹取 (只做 Y): 越界的选区点会让框画到世界外, 而且之后 /pwe set 是按选区体积
+            // 扣材料的 —— 界外那一层根本放不上, 等于白扣。被世界高度吃掉的那几格就丢掉, 但夹取后的
+            // 结果照旧应用 (不整体放弃), 只额外提示一句, 免得玩家以为命令没生效。
+            // X/Z 不做边界处理 (那是另一个已知限制, 不在本次修复范围)。
+            if (axis == AXIS_Y) {
+                // 绕 WorldEdit 取边界: 编译期用的精简 API 里 org.bukkit.World 没有 getMinHeight()/
+                // getMaxHeight(); BukkitWorld.getMinY()/getMaxY() 的实现正好就是
+                // world.getMinHeight() 和 world.getMaxHeight() - 1 (上界即最高可放置层)
+                val weWorld = BukkitAdapter.adapt(player.world)
+                val clamped = moved[AXIS_Y].coerceIn(weWorld.minY, weWorld.maxY)
+                if (clamped == movedYBefore) {
+                    // 这一面已经顶在世界边界上, 一格都推不动: 只提示被世界高度挡住就收工。不能走到
+                    // 下面那条成功提示 —— 坐标一步没动, 再报一句"已扩展选区到 ..."会自相矛盾。
+                    player.sendLang("message-selection-expand-limit",
+                        pluginId to "pluginId",
+                        clamped to "y")
+                    return
+                }
+                if (clamped != moved[AXIS_Y]) {
+                    moved[AXIS_Y] = clamped
+                    player.sendLang("message-selection-expand-limit",
+                        pluginId to "pluginId",
+                        clamped to "y")
+                }
+            }
+        } else {
+            // 收缩的下限: 该轴至少留 1 格。会缩成 0 格或反向就整体不动作 —— 宁可不动, 也不要
+            // 出现空选区或反向选区 (反向之后"扩展"会朝反方向长, 玩家看到的框和预期完全相反)
+            val extent = upper[axis] - lower[axis] + 1
+            if (extent - steps < 1) {
+                player.sendLang("message-selection-contract-limit",
+                    pluginId to "pluginId",
+                    extent to "extent")
+                return
+            }
+            if (positive) upper[axis] -= steps else lower[axis] += steps
+        }
+        // 两个 setter 各自触发一次 showSelection (重画选区框), 位置和原来一样:
+        // 点1 传 pos1 算出来的坐标, 点2 传 pos2 算出来的
+        val newPos1 = if (pos1IsFirst) lower else upper
+        val newPos2 = if (pos1IsFirst) upper else lower
+        setPlayerPos1(player, locationOf(player, newPos1))
+        setPlayerPos2(player, locationOf(player, newPos2))
+        val key = if (expand) "message-selection-expand-susses" else "message-selection-contract-susses"
+        // 坐标和方块数都告诉玩家: 他刚动的是哪一面, 现在选中的是哪一块。
+        // 方块数按移动后的两个点现算 —— 不能拿上面的 region.volume, 那是移动前的选区
+        val amount = (abs(newPos1[0] - newPos2[0]) + 1).toLong() *
+            (abs(newPos1[1] - newPos2[1]) + 1).toLong() *
+            (abs(newPos1[2] - newPos2[2]) + 1).toLong()
+        player.sendLang(key,
+            pluginId to "pluginId",
+            newPos1[0] to "x",
+            newPos1[1] to "y",
+            newPos1[2] to "z",
+            amount.toInt() to "amount")
+    }
+
+    /**
+     * 把视线方向吸附到最接近的 6 个轴向之一
+     *
+     * 取视线向量里**绝对值最大**的那个分量决定轴; 平局时按 X > Y > Z 的固定顺序取先遇到的那个,
+     * 保证同一个朝向每次都算出同一面 (玩家斜着看时不会一会儿扩 X 一会儿扩 Y)。
+     *
+     * @return 轴 (0=X, 1=Y, 2=Z) 与该轴的正负方向
+     */
+    private fun snapAxis(direction: Vector): Pair<Int, Boolean> {
+        val components = doubleArrayOf(direction.x, direction.y, direction.z)
+        var axis = 0
+        for (candidate in 1..2) {
+            if (abs(components[candidate]) > abs(components[axis])) {
+                axis = candidate
+            }
+        }
+        return axis to (components[axis] >= 0)
+    }
+
+    /** 把方块坐标拼成 Location (setPlayerPos1/2 只取整数部分, 小数位没有意义) */
+    private fun locationOf(player: Player, block: IntArray): Location {
+        return Location(player.world, block[0].toDouble(), block[1].toDouble(), block[2].toDouble())
     }
 
     /**
@@ -748,6 +870,17 @@ class WorldEditManager {
 
         /** 是否让外部 WE 记录插件 (CoreProtect 等) 按玩家身份记录本插件的编辑 */
         const val COREPROTECT_LOGGING_KEY = "coreprotect-logging"
+
+        /**
+         * 一次扩 / 缩的格数上限
+         *
+         * 选区编辑不写方块, 理论上多大都行; 设上限是为了防止手滑 (例如把 1000 敲成 10000)
+         * 一下子把选区撑到几个区块以外 —— 之后一个 set 就要跑很久。
+         */
+        const val SELECTION_EDIT_MAX_BLOCKS = 100
+
+        /** 轴索引里的 Y (与 [snapAxis] 的 0=X, 1=Y, 2=Z 顺序一致) —— 6 个面里只有 Y 需要世界高度夹取 */
+        const val AXIS_Y = 1
 
         /** 选区粒子边框在最长边上画多少个点 (其余边按同样步长, 总点数因此有上限) */
         const val PARTICLE_POINTS_PER_EDGE = 100.0
