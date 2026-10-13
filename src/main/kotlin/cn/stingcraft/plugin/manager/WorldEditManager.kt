@@ -268,16 +268,18 @@ class WorldEditManager {
             player.sendLang("message-no-region", pluginId to "pluginId")
             return
         }
-        if (!PlayerWorldEdit.packManager.hasEnoughMaterial(player, material, amount)) {
+        if (!beginEdit(player)) return
+        // 检查与扣费必须在一次原子操作里完成: 原来是"查够不够"和"扣"两次调用,
+        // 中间别的线程也能通过检查, 同一个玩家并发操作时会被各扣一次。
+        // 先扣材料, 有区块没执行成功再按体积退还。
+        if (!PlayerWorldEdit.packManager.tryConsume(player, material, amount)) {
             player.sendLang("message-materialpack-not-enough",
                 pluginId to "pluginId",
                 material.displayName(player) to "material",
                 amount to "amount")
+            endEdit(player)
             return
         }
-        if (!beginEdit(player)) return
-        // 先扣材料, 有区块没执行成功再按体积退还
-        chargeMaterial(player, material, amount)
         prepareEdit(amount, player)
         val actor = actorOf(player)
         val regions = region.splitByChunk()
@@ -342,7 +344,8 @@ class WorldEditManager {
                         endEdit(player)
                         return@runOnOwnThread
                     }
-                    if (!PlayerWorldEdit.packManager.hasEnoughMaterial(player, to, amount)) {
+                    // 同 trySetArea: 查与扣合成一次原子操作
+                    if (!PlayerWorldEdit.packManager.tryConsume(player, to, amount)) {
                         player.sendLang("message-materialpack-not-enough",
                             pluginId to "pluginId",
                             to.displayName(player) to "material",
@@ -350,7 +353,6 @@ class WorldEditManager {
                         endEdit(player)
                         return@runOnOwnThread
                     }
-                    chargeMaterial(player, to, amount)
                     prepareEdit(amount, player)
                     val actor = actorOf(player)
                     val batchRegions = targets.map { regions[it] }
