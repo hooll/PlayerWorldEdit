@@ -174,7 +174,7 @@ private class ChunkTask(
     private var finished = false
 
     fun start() {
-        loadChunkThen(world, chunkX, chunkZ, { schedule(0) }, { finish() })
+        schedule(0)
     }
 
     private fun runCurrent() {
@@ -210,9 +210,19 @@ private class ChunkTask(
     }
 
     /**
+     * 排下一片
+     *
+     * 每次都要先确认区块是加载着的: 切片之间区块可能被卸载 (附近没人了), 这时候
+     * `world.runTask` 排的任务会被区域调度器一直压着 —— 它不会主动去加载区块, 整批就会
+     * 卡到看门狗超时才收尾。start() 当初就是靠这个假设, 这里保持一致。
+     *
      * @param delayTicks 0 表示立刻排到该区块所属的区域线程
      */
     private fun schedule(delayTicks: Long) {
+        loadChunkThen(world, chunkX, chunkZ, { dispatch(delayTicks) }, { finish() })
+    }
+
+    private fun dispatch(delayTicks: Long) {
         if (delayTicks <= 0) {
             world.runTask(chunkX * 16.0, chunkZ * 16.0, Runnable { runCurrent() })
         } else {
