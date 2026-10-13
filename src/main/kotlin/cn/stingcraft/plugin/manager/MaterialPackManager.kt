@@ -100,20 +100,6 @@ class MaterialPackManager {
     }
 
     /**
-     * 整包覆盖 (锁内执行)。
-     *
-     * 对外保留这个方法, 但它接受的是调用方传进来的包 —— 传一个过期的包进来依然会覆盖掉别人的
-     * 改动, 所以插件内部一律走 [addMaterial] / [removeMaterial] / [tryConsume] 这些
-     * "读改写都在锁里"的方法。缓存是唯一真相源, 这里连缓存一起换掉。
-     */
-    fun saveMaterialPack(player: Player, materialPack: MaterialPack) {
-        synchronized(lockOf(player.uniqueId)) {
-            caches[player.uniqueId] = materialPack
-            MaterialPackDataBase.saveMaterialPack(player.uniqueId, materialPack)
-        }
-    }
-
-    /**
      * 添加物品列表
      * @param player 玩家
      * @param materials 物品列表
@@ -204,20 +190,6 @@ class MaterialPackManager {
             }
             false
         }
-    }
-
-    /**
-     * 判断玩家是否有足够的物品
-     * @param player 玩家
-     * @param material 物品
-     * @param amount 数量
-     * @return 是否有足够的物品
-     */
-    fun hasEnoughMaterial(player: Player, material: Material, amount: Int): Boolean {
-        val materialPack = getMaterialPack(player)
-        if (material.isAir) return true
-        val materialEntry = materialPack.materials.firstOrNull { it.material == material } ?: return false
-        return materialEntry.amount >= amount
     }
 
     /**
