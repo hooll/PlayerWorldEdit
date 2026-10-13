@@ -32,7 +32,7 @@ object EditBudget {
      */
     fun configure(blocksPerTick: Int) {
         perTick = blocksPerTick.coerceAtLeast(MIN_PER_TICK)
-        // 计时器还没跑起来时不要让"定时器失效"的兜底逻辑直接放行
+        // 记下基准时间: 第一次 tryConsume 就从这里开始按时间片补预算
         lastRefill.set(System.currentTimeMillis())
         synchronized(this) {
             if (!started) {
@@ -51,13 +51,30 @@ object EditBudget {
      */
     fun tryConsume(amount: Int): Boolean {
         if (amount <= 0) return true
-        // 补预算的定时器没在跑 (插件重载等异常情况) 就直接放行, 不能让操作永久卡住
-        if (System.currentTimeMillis() - lastRefill.get() > STALL_TIMEOUT) return true
+        // 自己按经过的时间补预算, 不依赖外部定时器。原来的兜底是"超过 STALL_TIMEOUT 就整体
+        // 放行" —— 定时器一停摆节流就完全失效, 正是这个类要防的事。改成按 perTick/50ms 的固定
+        // 速率降级放行, 操作既不会被卡死, 也不会失去节流。
+        refill(System.currentTimeMillis())
         while (true) {
             val current = remaining.get()
             if (current < amount) return false
             if (remaining.compareAndSet(current, current - amount)) return true
         }
+    }
+
+    /**
+     * 按距上次补预算过去了多少个 tick 自己补一次
+     *
+     * 每次最多补到 [perTick] 而不累积, 所以即使定时器停摆很久后恢复, 也不会一次性把积压的
+     * 预算放出来形成尖峰。
+     */
+    private fun refill(now: Long) {
+        val last = lastRefill.get()
+        val ticks = (now - last) / MILLIS_PER_TICK
+        if (ticks <= 0) return
+        // 几条区域线程同时进来时只让一个真的补
+        if (!lastRefill.compareAndSet(last, last + ticks * MILLIS_PER_TICK)) return
+        remaining.set(perTick)
     }
 
     private const val DEFAULT_PER_TICK = 20000
@@ -69,6 +86,6 @@ object EditBudget {
     private const val MAX_SLICE = 16384
     private const val MIN_PER_TICK = MIN_SLICE * SLICES_PER_TICK
 
-    /** 超过这个时间没有补过预算, 就认为定时器失效 */
-    private const val STALL_TIMEOUT = 3000L
+    /** 一个 tick 的毫秒数, 用来把"过了多久"换算成可以补多少个 tick 的预算 */
+    private const val MILLIS_PER_TICK = 50L
 }
