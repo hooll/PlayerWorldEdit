@@ -135,6 +135,18 @@ class AreaDisplay {
         remove(boxes.remove(player.uniqueId))
     }
 
+    /**
+     * 玩家退出: 收掉盒子并把这个玩家的代号条目也删掉
+     *
+     * [hide] 只把代号 +1 (排队中的旧任务据此判断自己该不该收实体), 键本身会一直留着 ——
+     * 按 UUID 只增不删, 长期运行就是一张无界累积的表。玩家已经退出, 不会再有在途任务,
+     * 所以这里可以直接删掉整个条目。
+     */
+    fun forget(player: Player) {
+        hide(player)
+        generations.remove(player.uniqueId)
+    }
+
     /** 收掉所有盒子 (关插件/重载时用, 免得留下孤儿实体) */
     fun hideAll() {
         hideTasks.values.forEach { runCatching { it.cancel() } }

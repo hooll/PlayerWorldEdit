@@ -35,10 +35,14 @@ object PlayerWorldEdit : Plugin() {
 
     /**
      * 重载配置文件与语言文件, 并丢弃依赖配置的缓存
+     *
+     * 顺便收掉所有已经显示出来的选区框: 显示材质 / 是否仅自己可见 / 显示时长这些配置改了之后,
+     * 已经画出来的实体不会自己更新。收掉之后玩家重新点一下点, 就会按新配置画出来。
      */
     fun reload() {
         settingManager.reload()
         Language.reload()
         worldEditManager.reloadCache()
+        worldEditManager.clearDisplays()
     }
 }

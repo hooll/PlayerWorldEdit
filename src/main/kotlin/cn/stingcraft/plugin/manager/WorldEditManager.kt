@@ -222,12 +222,15 @@ class WorldEditManager {
     }
 
     /**
-     * 清空点
+     * 清空点 (玩家退出 / 主动清除时用)
      * @param player 玩家
      */
     fun clearPlayerPos(player: Player) {
         playerpos.remove(player)
-        hideSelection(player)
+        stopParticle(player)
+        // 用 forget 而不是 hideSelection: 选区彻底没了, 顺手把代号表的条目一起清掉,
+        // 免得它按 UUID 只增不删
+        areaDisplay.forget(player)
         endEdit(player)
     }
 
