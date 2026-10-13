@@ -1,6 +1,7 @@
 package cn.stingcraft.plugin.manager
 
 import cn.stingcraft.plugin.PlayerWorldEdit
+import cn.stingcraft.plugin.hook.DominionCheck
 import cn.stingcraft.plugin.hook.DominionHook
 import cn.stingcraft.plugin.until.AreaDisplay
 import cn.stingcraft.plugin.until.EditBudget
@@ -519,9 +520,18 @@ class WorldEditManager {
         val region = getWERegion(player) ?: return null
         val pos1 = getPlayerPos1(player) ?: return null
         val pos2 = getPlayerPos2(player) ?: return null
-        DominionHook.findDeniedDominion(player, pos1, pos2, needBreak = needBreak)?.let { dominion ->
-            player.sendLang("message-dominion-denied", pluginId to "pluginId", dominion to "dominion")
-            return null
+        when (val check = DominionHook.checkAreaEdit(player, pos1, pos2, needBreak = needBreak)) {
+            is DominionCheck.Allowed -> Unit
+            is DominionCheck.Denied -> {
+                player.sendLang("message-dominion-denied", pluginId to "pluginId", check.dominion to "dominion")
+                return null
+            }
+            is DominionCheck.Failed -> {
+                // 校验过程出错 = 无法确认有没有领地, 按 fail-closed 拒绝
+                // (具体异常已经打进控制台, 这里只告诉玩家操作被拒)
+                player.sendLang("message-dominion-check-failed", pluginId to "pluginId")
+                return null
+            }
         }
         return region
     }
