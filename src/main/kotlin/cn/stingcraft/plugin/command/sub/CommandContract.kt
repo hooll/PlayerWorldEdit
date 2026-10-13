@@ -24,7 +24,8 @@ object CommandContract {
     }
 
     private fun contract(player: Player, blocks: Int) {
-        // 内部会先做选区校验 (没选齐两点 -> 提示先选点), 缩到该轴不足 1 格时不动作并提示
+        // 内部会先做选区校验 (没选齐两点 -> 提示先选点), 再把被砍掉的层清成空气;
+        // 缩到该轴不足 1 格时不动作并提示
         PlayerWorldEdit.worldEditManager.resizeSelection(player, blocks, expand = false)
     }
 }

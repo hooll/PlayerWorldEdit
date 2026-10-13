@@ -5,6 +5,7 @@ import cn.stingcraft.plugin.hook.DominionCheck
 import cn.stingcraft.plugin.hook.DominionHook
 import cn.stingcraft.plugin.until.AreaDisplay
 import cn.stingcraft.plugin.until.EditBudget
+import cn.stingcraft.plugin.until.RegionSlice
 import cn.stingcraft.plugin.until.WorldEditTool
 import cn.stingcraft.plugin.until.displayName
 import cn.stingcraft.plugin.until.markAsTool
@@ -314,9 +315,8 @@ class WorldEditManager {
                         player,
                         regions,
                         regions.indices.map { snapshots[it] },
-                        regions.map { it.volume.toInt() },
-                        material,
-                        amount,
+                        mapOf(material to amount),
+                        regions.map { mapOf(material to it.volume.toInt()) },
                         "message-set-susses"
                     )
                 }
@@ -353,8 +353,8 @@ class WorldEditManager {
                 onPlayerThread(player) {
                     val targets = regions.indices.filter { isComplete(snapshots[it]) }
                     // 每个区块实际会被替换的数量, 收费和失败退费都以它为准
-                    val costs = targets.map { replaceTargets(snapshots[it]!!, fromType.defaultState) }
-                    val amount = costs.sum()
+                    val costs = targets.map { mapOf(to to replaceTargets(snapshots[it]!!, fromType.defaultState)) }
+                    val amount = costs.sumOf { it.values.sum() }
                     if (amount <= 0) {
                         player.sendLang("message-replace-none", pluginId to "pluginId", from.displayName(player) to "material")
                         endEdit(player)
@@ -383,9 +383,8 @@ class WorldEditManager {
                                     player,
                                     batchRegions,
                                     batchSnapshots,
+                                    mapOf(to to amount),
                                     costs,
-                                    to,
-                                    amount,
                                     "message-replace-susses"
                                 )
                             }
@@ -525,9 +524,9 @@ class WorldEditManager {
         // 计费: 每个区块各数自己那一块里的形状方块, 加总就是总量。失败退费按区块退, 口径一致。
         // 这里数的是"列 × 层", 与下面 work 里逐块判定的结果严格相等 (见 ShapeVolume.countIn)
         val costs = regions.map { chunk ->
-            shape.countIn(chunk.minimumPoint.x(), chunk.maximumPoint.x(), chunk.minimumPoint.z(), chunk.maximumPoint.z())
+            mapOf(material to shape.countIn(chunk.minimumPoint.x(), chunk.maximumPoint.x(), chunk.minimumPoint.z(), chunk.maximumPoint.z()))
         }
-        val amount = costs.sum()
+        val amount = costs.sumOf { it.values.sum() }
         if (amount <= 0) {
             // 形状一点都没落在选区里 (例如 1x1 的选区放半径 1 的空心圆柱): 别白留一条 0 材料的撤销记录
             player.sendLang("message-shape-none", pluginId to "pluginId")
@@ -563,9 +562,8 @@ class WorldEditManager {
                         player,
                         regions,
                         regions.indices.map { snapshots[it] },
+                        mapOf(material to amount),
                         costs,
-                        material,
-                        amount,
                         successKey
                     )
                 }
@@ -647,99 +645,404 @@ class WorldEditManager {
     }
 
     /**
-     * 朝玩家朝向的那一面扩 / 缩选区
+     * 朝玩家朝向的那一面扩展 / 收缩选区, 并且**改动方块**
      *
-     * 这是**选区编辑**, 不是方块编辑: 一个方块都不写, 所以不扣材料、不记撤销, 也因此不碰
-     * [beginEdit]/[tryConsume]/[runOnChunkThreads]/[finishEdit] 那条写方块链路 —— 那条链路
-     * 的每一个环节都以"要改的方块"为对象, 这里没有对象; 白走一遍反而会扣掉一次材料。
+     * - 扩展: 把选区最外那一层 (朝视线那一面) 的方块**原样复制**到新增的每一层 (逐块对应)。
+     *   只有非空气的方块才写、才计费 —— 源层是空气的位置写空气 = 不写。
+     * - 收缩: 把被砍掉的那几层**全部清成空气** (只记账, 不产生材料返还, 与 /pwe set air 一致)。
      *
-     * 只动视线吸附轴 (|分量|最大的 ±X/±Y/±Z) 上对应的那一面, 另外 5 个面的坐标原样保留;
-     * pos1/pos2 哪个大哪个小都行, 每次现算 —— 注意 CuboidRegion 的构造器**不会**把两点摆成
-     * 最小/最大 (它只在**持有世界时**把 Y 夹进世界高度; [getWERegion] 走的是 2 参构造器, 世界为
-     * null, 此时 clampY 拿到的是 Integer.MIN/MAX_VALUE, 等于没夹), 但 getMinimumPoint()/
-     * getMaximumPoint()/getVolume() 都是现算两点的 min/max, 所以上下颠倒的选区在 WorldEdit 侧依旧算得对。
+     * 两者都是写方块的操作, 所以走全 beginEdit → 扣费 → runOnChunkThreads → finishEdit
+     * (撤销记录 + 成功保留选区)。领地校验对"老选区 ∪ 新选区"的包围盒做: 扩展动的是新层 (属于
+     * 新选区), 收缩清掉的是被砍掉的那几层 (属于老选区), 只查新选区会漏掉后者。
+     *
+     * 只动视线吸附轴 (|分量|最大的 ±X/±Y/±Z) 上对应的那一面, 另外 5 个面原样保留;
+     * pos1/pos2 哪个大哪个小都行, 每次现算。
      *
      * @param player 玩家
      * @param blocks 扩缩的格数, 内部 clamp 到 1..[SELECTION_EDIT_MAX_BLOCKS]
      * @param expand true=扩展, false=收缩
      */
     fun resizeSelection(player: Player, blocks: Int, expand: Boolean) {
-        // 和 set/replace 同一个前置校验: 没选齐两点 -> message-no-region; 有领地且没权限 -> 拒绝
-        validatedRegion(player, needBreak = false) ?: return
-        val pos1 = getPlayerPos1(player) ?: return
-        val pos2 = getPlayerPos2(player) ?: return
+        // 和 set/replace 一样: 没选齐两点就提示先选点。这里不走 validatedRegion —— 领地校验要等
+        // 移动后的包围盒算出来再做, 见下
+        val pos1 = getPlayerPos1(player) ?: run {
+            player.sendLang("message-no-region", pluginId to "pluginId")
+            return
+        }
+        val pos2 = getPlayerPos2(player) ?: run {
+            player.sendLang("message-no-region", pluginId to "pluginId")
+            return
+        }
         val steps = blocks.coerceIn(1, SELECTION_EDIT_MAX_BLOCKS)
         // 选区本来就按方块坐标存 (点的中心 5.5 落到方块 5), 这里同样取整: 全程按方块算, 不引入小数偏移
         val first = intArrayOf(floor(pos1.x).toInt(), floor(pos1.y).toInt(), floor(pos1.z).toInt())
         val second = intArrayOf(floor(pos2.x).toInt(), floor(pos2.y).toInt(), floor(pos2.z).toInt())
         val (axis, positive) = snapAxis(player.eyeLocation.direction)
-        // 大小关系现算, 不假设 pos1 就是小的一头。
-        // pos1IsFirst 必须在这里定下来: lower/upper 是 first/second 的别名, 下面的扩缩会就地改掉
-        // 数组内容, 等移动完再比较就只能读到改后的值 —— 收缩把该轴压成单层时两点在该轴上相等,
-        // pos1/pos2 的标签归属会跟着互换
+        val moved = moveSelectionFace(player, first, second, axis, positive, steps, expand) ?: return
+        val min = IntArray(3) { minOf(first[it], second[it]) }
+        val max = IntArray(3) { maxOf(first[it], second[it]) }
+        // 领地校验覆盖**所有会被改动的方块**: 老选区 ∪ 新选区的包围盒。扩展动的是新层 (新选区 ⊇
+        // 老选区), 收缩清掉的是被砍掉的层 (老选区 ⊇ 新选区), 取并集两条路都不会漏。fail-closed。
+        val checkMin = IntArray(3) { minOf(min[it], moved.first[it], moved.second[it]) }
+        val checkMax = IntArray(3) { maxOf(max[it], moved.first[it], moved.second[it]) }
+        if (!checkDominion(player, locationOf(player, checkMin), locationOf(player, checkMax), needBreak = false)) {
+            return
+        }
+        if (expand) expandSelection(player, moved, axis, positive, min, max)
+        else contractSelection(player, moved, axis, positive, min, max)
+    }
+
+    /** [moveSelectionFace] 的结果: 移动后的两个点 (保持 pos1/pos2 的角色) */
+    private class MovedFace(val first: IntArray, val second: IntArray)
+
+    /**
+     * 把选区在 [axis] 轴上朝视线那一面移动 [steps] 格 —— 扩展与收缩共用
+     *
+     * 只算几何、只做校验: 不写方块, 也不改传进来的数组 (改的是副本)。
+     * - 扩展: 往外推。只对 Y 轴做世界高度夹取 (被吃掉的那几格丢掉, 夹取后的结果照旧应用);
+     *   一格都推不动时发 limit 提示并返回 null。
+     * - 收缩: 往里收。该轴会缩到 1 格以下就整体不动作, 发 limit 提示并返回 null。
+     */
+    private fun moveSelectionFace(
+        player: Player,
+        first: IntArray,
+        second: IntArray,
+        axis: Int,
+        positive: Boolean,
+        steps: Int,
+        expand: Boolean
+    ): MovedFace? {
+        val newFirst = first.copyOf()
+        val newSecond = second.copyOf()
+        // 大小关系现算, 不假设 pos1 就是小的一头。pos1IsFirst 必须在这里定下来: lower/upper 是
+        // 新数组的别名, 下面会就地改掉内容, 等移动完再比较就只能读到改后的值
         val pos1IsFirst = first[axis] <= second[axis]
-        val lower = if (pos1IsFirst) first else second
-        val upper = if (pos1IsFirst) second else first
-        if (expand) {
-            val moved = if (positive) upper else lower
-            // 记下被移动这个点移动前的 Y, 用来区分"被世界高度完全挡住"和"只被吃掉几格"
-            val movedYBefore = moved[AXIS_Y]
-            moved[axis] += if (positive) steps else -steps
-            // 世界高度夹取 (只做 Y): 越界的选区点会让框画到世界外, 而且之后 /pwe set 是按选区体积
-            // 扣材料的 —— 界外那一层根本放不上, 等于白扣。被世界高度吃掉的那几格就丢掉, 但夹取后的
-            // 结果照旧应用 (不整体放弃), 只额外提示一句, 免得玩家以为命令没生效。
-            // X/Z 不做边界处理 (那是另一个已知限制, 不在本次修复范围)。
-            if (axis == AXIS_Y) {
-                // 绕 WorldEdit 取边界: 编译期用的精简 API 里 org.bukkit.World 没有 getMinHeight()/
-                // getMaxHeight(); BukkitWorld.getMinY()/getMaxY() 的实现正好就是
-                // world.getMinHeight() 和 world.getMaxHeight() - 1 (上界即最高可放置层)
-                val weWorld = BukkitAdapter.adapt(player.world)
-                val clamped = moved[AXIS_Y].coerceIn(weWorld.minY, weWorld.maxY)
-                if (clamped == movedYBefore) {
-                    // 这一面已经顶在世界边界上, 一格都推不动: 只提示被世界高度挡住就收工。不能走到
-                    // 下面那条成功提示 —— 坐标一步没动, 再报一句"已扩展选区到 ..."会自相矛盾。
-                    player.sendLang("message-selection-expand-limit",
-                        pluginId to "pluginId",
-                        clamped to "y")
-                    return
-                }
-                if (clamped != moved[AXIS_Y]) {
-                    moved[AXIS_Y] = clamped
-                    player.sendLang("message-selection-expand-limit",
-                        pluginId to "pluginId",
-                        clamped to "y")
-                }
-            }
-        } else {
+        val lower = if (pos1IsFirst) newFirst else newSecond
+        val upper = if (pos1IsFirst) newSecond else newFirst
+        // 要动的是朝向那一面: 正方向动 upper, 负方向动 lower
+        val target = if (positive) upper else lower
+        if (!expand) {
             // 收缩的下限: 该轴至少留 1 格。会缩成 0 格或反向就整体不动作 —— 宁可不动, 也不要
             // 出现空选区或反向选区 (反向之后"扩展"会朝反方向长, 玩家看到的框和预期完全相反)
             val extent = upper[axis] - lower[axis] + 1
             if (extent - steps < 1) {
-                player.sendLang("message-selection-contract-limit",
-                    pluginId to "pluginId",
-                    extent to "extent")
-                return
+                player.sendLang("message-selection-contract-limit", pluginId to "pluginId", extent to "extent")
+                return null
             }
-            if (positive) upper[axis] -= steps else lower[axis] += steps
+            target[axis] += if (positive) -steps else steps
+            return MovedFace(newFirst, newSecond)
         }
-        // 两个 setter 各自触发一次 showSelection (重画选区框), 位置和原来一样:
-        // 点1 传 pos1 算出来的坐标, 点2 传 pos2 算出来的
-        val newPos1 = if (pos1IsFirst) lower else upper
-        val newPos2 = if (pos1IsFirst) upper else lower
-        setPlayerPos1(player, locationOf(player, newPos1))
-        setPlayerPos2(player, locationOf(player, newPos2))
-        val key = if (expand) "message-selection-expand-susses" else "message-selection-contract-susses"
-        // 坐标和方块数都告诉玩家: 他刚动的是哪一面, 现在选中的是哪一块。
-        // 方块数按移动后的两个点现算 —— 不能拿上面的 region.volume, 那是移动前的选区
-        val amount = (abs(newPos1[0] - newPos2[0]) + 1).toLong() *
-            (abs(newPos1[1] - newPos2[1]) + 1).toLong() *
-            (abs(newPos1[2] - newPos2[2]) + 1).toLong()
-        player.sendLang(key,
-            pluginId to "pluginId",
-            newPos1[0] to "x",
-            newPos1[1] to "y",
-            newPos1[2] to "z",
-            amount.toInt() to "amount")
+        val before = target[axis]
+        val after = before + if (positive) steps else -steps
+        // 世界高度夹取 (只做 Y): 越界的选区点会让框画到世界外, 而且之后复制是按层数算的 —— 界外
+        // 那一层根本放不上, 等于白算。被世界高度吃掉的那几格就丢掉, 但夹取后的结果照旧应用
+        // (不整体放弃), 只额外提示一句, 免得玩家以为命令没生效。
+        // X/Z 不做边界处理 (那是另一个已知限制 REV-06, 不在本次范围)。
+        val clamped = if (axis == AXIS_Y) {
+            // 绕 WorldEdit 取边界: 编译期用的精简 API 里 org.bukkit.World 没有 getMinHeight()/
+            // getMaxHeight(); BukkitWorld.getMinY()/getMaxY() 的实现正好就是
+            // world.getMinHeight() 和 world.getMaxHeight() - 1 (上界即最高可放置层)
+            val weWorld = BukkitAdapter.adapt(player.world)
+            after.coerceIn(weWorld.minY, weWorld.maxY)
+        } else {
+            after
+        }
+        if (clamped == before) {
+            // 这一面已经顶在世界边界上, 一格都推不动: 只提示, 不写方块也不动选区
+            player.sendLang("message-selection-expand-limit", pluginId to "pluginId", clamped to "y")
+            return null
+        }
+        target[axis] = clamped
+        if (clamped != after) {
+            player.sendLang("message-selection-expand-limit", pluginId to "pluginId", clamped to "y")
+        }
+        return MovedFace(newFirst, newSecond)
+    }
+
+    /**
+     * 扩展: 把选区最外那一层 (朝视线那一面) 原样复制到新增的每一层
+     *
+     * 分两轮 (和 [tryReplaceArea] 同一个套路):
+     * 1. 在区块线程上**只读**源层, 统计每种方块各需要多少个 —— 玩家线程一行方块都不读;
+     * 2. 逐种扣材料: 任何一种不够就把已经扣掉的原样退回并整体放弃, 一个方块都不写; 全部扣成功
+     *    才进第二轮写入。所以"要么全够要么全不写"成立, 不依赖"扣费期间别人不会同时扣"这种假设。
+     */
+    private fun expandSelection(
+        player: Player,
+        moved: MovedFace,
+        axis: Int,
+        positive: Boolean,
+        min: IntArray,
+        max: IntArray
+    ) {
+        val world = player.world
+        // 源层 = 老选区在朝向那一面最外的一层; 目标面 = 移动后的那一面 (被世界高度夹过, 可能少几层)
+        val sourceCoord = if (positive) max[axis] else min[axis]
+        val targetCoord =
+            if (positive) maxOf(moved.first[axis], moved.second[axis]) else minOf(moved.first[axis], moved.second[axis])
+        val layers = abs(targetCoord - sourceCoord)
+        if (!beginEdit(player)) return
+        EditBudget.configure(blocksPerTick())
+        // 源层沿 [axis] 平移复制, 平面内两个坐标原样对应, 所以把源层压成一维数组存起来最省事
+        val plane = PlaneIndex(axis, min, max)
+        val source = arrayOfNulls<BlockState>(plane.size)
+        runOnChunkThreads(
+            slabRegion(axis, sourceCoord, sourceCoord, min, max).splitByChunk(),
+            world,
+            work = { _, slice ->
+                val weWorld = BukkitAdapter.adapt(world)
+                for (vector in slice.region) {
+                    source[plane.indexOf(vector.x(), vector.y(), vector.z())] = weWorld.getBlock(vector)
+                }
+            },
+            done = { timedOut ->
+                // 统计是纯内存操作, 顺手在区块线程上做, 玩家线程只拿结果
+                val perLayer = if (timedOut) emptyMap() else countMaterials(source)
+                onPlayerThread(player) {
+                    if (timedOut) {
+                        // 源层没读完: 什么都还没扣、也没写, 直接收尾
+                        endEdit(player)
+                        player.sendLang("message-edit-failed", pluginId to "pluginId")
+                        return@onPlayerThread
+                    }
+                    if (perLayer.isEmpty()) {
+                        // 源层全是空气: 没有可复制的, 一个方块都不写, 选区也不动
+                        endEdit(player)
+                        player.sendLang("message-selection-expand-empty", pluginId to "pluginId")
+                        return@onPlayerThread
+                    }
+                    // 每一层都照抄源层, 所以每种材料的用量 = 源层里该材料的个数 × 层数
+                    val needed = perLayer.mapValues { it.value * layers }
+                    if (!consumeAll(player, needed)) {
+                        endEdit(player)
+                        return@onPlayerThread
+                    }
+                    updateSelection(player, moved.first, moved.second)
+                    prepareEdit(needed.values.sum(), player)
+                    val actor = actorOf(player)
+                    val targetChunks =
+                        slabRegion(axis, sourceCoord + if (positive) 1 else -1, targetCoord, min, max).splitByChunk()
+                    // 每个区块实际写下去多少 (按材料记), 收尾时当成本表用
+                    val written = AtomicReferenceArray<HashMap<Material, Int>?>(targetChunks.size)
+                    writeChunks(
+                        player,
+                        targetChunks,
+                        "message-selection-expand-susses",
+                        charged = needed,
+                        costs = { targetChunks.indices.map { written.get(it) ?: emptyMap() } }
+                    ) { index, slice, _ ->
+                        val counts = written.get(index)
+                            ?: HashMap<Material, Int>().also { written.set(index, it) }
+                        WorldEditTool.writeBlocks(
+                            world,
+                            slice.region,
+                            actor,
+                            stateAt = { x, y, z -> source[plane.indexOf(x, y, z)]?.takeUnless { it.blockType.isAir() } },
+                            onWritten = { state -> counts.add(state.blockType) }
+                        )
+                    }
+                }
+            }
+        )
+    }
+
+    /**
+     * 收缩: 把被砍掉的那几层全部清成空气
+     *
+     * 只跑一轮: 空气不计材料, 没有"先扣费再写"的需求, 所以快照 (撤销用) 与清空气在同一个
+     * [runOnChunkThreads] 里完成。被清掉的非空气方块数从快照里数出来记进撤销记录 —— 只记账,
+     * 不产生材料返还 (与 /pwe set air 一致)。一层空气都没清到时连撤销记录都不写。
+     */
+    private fun contractSelection(
+        player: Player,
+        moved: MovedFace,
+        axis: Int,
+        positive: Boolean,
+        min: IntArray,
+        max: IntArray
+    ) {
+        if (!beginEdit(player)) return
+        updateSelection(player, moved.first, moved.second)
+        val newCoord =
+            if (positive) maxOf(moved.first[axis], moved.second[axis]) else minOf(moved.first[axis], moved.second[axis])
+        // 被砍掉的层 = 老选区里、新选区之外的那几层
+        val from = if (positive) newCoord + 1 else min[axis]
+        val to = if (positive) max[axis] else newCoord - 1
+        val regions = slabRegion(axis, from, to, min, max).splitByChunk()
+        // 每个区块被清掉多少非空气方块 —— 同一区块的切片在同一线程上顺序执行, 普通 IntArray 就够
+        val cleared = IntArray(regions.size)
+        // 处理提示用上界 (这一层里所有方块数), 真正扣的是 0 (空气不计材料)
+        prepareEdit(regions.sumOf { it.volume.toInt() }, player)
+        val actor = actorOf(player)
+        // AIR 一定存在 (哪个版本都有), WorldEdit 把这些常量标成可空只是因为老版本可能没有新方块
+        val air = BlockTypes.AIR!!.defaultState
+        writeChunks(
+            player,
+            regions,
+            "message-selection-contract-susses",
+            charged = emptyMap(),
+            costs = { regions.indices.map { index -> if (cleared[index] == 0) emptyMap() else mapOf(Material.AIR to cleared[index]) } }
+        ) { index, slice, states ->
+            for (position in slice.offset until slice.offset + slice.size) {
+                val state = states[position] ?: continue
+                if (!state.blockType.isAir()) cleared[index]++
+            }
+            WorldEditTool.setBlocksIf(player.world, slice.region, air, actor) { _, _, _ -> true }
+        }
+    }
+
+    /**
+     * 跑一遍写方块管线: 每个区块先读整片快照 (写之前), 再把这一片交给 [writeSlice] 写; 全部跑完
+     * 后回玩家线程收尾 ([finishEdit])。
+     *
+     * 快照整片读、整片还原是这套撤销机制的前提 (见 [UndoManager]): 没被改到的方块还原回去也
+     * 无副作用, 所以只改一部分方块的操作用不着更细的快照。
+     *
+     * @param charged 这次操作预扣的材料 (整笔), 收尾时按"预扣 - 实际写入"退费
+     * @param costs 收尾时按区块给出"这一块实际写入了多少材料"
+     * @param writeSlice 在区块线程上执行, 参数是该区块的快照数组与这一片
+     */
+    private fun writeChunks(
+        player: Player,
+        regions: List<CuboidRegion>,
+        successKey: String,
+        charged: Map<Material, Int>,
+        costs: () -> List<Map<Material, Int>>,
+        writeSlice: (index: Int, slice: RegionSlice, states: Array<BlockState?>) -> Unit
+    ) {
+        val snapshots = AtomicReferenceArray<Array<BlockState?>?>(regions.size)
+        runOnChunkThreads(regions, player.world,
+            work = { index, slice ->
+                val chunk = regions[index]
+                val states = snapshots.get(index)
+                    ?: arrayOfNulls<BlockState>(chunk.volume.toInt()).also { snapshots.set(index, it) }
+                WorldEditTool.readBlocksInto(player.world, slice.region, states, slice.offset)
+                writeSlice(index, slice, states)
+            },
+            done = { _ ->
+                onPlayerThread(player) {
+                    finishEdit(player, regions, regions.indices.map { snapshots[it] }, charged, costs(), successKey)
+                }
+            })
+    }
+
+    /**
+     * 逐种扣材料, 全有全无
+     *
+     * 先逐种 [MaterialPackManager.tryConsume]; 任何一种不够就把**已经扣掉的**原样加回去再整体
+     * 放弃 —— 这样"要么全扣要么全不扣"不依赖"扣费期间别的入口不会同时扣"这种假设 (材质包界面
+     * 并不受 [beginEdit] 约束, 玩家可以一边等扩展一边从包里取东西)。
+     */
+    private fun consumeAll(player: Player, charges: Map<Material, Int>): Boolean {
+        val done = ArrayList<Pair<Material, Int>>()
+        for ((material, amount) in charges) {
+            if (!PlayerWorldEdit.packManager.tryConsume(player, material, amount)) {
+                // 已经扣掉的退回去 (加回去不会失败), 保证一个都不少
+                done.forEach { (charged, count) -> PlayerWorldEdit.packManager.addMaterial(player, charged, count) }
+                player.sendLang("message-materialpack-not-enough",
+                    pluginId to "pluginId",
+                    material.displayName(player) to "material",
+                    amount to "amount")
+                return false
+            }
+            done += material to amount
+        }
+        return true
+    }
+
+    /** 把扩缩后的两个点写回选区 (两个 setter 各自会重画一次选区框) */
+    private fun updateSelection(player: Player, first: IntArray, second: IntArray) {
+        setPlayerPos1(player, locationOf(player, first))
+        setPlayerPos2(player, locationOf(player, second))
+    }
+
+    /**
+     * 建一个沿 [axis] 从 [from] 到 [to] 层、另外两轴取 [min]..[max] 的长方体
+     *
+     * 扩缩用到的"源层 / 新层 / 被砍掉的层"都是这种薄片, 所以抽出来共用 (from/to 会自己摆正)。
+     */
+    private fun slabRegion(axis: Int, from: Int, to: Int, min: IntArray, max: IntArray): CuboidRegion {
+        val low = intArrayOf(min[0], min[1], min[2])
+        val high = intArrayOf(max[0], max[1], max[2])
+        low[axis] = minOf(from, to)
+        high[axis] = maxOf(from, to)
+        return CuboidRegion(BlockVector3.at(low[0], low[1], low[2]), BlockVector3.at(high[0], high[1], high[2]))
+    }
+
+    /** 数一层方块里每种材料各有多少个 (跳过空气); 纯内存, 不读世界 */
+    private fun countMaterials(states: Array<BlockState?>): Map<Material, Int> {
+        val counts = LinkedHashMap<Material, Int>()
+        states.forEach { state ->
+            if (state != null && !state.blockType.isAir()) counts.add(state.blockType)
+        }
+        return counts
+    }
+
+    /**
+     * 把一个方块类型累加进"按 Material 记的数"里
+     *
+     * 认不出来的类型跳过 (正常不会发生: 方块类型都能对上 Material), 这类方块会被复制但不计费。
+     * 计费与写入共用这一份口径, 所以两边不会对不上。
+     */
+    private fun MutableMap<Material, Int>.add(type: BlockType) {
+        materialOf(type)?.let { merge(it, 1, Int::plus) }
+    }
+
+    /** WorldEdit 的方块类型 → Bukkit 的 Material (材质包按 Material 记账) */
+    private fun materialOf(type: BlockType): Material? = BukkitAdapter.adapt(type)
+
+    /**
+     * 方块类型是不是空气
+     *
+     * WorldEdit 的 BlockType 没有 isAir(), 这里显式列出三种空气 —— 口径与 Bukkit 的
+     * `Material.isAir` 一致 (洞穴空气 / 虚空空气也算空气), 免得把它们当方块复制、计费。
+     */
+    private fun BlockType.isAir(): Boolean =
+        this == BlockTypes.AIR || this == BlockTypes.CAVE_AIR || this == BlockTypes.VOID_AIR
+
+    /**
+     * 与 [axis] 垂直的那一层平面的下标器
+     *
+     * 复制时"源层 → 新层"只沿 [axis] 平移, 平面内的两个坐标原样对应, 所以把位置压成一个连续
+     * 下标 (u * sizeV + v) 就能用数组存源层、再按同样的下标写新层 —— 不用按坐标查哈希表。
+     */
+    private class PlaneIndex(axis: Int, private val min: IntArray, private val max: IntArray) {
+
+        private val axisU: Int
+        private val axisV: Int
+        private val minU: Int
+        private val minV: Int
+        private val sizeV: Int
+
+        init {
+            val (u, v) = when (axis) {
+                AXIS_X -> AXIS_Y to AXIS_Z
+                AXIS_Y -> AXIS_X to AXIS_Z
+                else -> AXIS_X to AXIS_Y
+            }
+            axisU = u
+            axisV = v
+            minU = min[u]
+            minV = min[v]
+            sizeV = max[v] - min[v] + 1
+        }
+
+        /** 平面里一共有多少格 (源层数组的长度) */
+        val size: Int get() = (max[axisU] - minU + 1) * sizeV
+
+        fun indexOf(x: Int, y: Int, z: Int): Int {
+            val u = when (axisU) {
+                AXIS_X -> x
+                AXIS_Y -> y
+                else -> z
+            }
+            val v = when (axisV) {
+                AXIS_X -> x
+                AXIS_Y -> y
+                else -> z
+            }
+            return (u - minU) * sizeV + (v - minV)
+        }
     }
 
     /**
@@ -831,8 +1134,11 @@ class WorldEditManager {
                                 finishUndo(player, done, timedOut = true, onDone)
                             }
                         } else {
-                            // 返还先落库, 再取吓一条: 两条的返还都是同一份材料包的读改写, 不能并发
-                            chargeMaterial(player, record.material, -record.amount)
+                            // 返还先落库, 再取吓一条: 两条的返还都是同一份材料包的读改写, 不能并发。
+                            // 一次操作可能扣了多种材料 (扩展), 所以按逐材料账逐项加回
+                            record.refundableCharges().forEach { (material, count) ->
+                                chargeMaterial(player, material, -count)
+                            }
                             // 回到异步线程取吓一条 (那里才能读文件)
                             submitAsync { undoStep(player, times, done + 1, onDone) }
                         }
@@ -890,45 +1196,56 @@ class WorldEditManager {
      * 编辑收尾 (走 [onPlayerThread]): 记录撤销、退还失败部分的材料并提示
      *
      * @param snapshots 与 regions 一一对应, null 或含 null 表示该区块没跑完
-     * @param costs 与 regions 一一对应, 表示该区块已经扣掉的材料数量 (失败时按它退还)
+     * @param charged 这次操作**预扣**的材料 (整笔; 填充/替换/形状是整块预扣, 扩展是按源层算出的整笔)
+     * @param costs 与 regions 一一对应, 表示该区块**实际写入**的材料数量
      */
     private fun finishEdit(
         player: Player,
         regions: List<CuboidRegion>,
         snapshots: List<Array<BlockState?>?>,
-        costs: List<Int>,
-        material: Material,
-        amount: Int,
+        charged: Map<Material, Int>,
+        costs: List<Map<Material, Int>>,
         successKey: String
     ) {
         endEdit(player)
         val succeeded = regions.indices.filter { isComplete(snapshots[it]) }
-        val refund = regions.indices.filter { !isComplete(snapshots[it]) }.sumOf { costs[it] }
-        if (refund > 0) {
-            chargeMaterial(player, material, -refund)
+        // 真正写进世界的账 = 跑成功那些区块的成本之和; 没跑完的区块按"没写成"处理
+        val actual = LinkedHashMap<Material, Int>()
+        succeeded.forEach { index ->
+            costs[index].forEach { (material, count) -> actual.merge(material, count, Int::plus) }
         }
-        // 成功后**保留选区** (和 WorldEdit 的手感一致): 想接着改同一块地方不用重新选点。
-        // 选区只在玩家退出或主动清除时清 —— 原来这里调 clearPlayerPos, 而 tryReplaceArea 的
-        // "没有可替换方块"分支只 endEdit 不清选区, 两条路行为不一致。
+        // 退费 = 预扣 - 实际写入。只退预扣过的材料: 收缩清空气没有预扣 (charged 为空), 也就没有退费。
+        charged.forEach { (material, count) ->
+            val used = actual[material] ?: 0
+            if (count > used) chargeMaterial(player, material, -(count - used))
+        }
         if (succeeded.isEmpty()) {
             player.sendLang("message-edit-failed", pluginId to "pluginId")
             return
         }
-        val changed = amount - refund
-        UndoManager.pushAsync(
-            player,
-            UndoRecord(
-                player.world.name,
-                succeeded.map { UndoBatch(regions[it], snapshots[it]!!.filterNotNull()) },
-                material,
-                changed
-            ),
-            undoLimit()
-        )
-        if (refund > 0) {
+        // 有实际改动才记撤销: 收缩的层全是空气时 actual 为空, 没有可撤的东西, 别留一条 0 材料的记录。
+        // 只有一种材料就写成 material + amount (旧格式, 文件更小也更好读); 多种材料才写 charges
+        // (扩展会一次扣多种)。
+        if (actual.isNotEmpty()) {
+            val single = actual.entries.singleOrNull()
+            UndoManager.pushAsync(
+                player,
+                UndoRecord(
+                    player.world.name,
+                    succeeded.map { UndoBatch(regions[it], snapshots[it]!!.filterNotNull()) },
+                    single?.key ?: Material.AIR,
+                    single?.value ?: 0,
+                    if (single == null) actual.map { it.key to it.value } else emptyList()
+                ),
+                undoLimit()
+            )
+        }
+        // 只要有一个区块没跑完就算失败: 收缩这类不产生退费的操作, 只看退费会把它误报成成功。
+        // {amount} 给扩展 / 收缩报"实际写入 / 清掉的方块数"; 其它操作的提示里没这个占位符, 忽略即可。
+        if (succeeded.size < regions.size) {
             player.sendLang("message-edit-failed", pluginId to "pluginId")
         } else {
-            player.sendLang(successKey, pluginId to "pluginId")
+            player.sendLang(successKey, pluginId to "pluginId", actual.values.sum() to "amount")
         }
     }
 
@@ -1134,8 +1451,8 @@ class WorldEditManager {
         /**
          * 一次扩 / 缩的格数上限
          *
-         * 选区编辑不写方块, 理论上多大都行; 设上限是为了防止手滑 (例如把 1000 敲成 10000)
-         * 一下子把选区撑到几个区块以外 —— 之后一个 set 就要跑很久。
+         * 扩 / 缩现在会真的复制 / 清掉方块, 格数直接决定要改动的方块数; 设上限是为了防止手滑
+         * (例如把 1000 敲成 10000) 一下子把选区撑到几个区块以外 —— 那样一次操作要跑很久。
          */
         const val SELECTION_EDIT_MAX_BLOCKS = 100
 
@@ -1147,8 +1464,14 @@ class WorldEditManager {
          */
         const val SHAPE_MAX_SIZE = 256
 
-        /** 轴索引里的 Y (与 [snapAxis] 的 0=X, 1=Y, 2=Z 顺序一致) —— 6 个面里只有 Y 需要世界高度夹取 */
+        /** 轴索引 (与 [snapAxis] 的 0=X, 1=Y, 2=Z 顺序一致) —— 6 个面里只有 Y 需要世界高度夹取 */
+        const val AXIS_X = 0
+
+        /** 见 [AXIS_X] */
         const val AXIS_Y = 1
+
+        /** 见 [AXIS_X] */
+        const val AXIS_Z = 2
 
         /** 选区粒子边框在最长边上画多少个点 (其余边按同样步长, 总点数因此有上限) */
         const val PARTICLE_POINTS_PER_EDGE = 100.0

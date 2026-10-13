@@ -24,7 +24,7 @@ object CommandExpand {
     }
 
     private fun expand(player: Player, blocks: Int) {
-        // 内部会先做选区校验 (没选齐两点 -> 提示先选点), 再只移动朝向那一面
+        // 内部会先做选区校验 (没选齐两点 -> 提示先选点), 再把朝向那一面外扩并把最外层方块复制过去
         PlayerWorldEdit.worldEditManager.resizeSelection(player, blocks, expand = true)
     }
 }

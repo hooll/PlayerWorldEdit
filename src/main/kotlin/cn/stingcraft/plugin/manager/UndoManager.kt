@@ -33,8 +33,20 @@ class UndoRecord(
     val worldName: String,
     val batches: List<UndoBatch>,
     val material: Material,
-    val amount: Int
-)
+    val amount: Int,
+    /**
+     * 逐材料费用表 —— 一次操作可能扣多种材料 (任务 13 的扩展会复制整层, 层里什么方块都有)。
+     *
+     * 非空时撤销按它**逐项**加回; 为空时回落到 [material] × [amount]。单材料操作 (填充 / 替换 /
+     * 形状 / 收缩) 一律只写 material + amount, charges 留空, 所以落盘格式与旧版完全一致。
+     */
+    val charges: List<Pair<Material, Int>> = emptyList()
+) {
+
+    /** 撤销时要逐项加回的材料: 多材料用 [charges], 否则用 material + amount */
+    fun refundableCharges(): List<Pair<Material, Int>> =
+        if (charges.isEmpty()) listOf(material to amount) else charges
+}
 
 /**
  * 撤销记录
@@ -297,6 +309,8 @@ object UndoManager {
             world = worldName,
             material = material.name,
             amount = amount,
+            // 单材料操作写 null: 落盘格式与旧版逐字一致 (charges 只在多材料操作里才出现)
+            charges = charges.takeIf { it.isNotEmpty() }?.map { StoredUndoCharge(it.first.name, it.second) },
             batches = batches.map { batch ->
                 StoredUndoBatch(
                     minX = batch.region.minimumPoint.x,
@@ -354,10 +368,26 @@ private data class StoredUndoRecord(
     val world: String,
     val material: String,
     val amount: Int,
-    val batches: List<StoredUndoBatch>
+    val batches: List<StoredUndoBatch>,
+    /**
+     * 逐材料费用表 (任务 13 新增)。**必须可空**: 改动前写下的记录文件里没有这个字段,
+     * 反序列化后就是 null, 那时回落到 material + amount —— 存量记录必须还能正常撤销。
+     */
+    val charges: List<StoredUndoCharge>? = null
 ) {
 
     fun toRecord(): UndoRecord {
-        return UndoRecord(world, batches.map { it.toBatch() }, Material.valueOf(material), amount)
+        return UndoRecord(
+            world,
+            batches.map { it.toBatch() },
+            Material.valueOf(material),
+            amount,
+            charges.orEmpty().map { Material.valueOf(it.material) to it.amount }
+        )
     }
 }
+
+private data class StoredUndoCharge(
+    val material: String,
+    val amount: Int
+)

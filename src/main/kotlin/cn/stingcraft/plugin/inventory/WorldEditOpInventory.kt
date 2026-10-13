@@ -84,12 +84,12 @@ object WorldEditOpInventory {
                     }
                 }
             }
-            // 选区编辑: 每次点击 1 格 (要更多格数用命令的 [格数] 参数)。
+            // 扩展 / 收缩: 每次点击 1 格 (要更多格数用命令的 [格数] 参数)。
             // 菜单扩到 5 行, 这两个按钮排在第 4 行的对称位置; 第 3 行与第 5 行留空给下一轮的墙/圆柱按钮。
             set(29, buildItem(XMaterial.LIME_STAINED_GLASS_PANE) {
                 name = "&f| 扩展选区"
                 lore += "&7| 朝你视线的那一面外扩 1 格"
-                lore += "&7| 不消耗材料"
+                lore += "&7| 把最外层方块复制出去 (消耗材料)"
                 colored()
             }) {
                 worldEditManager.resizeSelection(player, 1, expand = true)
@@ -100,7 +100,7 @@ object WorldEditOpInventory {
             set(33, buildItem(XMaterial.RED_STAINED_GLASS_PANE) {
                 name = "&f| 收缩选区"
                 lore += "&7| 朝你视线的那一面内缩 1 格"
-                lore += "&7| 不消耗材料"
+                lore += "&7| 被移除的层清成空气"
                 colored()
             }) {
                 worldEditManager.resizeSelection(player, 1, expand = false)

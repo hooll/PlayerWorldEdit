@@ -43,27 +43,38 @@ object WorldEditTool {
     }
 
     /**
-     * 只写区域里满足 [contains] 的方块 (形状生成用)
+     * 逐块写入: 对区域里每个方块调 [stateAt] 取"要写的状态", 返回 null 就跳过这一格;
+     * 实际写下去的每个状态都会回调 [onWritten] (调用方用它记账)。
      *
-     * 形状不是长方体, 用不了 `setBlocks(Region)` 那条快路径, 只能逐个 [EditSession.setBlock] ——
-     * 和 [restoreBlocks] 是同一条写入路径, 所以形状生成的开销特征和撤销一致: 都在区块所属的
-     * 区域线程上跑, 都受每 tick 预算限流。[contains] 是纯算术判定, 不读世界。
+     * 形状 / 复制这类"要写的方块不是整块长方体"的操作用不了 `setBlocks(Region)` 那条快路径,
+     * 只能逐个 [EditSession.setBlock] —— 和 [restoreBlocks] 是同一条写入路径, 所以开销特征和
+     * 撤销一致: 都在区块所属的区域线程上跑, 都受每 tick 预算限流。[stateAt] 必须是纯判定或
+     * 纯查表, 不读世界。
      */
+    fun writeBlocks(
+        world: World,
+        region: Region,
+        actor: Actor?,
+        stateAt: (x: Int, y: Int, z: Int) -> BlockState?,
+        onWritten: (BlockState) -> Unit = {}
+    ) {
+        newSession(world, actor).use { session ->
+            for (vector in region) {
+                val state = stateAt(vector.x(), vector.y(), vector.z()) ?: continue
+                session.setBlock(vector, state)
+                onWritten(state)
+            }
+        }
+    }
+
+    /** [writeBlocks] 的常量形式: 只写判定为真的那些方块 (形状生成用, 空气照写 = 清空) */
     fun setBlocksIf(
         world: World,
         region: Region,
         blockState: BlockState,
         actor: Actor?,
         contains: (x: Int, y: Int, z: Int) -> Boolean
-    ) {
-        newSession(world, actor).use { session ->
-            for (vector in region) {
-                if (contains(vector.x(), vector.y(), vector.z())) {
-                    session.setBlock(vector, blockState)
-                }
-            }
-        }
-    }
+    ) = writeBlocks(world, region, actor, { x, y, z -> if (contains(x, y, z)) blockState else null })
 
     /** 按 [RegionSlice] 把整块快照里对应的那一段写回这片区域 */
     fun restoreBlocks(world: World, slice: RegionSlice, states: List<BlockState>, actor: Actor? = null) {
