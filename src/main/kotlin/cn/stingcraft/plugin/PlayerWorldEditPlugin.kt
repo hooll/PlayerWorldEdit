@@ -3,6 +3,7 @@ package cn.stingcraft.plugin
 import cn.stingcraft.plugin.manager.SettingManager
 import cn.stingcraft.plugin.manager.MaterialPackManager
 import cn.stingcraft.plugin.manager.WorldEditManager
+import cn.stingcraft.plugin.until.cancelWatchdogs
 import com.google.gson.GsonBuilder
 import taboolib.common.platform.Plugin
 import taboolib.common.platform.function.info
@@ -26,6 +27,8 @@ object PlayerWorldEdit : Plugin() {
     override fun onDisable() {
         // 选区显示体是实体, 插件卸载/关服时收掉, 免得留下孤儿实体
         worldEditManager.clearDisplays()
+        // 超时兜底计时器也停掉, 免得卸载后还在跑
+        cancelWatchdogs()
     }
 
     /**

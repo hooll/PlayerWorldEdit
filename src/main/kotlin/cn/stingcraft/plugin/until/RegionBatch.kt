@@ -9,9 +9,14 @@ import org.bukkit.entity.Entity
 import taboolib.platform.Folia
 import taboolib.platform.util.runTask
 import taboolib.platform.util.submit
+import taboolib.common.platform.function.submit as submitTask
+import taboolib.common.platform.service.PlatformExecutor
 import java.lang.reflect.Method
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /** 区块切片: 一个区块沿 Y 轴切出来的一片, [offset]/[size] 是它在整块快照里的下标区间 */
 class RegionSlice(val region: CuboidRegion, val offset: Int, val size: Int)
@@ -75,27 +80,58 @@ fun CuboidRegion.sliceByY(maxBlocks: Int): List<RegionSlice> {
  *
  * 单个区块抛错不会影响其余区块, 异常直接打到控制台; [done] 在最后一个完成的线程上运行,
  * 所以里面不要再碰玩家数据, 用 [runOnOwnThread] 切回玩家线程。
+ *
+ * [done] 的参数表示这次收尾是不是**超时兜底**触发的 (见 [STALL_TIMEOUT_MILLIS]): 超时说明还有
+ * 区块没跑完, 调用方必须按"失败"处理 —— set/replace 靠快照里的 null 判断, undo 靠这个参数。
  */
 fun runOnChunkThreads(
     regions: List<CuboidRegion>,
     world: World,
     work: (index: Int, slice: RegionSlice) -> Unit,
-    done: () -> Unit
+    done: (timedOut: Boolean) -> Unit
 ) {
     if (regions.isEmpty()) {
-        done()
+        done(false)
         return
     }
     val slices = regions.map { it.sliceByY(EditBudget.sliceSize) }
     val waves = regions.indices.chunked(minOf(regions.size, CHUNK_LOAD_WAVE))
     var waveIndex = 0
-    var notified = false
+    val notified = AtomicBoolean(false)
+    // 超时收尾之后不再往区域线程排新切片: 这一批已经按"失败"结账, 再写下去既不会有撤销记录
+    // 也不会退费, 那些改动就成了无主的
+    val aborted = AtomicBoolean(false)
+    // 每完成一片就刷新它; 计时器只盯"多久没有进展", 不盯"总共跑了多久"
+    val lastProgress = AtomicLong(System.currentTimeMillis())
+    var watchdog: PlatformExecutor.PlatformTask? = null
+
+    fun complete(timedOut: Boolean) {
+        if (!notified.compareAndSet(false, true)) {
+            return
+        }
+        if (timedOut) {
+            aborted.set(true)
+        }
+        watchdog?.let {
+            watchdogs.remove(it)
+            it.cancel()
+        }
+        done(timedOut)
+    }
+
+    // 真的写完一片才算"有进展": 失败的切片会直接 finish, 不该刷新计时
+    val trackedWork: (Int, RegionSlice) -> Unit = { index, slice ->
+        work(index, slice)
+        lastProgress.set(System.currentTimeMillis())
+    }
+
     fun nextWave() {
+        // 已经超时收尾了就不用再排下一批 (排出来的任务也会因为 aborted 立刻结束)
+        if (aborted.get()) {
+            return
+        }
         if (waveIndex >= waves.size) {
-            if (!notified) {
-                notified = true
-                done()
-            }
+            complete(false)
             return
         }
         val wave = waves[waveIndex++]
@@ -103,9 +139,19 @@ fun runOnChunkThreads(
         // 区块没跑成也要计数, 否则 done 永远不触发 (材料扣了却没有记录和提示)
         val completeOne = Runnable { if (remaining.decrementAndGet() == 0) nextWave() }
         wave.forEach { index ->
-            ChunkTask(world, regions[index], slices[index], index, work, completeOne).start()
+            ChunkTask(world, regions[index], slices[index], index, trackedWork, aborted, completeOne).start()
         }
     }
+
+    // 兜底: 区块加载卡死、区域调度器把任务静默丢掉……任何原因导致 done 迟迟不来时, 只要
+    // [STALL_TIMEOUT_MILLIS] 内一片都没完成就强制收尾。盯"无进展"而不是"总时长"是因为插件不限制
+    // 操作大小, 一个超大选区正常跑也可能超过 30 秒, 按总时长收尾会把正常的大操作误判成失败。
+    watchdog = submitTask(now = false, async = false, delay = WATCHDOG_INTERVAL_TICKS, period = WATCHDOG_INTERVAL_TICKS) {
+        if (System.currentTimeMillis() - lastProgress.get() > STALL_TIMEOUT_MILLIS) {
+            complete(true)
+        }
+    }.also { watchdogs.add(it) }
+
     nextWave()
 }
 
@@ -118,6 +164,7 @@ private class ChunkTask(
     private val slices: List<RegionSlice>,
     private val index: Int,
     private val work: (Int, RegionSlice) -> Unit,
+    private val aborted: AtomicBoolean,
     private val complete: Runnable
 ) {
 
@@ -132,6 +179,11 @@ private class ChunkTask(
 
     private fun runCurrent() {
         if (finished) return
+        // 整批已经超时收尾: 再写方块就是没人记录的改动, 直接停下
+        if (aborted.get()) {
+            finish()
+            return
+        }
         if (position >= slices.size) {
             finish()
             return
@@ -198,16 +250,32 @@ private val chunkLoader: Method? by lazy {
  * Folia 的区域调度器对**没加载的区块会静默不执行** (任务一直排队, 直到区块被加载),
  * 所以先把区块异步加载出来。非 Folia 环境没有这个问题, 直接执行 —— 那条分支不能碰
  * Paper 独有 API。[then] 里只做"排任务", 真正干活仍然发生在区块所属的区域线程上。
+ *
+ * 加载不了区块时一定要走 [onFailed]: 在 Folia 上直接排任务会被静默丢弃, 任务永远不完成,
+ * 调用方的 done 也就永远不触发 (材料扣了、不退费、没有撤销记录, 玩家还卡在 editing)。
  */
 private fun loadChunkThen(world: World, chunkX: Int, chunkZ: Int, then: () -> Unit, onFailed: () -> Unit) {
-    val loader = if (Folia.isFolia) chunkLoader else null
-    if (loader == null) {
+    if (!Folia.isFolia) {
         then()
+        return
+    }
+    val loader = chunkLoader
+    if (loader == null) {
+        // 编译用的 API 里没有 World.getChunkAtAsync, 只能运行时反射。拿不到就说明这个服务端
+        // 没有这个方法 (核心换了实现), 无法保证区块已加载 —— 明确失败, 让调用方退费收尾。
+        Bukkit.getLogger().warning(
+            "[PlayerWorldEdit] 反射不到 World.getChunkAtAsync, Folia 上无法加载区块, 本次操作按失败处理: ${world.name} $chunkX,$chunkZ"
+        )
+        onFailed()
         return
     }
     val future = runCatching { loader.invoke(world, chunkX, chunkZ) as? CompletableFuture<*> }.getOrNull()
     if (future == null) {
-        then()
+        // 方法在但调用没成 (参数不匹配/返回值不是 CompletableFuture): 同样是加载不了区块
+        Bukkit.getLogger().warning(
+            "[PlayerWorldEdit] 调用 World.getChunkAtAsync 失败, 本次操作按失败处理: ${world.name} $chunkX,$chunkZ"
+        )
+        onFailed()
         return
     }
     future.whenComplete { _, error ->
@@ -222,3 +290,18 @@ private fun loadChunkThen(world: World, chunkX: Int, chunkZ: Int, then: () -> Un
 
 /** 一次同时加载的区块数量上限 */
 private const val CHUNK_LOAD_WAVE = 64
+
+/** 多久没有任何切片完成就认为这一批卡死了 */
+private const val STALL_TIMEOUT_MILLIS = 30_000L
+
+/** 检查"还有没有进展"的间隔 (1 秒) */
+private const val WATCHDOG_INTERVAL_TICKS = 20L
+
+/** 正在等超时收尾的批次计时器 (插件卸载时要能停掉) */
+private val watchdogs = ConcurrentHashMap.newKeySet<PlatformExecutor.PlatformTask>()
+
+/** 停掉所有超时兜底计时器 (插件 disable 时调用) */
+fun cancelWatchdogs() {
+    watchdogs.forEach { it.cancel() }
+    watchdogs.clear()
+}

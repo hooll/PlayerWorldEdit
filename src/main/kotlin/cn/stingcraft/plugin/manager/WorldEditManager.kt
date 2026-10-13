@@ -294,7 +294,7 @@ class WorldEditManager {
                 WorldEditTool.readBlocksInto(player.world, slice.region, states, slice.offset)
                 WorldEditTool.setBlocks(player.world, slice.region, blockType.defaultState, actor)
             },
-            done = {
+            done = { _ ->
                 player.runOnOwnThread {
                     finishEdit(
                         player,
@@ -335,7 +335,7 @@ class WorldEditManager {
                     ?: arrayOfNulls<BlockState>(chunk.volume.toInt()).also { snapshots.set(index, it) }
                 WorldEditTool.readBlocksInto(player.world, slice.region, states, slice.offset)
             },
-            done = {
+            done = { _ ->
                 player.runOnOwnThread {
                     val targets = regions.indices.filter { isComplete(snapshots[it]) }
                     // 每个区块实际会被替换的数量, 收费和失败退费都以它为准
@@ -363,7 +363,7 @@ class WorldEditManager {
                         work = { index, slice ->
                             WorldEditTool.replaceBlocks(player.world, slice.region, fromType.defaultState, toType.defaultState, actor)
                         },
-                        done = {
+                        done = { _ ->
                             player.runOnOwnThread {
                                 finishEdit(
                                     player,
@@ -392,6 +392,9 @@ class WorldEditManager {
      *
      * 所以这里改成一条接一条的链式回调: 异步线程取记录 → 区块线程还原 → 玩家线程返还 →
      * 回到异步线程取吓一条。
+     *
+     * 某一条超时 (见 [runOnChunkThreads] 的超时兜底) 时不退还材料、也不丢记录, 而是把它放回
+     * 队列并中止整轮 —— 只还原了一部分还照常退料等于白送, 直接丢掉则剩下的区块再也撤不回去。
      *
      * @param player 玩家
      * @param times 次数
@@ -428,12 +431,24 @@ class WorldEditManager {
                 work = { index, slice ->
                     WorldEditTool.restoreBlocks(bukkitWorld, slice, record.batches[index].states, actor)
                 },
-                done = {
+                done = { timedOut ->
                     player.runOnOwnThread {
-                        // 返还先落库, 再取吓一条: 两条的返还都是同一份材料包的读改写, 不能并发
-                        chargeMaterial(player, record.material, -record.amount)
-                        // 回到异步线程取吓一条 (那里才能读文件)
-                        submitAsync { undoStep(player, times, done + 1, onDone) }
+                        if (timedOut) {
+                            // 超时: 这条记录只还原了一部分, 不能按"已撤销"退还材料 (那等于白送),
+                            // 也不能就这么丢掉 (剩下的区块就再也撤不回去了)。还原到快照是幂等的,
+                            // 所以把记录放回队列, 让玩家再 undo 一次 —— 已还原的区块重做一遍没有副作用。
+                            // 写盘是同步 IO, 丢到异步线程做。
+                            warning("[PlayerWorldEdit] 撤销超时 (${player.name}), 本条记录已放回队列, 可重试")
+                            submitAsync {
+                                UndoManager.push(player, record, undoLimit())
+                                finishUndo(player, done, onDone)
+                            }
+                        } else {
+                            // 返还先落库, 再取吓一条: 两条的返还都是同一份材料包的读改写, 不能并发
+                            chargeMaterial(player, record.material, -record.amount)
+                            // 回到异步线程取吓一条 (那里才能读文件)
+                            submitAsync { undoStep(player, times, done + 1, onDone) }
+                        }
                     }
                 }
             )
