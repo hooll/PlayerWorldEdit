@@ -24,12 +24,13 @@ object CommandUndo {
     }
 
     private fun undo(player: Player, times: Int) {
-        // 内部会按区块丢到各自区域线程上执行, 这里不能异步
-        val done = PlayerWorldEdit.worldEditManager.undo(player, times.coerceIn(1, 10))
-        if (done <= 0) {
-            player.sendLang("message-undo-none", pluginId to "pluginId")
-        } else {
-            player.sendLang("message-undo-susses", pluginId to "pluginId", done to "times")
+        // undo 改成严格串行后不再同步返回条数: 一条完全结束才轮到下一条, 结果用回调给回来
+        PlayerWorldEdit.worldEditManager.undo(player, times.coerceIn(1, 10)) { done ->
+            if (done <= 0) {
+                player.sendLang("message-undo-none", pluginId to "pluginId")
+            } else {
+                player.sendLang("message-undo-susses", pluginId to "pluginId", done to "times")
+            }
         }
     }
 }

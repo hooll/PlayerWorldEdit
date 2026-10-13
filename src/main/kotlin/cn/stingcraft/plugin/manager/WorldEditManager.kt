@@ -26,6 +26,7 @@ import org.bukkit.entity.Player
 import org.bukkit.inventory.ItemStack
 import taboolib.common.platform.function.pluginId
 import taboolib.common.platform.function.submitAsync
+import taboolib.common.platform.function.warning
 import taboolib.common.platform.service.PlatformExecutor
 import taboolib.library.xseries.XMaterial
 import taboolib.library.xseries.parseToXMaterial
@@ -382,38 +383,85 @@ class WorldEditManager {
 
     /**
      * 撤销最近的操作
+     *
+     * 必须**严格串行**: 第 i 条完全还原、返还落库之后才取第 i+1 条。
+     * [runOnChunkThreads] 是异步返回的, 原来的 repeat 会把 N 组区块任务同时铺开 ——
+     * 返还互相覆盖 (同一份材料包的读改写), 后一条的旧快照还会盖掉前一条刚还原的状态,
+     * `/pwe undo 3` 的最终结果不可预测。
+     *
+     * 所以这里改成一条接一条的链式回调: 异步线程取记录 → 区块线程还原 → 玩家线程返还 →
+     * 回到异步线程取吓一条。
+     *
      * @param player 玩家
      * @param times 次数
-     * @return 实际撤销次数
+     * @param onDone 整轮结束时回调一次, 参数是实际撤销的条数
      */
-    fun undo(player: Player, times: Int): Int {
-        if (!beginEdit(player)) return 0
-        var done = 0
-        repeat(times) {
-            val record = UndoManager.poll(player) ?: return@repeat
-            val bukkitWorld = Bukkit.getWorld(record.worldName)
-            if (bukkitWorld == null) {
-                // 世界未加载, 把记录放回去, 避免白丢一条
-                UndoManager.push(player, record, undoLimit())
-                return@repeat
-            }
-            done++
-            EditBudget.configure(blocksPerTick())
-            val actor = actorOf(player)
-            val regions = record.batches.map { it.region }
+    fun undo(player: Player, times: Int, onDone: (Int) -> Unit) {
+        if (!beginEdit(player)) {
+            // 和其它出口一样走 finishUndo, 保证回调线程一致 (endEdit 对没进过集合的玩家是空操作)
+            finishUndo(player, 0, onDone)
+            return
+        }
+        // 第一次取记录要读文件, 丢到异步线程; 之后每一步由链自己挑线程
+        submitAsync { undoStep(player, times, 0, onDone) }
+    }
+
+    private fun undoStep(player: Player, times: Int, done: Int, onDone: (Int) -> Unit) {
+        if (done >= times) {
+            finishUndo(player, done, onDone)
+            return
+        }
+        // poll 要读撤销记录文件, 这一步在异步线程上跑
+        val record = UndoManager.poll(player) ?: return finishUndo(player, done, onDone)
+        val bukkitWorld = Bukkit.getWorld(record.worldName)
+        if (bukkitWorld == null) {
+            // 世界未加载: 把记录放回去并**中止整轮** —— 跳过后面的记录只会让撤销顺序错乱
+            UndoManager.push(player, record, undoLimit())
+            return finishUndo(player, done, onDone)
+        }
+        EditBudget.configure(blocksPerTick())
+        val actor = actorOf(player)
+        val regions = record.batches.map { it.region }
+        val started = runCatching {
             runOnChunkThreads(regions, bukkitWorld,
                 work = { index, slice ->
                     WorldEditTool.restoreBlocks(bukkitWorld, slice, record.batches[index].states, actor)
                 },
                 done = {
                     player.runOnOwnThread {
+                        // 返还先落库, 再取吓一条: 两条的返还都是同一份材料包的读改写, 不能并发
                         chargeMaterial(player, record.material, -record.amount)
+                        // 回到异步线程取吓一条 (那里才能读文件)
+                        submitAsync { undoStep(player, times, done + 1, onDone) }
                     }
                 }
             )
+        }.onFailure {
+            // 排队阶段就炸了: 这条当作没撤成, 结束整轮
+            warning("[PlayerWorldEdit] 撤销失败: $it")
+        }.isSuccess
+        if (!started) {
+            finishUndo(player, done, onDone)
         }
+    }
+
+    /**
+     * 撤销的收尾: 释放 editing 并回报次数 (所有退出路径都要走这里)
+     *
+     * 回调必须回到**玩家线程**: 两个调用点都在回调里给玩家发消息, 而 Folia 下从异步线程
+     * 碰玩家会抛线程归属异常。玩家已经下线时没有玩家线程可回, 只能就地回调 —— 调用方那句
+     * 消息发给离线玩家本来就是空操作。
+     */
+    private fun finishUndo(player: Player, done: Int, onDone: (Int) -> Unit) {
         endEdit(player)
-        return done
+        if (!player.isOnline) {
+            onDone(done)
+            return
+        }
+        // runOnOwnThread 自身失败 (实体已退役等) 时也不能让调用方永远等不到结果
+        if (runCatching { player.runOnOwnThread { onDone(done) } }.isFailure) {
+            onDone(done)
+        }
     }
 
     /**

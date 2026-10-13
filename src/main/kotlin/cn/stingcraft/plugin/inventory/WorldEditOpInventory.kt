@@ -75,11 +75,12 @@ object WorldEditOpInventory {
                 lore += "&7| 撤销最近一次操作并返还材料"
                 colored()
             }) {
-                val done = worldEditManager.undo(player, 1)
-                if (done <= 0) {
-                    player.sendLang("message-undo-none", pluginId to "pluginId")
-                } else {
-                    player.sendLang("message-undo-susses", pluginId to "pluginId", done to "times")
+                worldEditManager.undo(player, 1) { done ->
+                    if (done <= 0) {
+                        player.sendLang("message-undo-none", pluginId to "pluginId")
+                    } else {
+                        player.sendLang("message-undo-susses", pluginId to "pluginId", done to "times")
+                    }
                 }
             }
         }
