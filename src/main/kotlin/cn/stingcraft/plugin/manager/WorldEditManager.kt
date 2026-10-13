@@ -159,6 +159,8 @@ class WorldEditManager {
      * 原来是每个粒子点提交一个区域任务, 一个百来格的选区每秒钟会提交两千多个任务,
      * 区域线程光排队就卡住了。
      *
+     * 显示时长跟着选区: 选区被清除或玩家退出才停 (与玻璃盒一致)。
+     *
      * @param player 玩家
      */
     private fun showParticle(player: Player) {
@@ -179,9 +181,10 @@ class WorldEditManager {
         }
         // 按区块分组, 每秒每个区块只提交一个任务
         val pointsByChunk = points.groupBy { (it.blockX shr 4) to (it.blockZ shr 4) }
-        var tick = 0
         particleTasks[player] = submitAsync(period = 20) {
-            if (tick >= 60*20 || !player.isOnline) {
+            // 粒子跟着选区走 (和玻璃盒一致): 只在自己下线时停, 选区被清除时由 stopParticle 停。
+            // 原来还有一条 60 秒自停, 那样会变成"选区还在、提示没了", 和"成功后保留选区"矛盾。
+            if (!player.isOnline) {
                 cancel()
                 particleTasks.remove(player)
                 return@submitAsync
@@ -192,7 +195,6 @@ class WorldEditManager {
                     locations.forEach { player.spawnParticle(particle, it, 1) }
                 })
             }
-            tick += 20
         }
     }
 
