@@ -54,13 +54,15 @@ fun Material.displayName(player: Player? = null): String {
     val key = translationKeyMethod?.let { runCatching { it.invoke(this) as? String }.getOrNull() }
     if (key != null) {
         val file = player?.getMinecraftLanguageFile() ?: MinecraftLanguage.getDefaultLanguageFile()
-        val name = runCatching { file?.get(key) }.getOrNull()
-        if (!name.isNullOrBlank()) {
-            return name
+        val translated = runCatching { file?.get(key) }.getOrNull()
+        if (!translated.isNullOrBlank()) {
+            return translated
         }
     }
-    // 语言文件缺失时的兜底: DIAMOND_PICKAXE -> Diamond Pickaxe, TNT 这类短词保持大写
-    return name.lowercase().split('_').joinToString(" ") { word ->
+    // 语言文件缺失时的兜底: 用 Material.name (枚举名), DIAMOND_PICKAXE -> Diamond Pickaxe,
+    // TNT 这类短词保持大写。这里显式写 this.name —— 上面那个局部变量叫 name 的话,
+    // 这一行靠遮蔽才解析对, 以后谁挪一下代码就会悄悄改掉兜底行为。
+    return this.name.lowercase().split('_').joinToString(" ") { word ->
         if (word.length <= 3) word.uppercase() else word.replaceFirstChar { it.uppercaseChar() }
     }
 }
