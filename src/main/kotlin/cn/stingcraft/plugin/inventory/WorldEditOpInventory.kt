@@ -122,7 +122,7 @@ object WorldEditOpInventory {
             }
             set(22, buildItem(XMaterial.CAULDRON) {
                 name = "&f| 实心圆柱"
-                lore += "&7| 以选区水平中心生成实心圆柱"
+                lore += "&7| 以你的位置为中心生成实心圆柱"
                 lore += "&7| 下一步选半径与高度"
                 colored()
             }) {
@@ -135,6 +135,7 @@ object WorldEditOpInventory {
             }
             set(24, buildItem(XMaterial.FLOWER_POT) {
                 name = "&f| 空心圆柱"
+                lore += "&7| 以你的位置为中心"
                 lore += "&7| 只生成半径处那一圈壳 (厚 1 格)"
                 lore += "&7| 内部方块不动"
                 colored()

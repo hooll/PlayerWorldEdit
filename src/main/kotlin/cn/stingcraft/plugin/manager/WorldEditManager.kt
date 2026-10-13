@@ -403,7 +403,9 @@ class WorldEditManager {
      * @param material 方块 (空气 = 清空这些位置)
      */
     fun tryGenerateWall(player: Player, material: Material) {
-        generateShape(player, ShapeKind.WALL, material, radius = 0, height = 0, successKey = "message-wall-susses")
+        // 墙保持"选区四周"的口径不变: 选区校验 (含 Dominion fail-closed) 与以前完全一样
+        val region = validatedRegion(player, needBreak = false) ?: return
+        generateShape(player, ShapeKind.WALL, material, region, radius = 0, successKey = "message-wall-susses")
     }
 
     /**
@@ -415,14 +417,65 @@ class WorldEditManager {
      * @param height 高度, 1..[SHAPE_MAX_SIZE]
      */
     fun tryGenerateCylinder(player: Player, material: Material, radius: Int, height: Int) {
-        if (!validateShapeSize(player, radius, height)) return
-        generateShape(player, ShapeKind.CYLINDER, material, radius, height, "message-cyl-susses")
+        generateCylinder(player, material, radius, height, hollow = false, successKey = "message-cyl-susses")
     }
 
     /** 生成空心圆柱: 只写半径处那一圈壳 (径向厚 1), 内部不动 */
     fun tryGenerateHollowCylinder(player: Player, material: Material, radius: Int, height: Int) {
+        generateCylinder(player, material, radius, height, hollow = true, successKey = "message-hcyl-susses")
+    }
+
+    /**
+     * 圆柱的几何与校验 —— 和墙的区别在于它**完全不看选区**
+     *
+     * 中心 = 玩家所在的那一格, 底面 = 玩家脚下方块, 向上 [height] 层; 顶面夹进世界高度
+     * (被世界高度吃掉的那几层直接丢掉), 夹完一层都不剩 (例如站在世界顶) 时提示并返回。
+     *
+     * 没有选区就走不了 [validatedRegion], 但领地校验一个都不能少: 对圆柱的**外接长方体**做同一套
+     * fail-closed 校验 —— 要动的方块必须全部有权限, 和 /pwe set 检查选区是同一个道理。
+     */
+    private fun generateCylinder(
+        player: Player,
+        material: Material,
+        radius: Int,
+        height: Int,
+        hollow: Boolean,
+        successKey: String
+    ) {
         if (!validateShapeSize(player, radius, height)) return
-        generateShape(player, ShapeKind.HOLLOW_CYLINDER, material, radius, height, "message-hcyl-susses")
+        val weWorld = BukkitAdapter.adapt(player.world)
+        val location = player.location
+        val centerX = location.blockX
+        val centerZ = location.blockZ
+        val baseY = location.blockY.coerceIn(weWorld.minY, weWorld.maxY)
+        val topY = (location.blockY + height - 1).coerceAtMost(weWorld.maxY)
+        if (baseY > topY) {
+            // 夹取后一层都不剩: 直接提示返回, 别留下一条 0 材料的撤销记录
+            player.sendLang("message-shape-none", pluginId to "pluginId")
+            return
+        }
+        val world = player.world
+        val box = CuboidRegion(
+            BlockVector3.at(centerX - radius, baseY, centerZ - radius),
+            BlockVector3.at(centerX + radius, topY, centerZ + radius)
+        )
+        if (!checkDominion(
+                player,
+                Location(world, (centerX - radius).toDouble(), baseY.toDouble(), (centerZ - radius).toDouble()),
+                Location(world, (centerX + radius).toDouble(), topY.toDouble(), (centerZ + radius).toDouble()),
+                needBreak = false
+            )
+        ) {
+            return
+        }
+        generateShape(
+            player,
+            if (hollow) ShapeKind.HOLLOW_CYLINDER else ShapeKind.CYLINDER,
+            material,
+            box,
+            radius,
+            successKey
+        )
     }
 
     /**
@@ -450,28 +503,25 @@ class WorldEditManager {
         player: Player,
         kind: ShapeKind,
         material: Material,
+        box: CuboidRegion,
         radius: Int,
-        height: Int,
         successKey: String
     ) {
-        val region = validatedRegion(player, needBreak = false) ?: return
         val blockType = resolveBlockType(material) ?: run {
             player.sendLang("message-invalid-material", pluginId to "pluginId", material.name to "material")
             return
         }
         // 用 BlockVector3.x()/y()/z(): getX()/getY()/getZ() 在 7.4.6 已经标记弃用, 新代码别再添警告
-        val min = region.minimumPoint
-        val max = region.maximumPoint
+        val min = box.minimumPoint
+        val max = box.maximumPoint
         val shape = ShapeVolume(
             kind,
             min.x(), max.x(),
             min.y(), max.y(),
             min.z(), max.z(),
-            radius,
-            // 墙的高度就是整个选区 (//walls 取全部 Y 范围); 圆柱用玩家给的高度
-            if (kind == ShapeKind.WALL) max.y() - min.y() + 1 else height
+            radius
         )
-        val regions = region.splitByChunk()
+        val regions = box.splitByChunk()
         // 计费: 每个区块各数自己那一块里的形状方块, 加总就是总量。失败退费按区块退, 口径一致。
         // 这里数的是"列 × 层", 与下面 work 里逐块判定的结果严格相等 (见 ShapeVolume.countIn)
         val costs = regions.map { chunk ->
@@ -543,18 +593,14 @@ class WorldEditManager {
         private val maxY: Int,
         private val minZ: Int,
         private val maxZ: Int,
-        radius: Int,
-        height: Int
+        radius: Int
     ) {
-        /** 形状最上面一层的 Y; 可以超出选区顶, 计费与写入时再按选区裁掉 */
-        private val topY = minY + height - 1
-
-        // 选区的水平中心。选区覆盖 [minX, maxX+1), 方块 x 的中心是 x+0.5, 所以方块到中心的水平
-        // 距离正好是 x - (minX+maxX)/2 —— 直接用方块坐标算就行, 不需要再 +0.5
-        private val centerX = (minX + maxX) / 2.0
-        private val centerZ = (minZ + maxZ) / 2.0
-        private val outerRadiusSquared = (radius * radius).toDouble()
-        private val innerRadiusSquared = (radius - 1).toDouble().let { it * it }
+        // 圆心 = 外接框的水平中心。圆柱的外接框是 [cx-r, cx+r], 宽度 2r+1 是奇数, 所以整数除法
+        // 算出来正好是玩家所在的那一格 cx; 墙的判定不看圆心, 算出来是什么都无所谓。
+        private val centerX = (minX + maxX) / 2
+        private val centerZ = (minZ + maxZ) / 2
+        private val outerRadiusSquared = radius * radius
+        private val innerRadiusSquared = (radius - 1) * (radius - 1)
 
         /**
          * 这一列 (x, z) 的水平投影在不在形状里 (纯算术, 与 Y 无关)
@@ -573,7 +619,7 @@ class WorldEditManager {
         }
 
         /** 方块在不在形状里 —— 写入判定用的就是它 */
-        fun contains(x: Int, y: Int, z: Int): Boolean = y in minY..topY && columnContains(x, z)
+        fun contains(x: Int, y: Int, z: Int): Boolean = y in minY..maxY && columnContains(x, z)
 
         /**
          * 选区 (X/Z 取 [x1]..[x2] / [z1]..[z2]) 里有多少方块落在形状里, 纯算术
@@ -583,8 +629,7 @@ class WorldEditManager {
          * 结果**严格相等** —— 但不用遍历整个体积, 也不读世界。
          */
         fun countIn(x1: Int, x2: Int, z1: Int, z2: Int): Int {
-            val layers = (minOf(topY, maxY) - minY + 1).coerceAtLeast(0)
-            if (layers == 0) return 0
+            val layers = maxY - minY + 1
             var columns = 0
             for (x in x1..x2) {
                 for (z in z1..z2) {
@@ -594,7 +639,7 @@ class WorldEditManager {
             return columns * layers
         }
 
-        private fun distanceSquared(x: Int, z: Int): Double {
+        private fun distanceSquared(x: Int, z: Int): Int {
             val dx = x - centerX
             val dz = z - centerZ
             return dx * dx + dz * dz
@@ -898,20 +943,30 @@ class WorldEditManager {
         val region = getWERegion(player) ?: return null
         val pos1 = getPlayerPos1(player) ?: return null
         val pos2 = getPlayerPos2(player) ?: return null
-        when (val check = DominionHook.checkAreaEdit(player, pos1, pos2, needBreak = needBreak)) {
-            is DominionCheck.Allowed -> Unit
+        if (!checkDominion(player, pos1, pos2, needBreak)) return null
+        return region
+    }
+
+    /**
+     * 领地校验 (fail-closed), 通过返回 true
+     *
+     * 抽出来是因为有两个调用方: 选区操作拿 pos1/pos2 去查, 而圆柱**没有选区**, 只能拿它的
+     * 外接长方体去查 —— 但"拒绝 / 无法确认"的处理必须一模一样, 不能各写一份。
+     */
+    private fun checkDominion(player: Player, corner1: Location, corner2: Location, needBreak: Boolean): Boolean {
+        return when (val check = DominionHook.checkAreaEdit(player, corner1, corner2, needBreak)) {
+            is DominionCheck.Allowed -> true
             is DominionCheck.Denied -> {
                 player.sendLang("message-dominion-denied", pluginId to "pluginId", check.dominion to "dominion")
-                return null
+                false
             }
             is DominionCheck.Failed -> {
                 // 校验过程出错 = 无法确认有没有领地, 按 fail-closed 拒绝
                 // (具体异常已经打进控制台, 这里只告诉玩家操作被拒)
                 player.sendLang("message-dominion-check-failed", pluginId to "pluginId")
-                return null
+                false
             }
         }
-        return region
     }
 
     /**
