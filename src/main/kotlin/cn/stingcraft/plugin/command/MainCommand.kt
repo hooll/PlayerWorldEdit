@@ -54,4 +54,10 @@ object MainCommand {
 
     @CommandBody(permission = "PlayerWorldEdit.Use")
     val wall = CommandWall.command
+
+    @CommandBody(permission = "PlayerWorldEdit.Use")
+    val cyl = CommandCyl.command
+
+    @CommandBody(permission = "PlayerWorldEdit.Use")
+    val hcyl = CommandHcyl.command
 }

@@ -107,7 +107,8 @@ object WorldEditOpInventory {
                 // 同上: 重开菜单让第 4 槽的方块数跟上新的选区
                 open(player)
             }
-            // 形状生成: 墙一步到底 (选完方块直接生成)
+            // 形状生成。墙一步到底; 两个圆柱再点一次尺寸预设 —— 和上面"替换方块"一样是
+            // 连着选两次, 不是二级菜单。
             set(20, buildItem(XMaterial.BRICKS) {
                 name = "&f| 生成墙"
                 lore += "&7| 沿选区四周生成四面竖墙"
@@ -119,7 +120,66 @@ object WorldEditOpInventory {
                     worldEditManager.tryGenerateWall(player, material)
                 }
             }
+            set(22, buildItem(XMaterial.CAULDRON) {
+                name = "&f| 实心圆柱"
+                lore += "&7| 以选区水平中心生成实心圆柱"
+                lore += "&7| 下一步选半径与高度"
+                colored()
+            }) {
+                openBlockPicker(player, "&f选择实心圆柱的方块") { material ->
+                    openSizePicker(player, "&f选择圆柱尺寸") { radius, height ->
+                        player.closeInventory()
+                        worldEditManager.tryGenerateCylinder(player, material, radius, height)
+                    }
+                }
+            }
+            set(24, buildItem(XMaterial.FLOWER_POT) {
+                name = "&f| 空心圆柱"
+                lore += "&7| 只生成半径处那一圈壳 (厚 1 格)"
+                lore += "&7| 内部方块不动"
+                colored()
+            }) {
+                openBlockPicker(player, "&f选择空心圆柱的方块") { material ->
+                    openSizePicker(player, "&f选择圆柱尺寸") { radius, height ->
+                        player.closeInventory()
+                        worldEditManager.tryGenerateHollowCylinder(player, material, radius, height)
+                    }
+                }
+            }
         }
+    }
+
+    /**
+     * 圆柱的半径 / 高度预设
+     *
+     * 箱子界面没有输入框, 做一个"等玩家打字"的输入流程又要多一份 per-player 待输入状态
+     * (前几轮反复踩过按 UUID 只增不删的坑), 所以这里给 3x3 预设: 横轴半径、纵轴高度,
+     * 都是 5 / 10 / 20; 任意数值走命令行 `/pwe cyl <方块> <半径> <高度>`。
+     */
+    private fun openSizePicker(player: Player, title: String, callback: (radius: Int, height: Int) -> Unit) {
+        player.openMenu(buildMenu<ChestImpl>(title.colored()) {
+            rows(4)
+            // 和主菜单一样锁住整页: 没注册 onClick 的格子原本可以把物品拿走
+            onClick(true) { }
+            set(4, buildItem(XMaterial.PAPER) {
+                name = "&f| 半径 x 高度"
+                lore += "&7| 横着看是半径: &e5 &7/ &e10 &7/ &e20"
+                lore += "&7| 竖着看是高度: &e5 &7/ &e10 &7/ &e20"
+                lore += "&7| 要任意数值用命令: &f/pwe cyl <方块> <半径> <高度>"
+                colored()
+            })
+            val radii = listOf(5, 10, 20)
+            listOf(5, 10, 20).forEachIndexed { row, height ->
+                radii.forEachIndexed { column, radius ->
+                    set((row + 1) * 9 + 3 + column, buildItem(XMaterial.LIME_STAINED_GLASS_PANE) {
+                        name = "&f| 半径 $radius &7/ &f高度 $height"
+                        colored()
+                    }) {
+                        callback(radius, height)
+                    }
+                }
+            }
+        })
     }
 
     private fun openBlockPicker(player: Player, title: String, callback: (Material) -> Unit) {

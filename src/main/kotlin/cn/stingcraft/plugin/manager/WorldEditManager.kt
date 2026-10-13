@@ -407,6 +407,37 @@ class WorldEditManager {
     }
 
     /**
+     * 生成实心圆柱 (轴竖直 Y)
+     *
+     * 底面在选区最小 Y、水平中心取选区中心、向上高 [height]; 超出选区的部分一律裁掉。
+     *
+     * @param radius 半径, 1..[SHAPE_MAX_SIZE]
+     * @param height 高度, 1..[SHAPE_MAX_SIZE]
+     */
+    fun tryGenerateCylinder(player: Player, material: Material, radius: Int, height: Int) {
+        if (!validateShapeSize(player, radius, height)) return
+        generateShape(player, ShapeKind.CYLINDER, material, radius, height, "message-cyl-susses")
+    }
+
+    /** 生成空心圆柱: 只写半径处那一圈壳 (径向厚 1), 内部不动 */
+    fun tryGenerateHollowCylinder(player: Player, material: Material, radius: Int, height: Int) {
+        if (!validateShapeSize(player, radius, height)) return
+        generateShape(player, ShapeKind.HOLLOW_CYLINDER, material, radius, height, "message-hcyl-susses")
+    }
+
+    /**
+     * 半径 / 高度的范围校验
+     *
+     * 下限 1 是真约束 (0 或负数没有意义); 上限 [SHAPE_MAX_SIZE] 只是 sanity cap —— 形状本来就被
+     * 裁剪在选区内, 给得再大也只是"填满选区", 卡个上限是为了挡住手滑敲出的一长串数字。
+     */
+    private fun validateShapeSize(player: Player, radius: Int, height: Int): Boolean {
+        if (radius in 1..SHAPE_MAX_SIZE && height in 1..SHAPE_MAX_SIZE) return true
+        player.sendLang("message-shape-invalid-size", pluginId to "pluginId", SHAPE_MAX_SIZE to "max")
+        return false
+    }
+
+    /**
      * 形状生成的公共流程 —— 和 [trySetArea] 走**同一条写方块链路**:
      * validatedRegion (含 Dominion fail-closed) → beginEdit → 计费 → tryConsume →
      * runOnChunkThreads → finishEdit (撤销记录 + 成功保留选区)。
@@ -1052,6 +1083,14 @@ class WorldEditManager {
          * 一下子把选区撑到几个区块以外 —— 之后一个 set 就要跑很久。
          */
         const val SELECTION_EDIT_MAX_BLOCKS = 100
+
+        /**
+         * 圆柱半径 / 高度的上限
+         *
+         * 只是 sanity cap: 形状本来就被裁剪在选区内, 给得再大也只是"填满选区"; 卡个上限是为了
+         * 挡住手滑敲出来的一长串数字。
+         */
+        const val SHAPE_MAX_SIZE = 256
 
         /** 轴索引里的 Y (与 [snapAxis] 的 0=X, 1=Y, 2=Z 顺序一致) —— 6 个面里只有 Y 需要世界高度夹取 */
         const val AXIS_Y = 1
