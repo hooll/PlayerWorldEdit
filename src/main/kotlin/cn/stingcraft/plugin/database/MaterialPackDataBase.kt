@@ -18,6 +18,7 @@ import taboolib.expansion.setupDataContainer
 import taboolib.expansion.setupPlayerDatabase
 import java.io.ByteArrayOutputStream
 import java.util.Base64
+import java.util.UUID
 import java.util.zip.GZIPInputStream
 import java.util.zip.GZIPOutputStream
 
@@ -31,25 +32,38 @@ object MaterialPackDataBase {
     @SubscribeEvent
     private fun setup(e:PlayerJoinEvent){
         submitAsync {
-            e.player.setupDataContainer()
+            setupAndLoad(e.player)
         }
     }
 
     @SubscribeEvent
     private fun onQuit(e: PlayerQuitEvent) {
+        // 先把材料包缓存落盘, 再释放数据容器 —— 顺序反了容器就已经没了, 写不进去
+        PlayerWorldEdit.packManager.unload(e.player)
         e.player.uniqueId.releasePlayerDataContainer()
     }
 
-    fun getMaterialPack(player: Player): MaterialPack {
-        if (!player.uniqueId.getAutoDataContainer().keys().contains("materialPack")) {
+    /**
+     * 数据容器就绪之后再去加载材料包缓存
+     *
+     * 加载排在 setupDataContainer() 之后: 容器没就绪就读会拿到一个空包, 之后退出时落盘
+     * 就把玩家的真实数据覆盖成空的了。
+     */
+    private fun setupAndLoad(player: Player) {
+        player.setupDataContainer()
+        PlayerWorldEdit.packManager.load(player)
+    }
+
+    fun getMaterialPack(uuid: UUID): MaterialPack {
+        if (!uuid.getAutoDataContainer().keys().contains("materialPack")) {
             val materialPack = MaterialPack(mutableSetOf())
-            saveMaterialPack(player, materialPack)
+            saveMaterialPack(uuid, materialPack)
             return materialPack
         }
-        return PlayerWorldEdit.gson.fromJson(decompressFromBase64(player.uniqueId.getAutoDataContainer()["materialPack"]!!), MaterialPack::class.java)
+        return PlayerWorldEdit.gson.fromJson(decompressFromBase64(uuid.getAutoDataContainer()["materialPack"]!!), MaterialPack::class.java)
     }
-    fun saveMaterialPack(player: Player, materialPack: MaterialPack) {
-        player.uniqueId.getAutoDataContainer()["materialPack"] = compressToBase64(PlayerWorldEdit.gson.toJson(materialPack))
+    fun saveMaterialPack(uuid: UUID, materialPack: MaterialPack) {
+        uuid.getAutoDataContainer()["materialPack"] = compressToBase64(PlayerWorldEdit.gson.toJson(materialPack))
     }
 
     private fun compressToBase64(json: String): String {

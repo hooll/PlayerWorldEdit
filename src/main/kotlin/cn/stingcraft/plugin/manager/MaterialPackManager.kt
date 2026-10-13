@@ -16,38 +16,97 @@ class MaterialPackManager {
      * 复合操作非原子, 并发时后写会覆盖先写 —— 材料凭空消失或多出来。
      *
      * 用 per-player 锁把同一个玩家的读改写串成一条线, 不同玩家之间互不阻塞。
+     * 锁保护的是 [caches] 里的内存包 (以前是每次从库里读出来的那个包)。
      */
     private val locks = ConcurrentHashMap<UUID, Any>()
 
-    private fun lockOf(player: Player): Any = locks.computeIfAbsent(player.uniqueId) { Any() }
+    /**
+     * per-player 材料包缓存 —— 玩家在线期间的**唯一真相源**。
+     *
+     * 以前每次取物/扣费都要"base64 解码 + gzip 解压 + gson 解析"读一次, 再"gson + gzip + base64"
+     * 全量写一次, 一次点击就是两读一写。加了缓存之后, 操作只改内存, 退出 (或关服) 时才落一次盘。
+     *
+     * 缓存里没有这个玩家时, 读改写会退回数据库直连 (见 [mutate]): 玩家已经退出、或者登录时的
+     * 加载还没跑完, 走直连才不会把那次改动丢掉。
+     */
+    private val caches = ConcurrentHashMap<UUID, MaterialPack>()
+
+    private fun lockOf(uuid: UUID): Any = locks.computeIfAbsent(uuid) { Any() }
+
+    /**
+     * 登录后从数据库加载一次 (数据容器就绪之后调用)
+     *
+     * 已经有缓存就不重复加载 —— 加载必须是幂等的, 否则一次晚到的加载会用库里的旧数据
+     * 盖掉内存里还没落盘的改动。
+     */
+    fun load(player: Player) {
+        synchronized(lockOf(player.uniqueId)) {
+            if (caches.containsKey(player.uniqueId)) return
+            caches[player.uniqueId] = MaterialPackDataBase.getMaterialPack(player.uniqueId)
+        }
+    }
+
+    /**
+     * 把缓存写回数据库 (退出 / 关服时用)
+     *
+     * 没有缓存就什么都不写: 那说明这个玩家的包从没加载过, 写回去只会把库里的数据盖成空包。
+     */
+    fun flush(uuid: UUID) {
+        synchronized(lockOf(uuid)) {
+            flushLocked(uuid)
+        }
+    }
+
+    /** 把缓存写回数据库; 调用方必须已经持有这个玩家的锁 */
+    private fun flushLocked(uuid: UUID) {
+        val materialPack = caches[uuid] ?: return
+        MaterialPackDataBase.saveMaterialPack(uuid, materialPack)
+    }
+
+    /**
+     * 退出: 落盘并丢掉缓存 (下次登录重新从库里加载)
+     *
+     * 落盘和丢缓存必须在**同一段锁**里完成。分成"flush(锁①) → remove(锁②)"两次加锁的话,
+     * 中间能被一次并发的 mutate 插进来: 缓存还在 -> 只改内存不写库 -> 紧接着被 remove 丢掉,
+     * 这次改动就既不在缓存里也不在库里了 (触发场景: MaterialADDInventory 的异步添加撞上退出)。
+     */
+    fun unload(player: Player) {
+        synchronized(lockOf(player.uniqueId)) {
+            flushLocked(player.uniqueId)
+            caches.remove(player.uniqueId)
+        }
+    }
+
+    /** 关服: 把所有还没落盘的缓存写回去 */
+    fun flushAll() {
+        caches.keys.toList().forEach { flush(it) }
+    }
 
     /**
      * 只读快照。
      *
-     * 返回的是**深拷贝**: `MaterialPack` 的 `copy()` 是浅拷贝 —— 副本与刚从库里反序列化出来的
-     * 对象共享同一个 `MutableSet` 和同一批 `MaterialEntry`, 调用方在锁外改副本就等于改原件,
-     * 锁白加。这里逐个复制 entry, 让返回值与内部状态彻底脱钩 (材料包将来改成内存缓存后,
-     * 这一点是那把锁能成立的前提)。
-     *
-     * 真正的读改写一律在锁内直接用 [MaterialPackDataBase] 完成。
+     * 返回的是**深拷贝**: `MaterialPack` 的 `copy()` 是浅拷贝 —— 副本与缓存里的对象共享同一个
+     * `MutableSet` 和同一批 `MaterialEntry`, 调用方在锁外改副本就等于改原件, 锁白加。
+     * 这里逐个复制 entry, 让返回值与缓存彻底脱钩。
      */
     fun getMaterialPack(player: Player): MaterialPack {
-        return synchronized(lockOf(player)) {
-            val materialPack = MaterialPackDataBase.getMaterialPack(player)
+        return synchronized(lockOf(player.uniqueId)) {
+            val materialPack = caches[player.uniqueId] ?: MaterialPackDataBase.getMaterialPack(player.uniqueId)
             MaterialPack(materialPack.materials.mapTo(mutableSetOf()) { it.copy() })
         }
     }
 
     /**
-     * 整包写库。
+     * 整包覆盖 (锁内执行)。
      *
-     * 对外保留这个方法 (锁内执行), 但它接受的是调用方传进来的包 —— 传一个过期的包进来
-     * 依然会覆盖掉别人的改动, 所以插件内部一律走 [addMaterial] / [removeMaterial] /
-     * [tryConsume] 这些"读改写都在锁里"的方法。
+     * 对外保留这个方法, 但它接受的是调用方传进来的包 —— 传一个过期的包进来依然会覆盖掉别人的
+     * 改动, 所以插件内部一律走 [addMaterial] / [removeMaterial] / [tryConsume] 这些
+     * "读改写都在锁里"的方法。缓存是唯一真相源, 这里连缓存一起换掉。
      */
     fun saveMaterialPack(player: Player, materialPack: MaterialPack) {
-        synchronized(lockOf(player)) {
-            MaterialPackDataBase.saveMaterialPack(player, materialPack)
+        synchronized(lockOf(player.uniqueId)) {
+            caches[player.uniqueId] = materialPack
+            MaterialPackDataBase.saveMaterialPack(player.uniqueId, materialPack)
         }
     }
 
@@ -57,10 +116,9 @@ class MaterialPackManager {
      * @param materials 物品列表
      */
     fun addMaterials(player: Player,materials: List<MaterialEntry>){
-        synchronized(lockOf(player)) {
-            val materialPack = MaterialPackDataBase.getMaterialPack(player)
+        mutate(player.uniqueId) { materialPack ->
             val packMaterials = materialPack.materials
-            materials.forEach { newEntry->
+            materials.forEach { newEntry ->
                 val existing = packMaterials.find { it.material == newEntry.material }
                 if (existing != null) {
                     existing.amount += newEntry.amount
@@ -68,7 +126,6 @@ class MaterialPackManager {
                     packMaterials.add(MaterialEntry(newEntry.material, newEntry.amount))
                 }
             }
-            MaterialPackDataBase.saveMaterialPack(player, materialPack)
         }
     }
 
@@ -80,16 +137,13 @@ class MaterialPackManager {
      */
     fun addMaterial(player: Player, material: Material, amount: Int) {
         if (amount <= 0) return
-        synchronized(lockOf(player)) {
-            val materialPack = MaterialPackDataBase.getMaterialPack(player)
-            val materialEntry = materialPack.materials.find { it.material == material } ?:run {
-                val newMaterialEntry = MaterialEntry(material, amount)
-                materialPack.materials.add(newMaterialEntry)
-                MaterialPackDataBase.saveMaterialPack(player, materialPack)
-                return
+        mutate(player.uniqueId) { materialPack ->
+            val materialEntry = materialPack.materials.find { it.material == material }
+            if (materialEntry == null) {
+                materialPack.materials.add(MaterialEntry(material, amount))
+            } else {
+                materialEntry.amount += amount
             }
-            materialEntry.amount += amount
-            MaterialPackDataBase.saveMaterialPack(player, materialPack)
         }
     }
 
@@ -100,8 +154,7 @@ class MaterialPackManager {
      * @param amount 数量
      */
     fun removeMaterial(player: Player, material: Material, amount: Int) {
-        synchronized(lockOf(player)) {
-            val materialPack = MaterialPackDataBase.getMaterialPack(player)
+        mutate(player.uniqueId) { materialPack ->
             val iterator = materialPack.materials.iterator()
             while (iterator.hasNext()) {
                 val entry = iterator.next()
@@ -113,7 +166,6 @@ class MaterialPackManager {
                     break
                 }
             }
-            MaterialPackDataBase.saveMaterialPack(player, materialPack)
         }
     }
 
@@ -130,16 +182,24 @@ class MaterialPackManager {
      */
     fun tryConsume(player: Player, material: Material, amount: Int): Boolean {
         if (material.isAir || amount <= 0) return true
-        synchronized(lockOf(player)) {
-            val materialPack = MaterialPackDataBase.getMaterialPack(player)
-            val materialEntry = materialPack.materials.firstOrNull { it.material == material } ?: return false
-            if (materialEntry.amount < amount) return false
-            materialEntry.amount -= amount
-            if (materialEntry.amount <= 0) {
-                materialPack.materials.remove(materialEntry)
+        return mutate(player.uniqueId) { materialPack ->
+            // 用迭代器删, 和 removeMaterial 保持一致: MaterialEntry 是 data class 且 amount 是 var,
+            // 元素进的是 LinkedHashSet, 先把 amount 减到 0 再 remove(entry) 时 hashCode 已经变了,
+            // 删不掉, 会留下一条"数量 0"的死记录。
+            val iterator = materialPack.materials.iterator()
+            while (iterator.hasNext()) {
+                val entry = iterator.next()
+                if (entry.material == material) {
+                    // 余额不足: 一个方块都不动
+                    if (entry.amount < amount) return@mutate false
+                    entry.amount -= amount
+                    if (entry.amount <= 0) {
+                        iterator.remove()
+                    }
+                    return@mutate true
+                }
             }
-            MaterialPackDataBase.saveMaterialPack(player, materialPack)
-            return true
+            false
         }
     }
 
@@ -157,7 +217,25 @@ class MaterialPackManager {
         return materialEntry.amount >= amount
     }
 
-
-
-
+    /**
+     * 在锁内对玩家的材料包做一次读改写。
+     *
+     * 有缓存时改缓存 (常态, 不再每次全量序列化写库); 没有缓存时直接读改写数据库 ——
+     * 玩家已经退出、或者登录加载还没跑完时, 那次改动不能就这么丢掉。
+     *
+     * 走数据库这条路的缺点: 即使 [block] 判定"不用改" (比如材料不够), 也会把原样写回去一次。
+     * 这是少见路径上的一次多余写, 换来的是不用为它单独开一条分支。
+     */
+    private fun <T> mutate(uuid: UUID, block: (MaterialPack) -> T): T {
+        synchronized(lockOf(uuid)) {
+            val cached = caches[uuid]
+            if (cached != null) {
+                return block(cached)
+            }
+            val materialPack = MaterialPackDataBase.getMaterialPack(uuid)
+            val result = block(materialPack)
+            MaterialPackDataBase.saveMaterialPack(uuid, materialPack)
+            return result
+        }
+    }
 }

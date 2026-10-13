@@ -50,22 +50,20 @@ object MaterialPackInventory {
             onClick { event, element ->
                 when(event.clickEvent().click){
                     ClickType.LEFT -> {
-                        if (packManager.hasEnoughMaterial(player, element.material, 1)){
-                            packManager.removeMaterial(player, element.material, 1)
+                        // 检查 + 扣除合成一次原子操作 (原来分两次调用, 中间别的线程也能通过检查)
+                        if (packManager.tryConsume(player, element.material, 1)){
                             player.giveItem(buildItem(element.material),1)
                             open(player)
                         }
                     }
                     ClickType.RIGHT -> {
-                        if (packManager.hasEnoughMaterial(player, element.material, 10)){
-                            packManager.removeMaterial(player, element.material, 10)
+                        if (packManager.tryConsume(player, element.material, 10)){
                             player.giveItem(buildItem(element.material),10)
                             open(player)
                         }
                     }
                     ClickType.SHIFT_RIGHT -> {
-                        if (packManager.hasEnoughMaterial(player, element.material, 64)){
-                            packManager.removeMaterial(player, element.material, 64)
+                        if (packManager.tryConsume(player, element.material, 64)){
                             player.giveItem(buildItem(element.material),64)
                             open(player)
                         }

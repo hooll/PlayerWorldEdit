@@ -29,6 +29,8 @@ object PlayerWorldEdit : Plugin() {
         worldEditManager.clearDisplays()
         // 超时兜底计时器也停掉, 免得卸载后还在跑
         cancelWatchdogs()
+        // 材料包缓存是唯一真相源, 关服前必须落盘, 否则在线玩家这一段时间的材料就丢了
+        packManager.flushAll()
     }
 
     /**
