@@ -23,10 +23,10 @@ plugins {
 
 // 版本号 = 语义版本 + git 短哈希, 区分每次构建
 version = runCatching {
-    "1.1.0-" + providers.exec {
+    "1.2.0-" + providers.exec {
         commandLine("git", "rev-parse", "--short=7", "HEAD")
     }.standardOutput.asText.map { it.trim() }.get()
-}.getOrDefault("1.1.0")
+}.getOrDefault("1.2.0")
 
 taboolib {
     env {
