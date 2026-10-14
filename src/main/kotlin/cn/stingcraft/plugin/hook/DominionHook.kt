@@ -8,24 +8,15 @@ import org.bukkit.entity.Player
 import taboolib.common.platform.function.warning
 
 /**
- * 领地校验结果
+ * Dominion 的领地保护钩子
  *
- * 三态而不是原来的"领地名 / null": 必须能把"校验过程出错、无法确认"和"确认没有重叠领地"
- * 分开 —— 前者按 fail-closed 要拒绝, 不能因为 API 出错就当成没领地放行。
+ * 这里是三个钩子里唯一"遍历相交区域"的实现: Dominion 的领地是立方体, 而且 API 直接把
+ * `allDominions` 给出来, 所以能做到"只要相交就逐个查"的完整覆盖 —— Residence / WorldGuard
+ * 只有按点查询的入口, 覆盖粒度见 [protectionProbePoints] 的说明。
  */
-sealed interface DominionCheck {
+object DominionHook : RegionProtectionHook {
 
-    /** 确认可以编辑 */
-    object Allowed : DominionCheck
-
-    /** 选区压到了没有权限的领地 */
-    data class Denied(val dominion: String) : DominionCheck
-
-    /** 校验过程本身出错, 无法确认 -> 调用方必须拒绝 */
-    data class Failed(val cause: Throwable) : DominionCheck
-}
-
-object DominionHook {
+    override val name = "Dominion"
 
     /**
      * Dominion 现在装没装 / 启没启用。
@@ -33,21 +24,21 @@ object DominionHook {
      * 每次现查, 不能用 lazy: Dominion 比本插件晚启用时, 第一次求值会把结果永久钉死成
      * "没装", 之后领地保护就再也不生效了。isPluginEnabled 只是查一下插件表, 很便宜。
      */
-    private val available: Boolean
-        get() = runCatching { Bukkit.getPluginManager().isPluginEnabled("Dominion") }.getOrDefault(false)
+    override fun isAvailable(): Boolean =
+        runCatching { Bukkit.getPluginManager().isPluginEnabled("Dominion") }.getOrDefault(false)
 
     /**
      * 检查玩家是否有权编辑选区范围内的所有领地
      *
-     * 校验出错返回 [DominionCheck.Failed] 而不是放行: Dominion 版本不兼容、内部 NPE 之类的问题
+     * 校验出错返回 [ProtectionCheck.Failed] 而不是放行: Dominion 版本不兼容、内部 NPE 之类的问题
      * 会让领地保护静默失效, 而"无法确认"不等于"允许"。异常会打进控制台日志。
      *
      * @param needBreak 是否同时需要破坏权限 (替换操作需要)
      */
-    fun checkAreaEdit(player: Player, corner1: Location, corner2: Location, needBreak: Boolean): DominionCheck {
+    override fun check(player: Player, corner1: Location, corner2: Location, needBreak: Boolean): ProtectionCheck {
         // 没装 / 没启用 Dominion 是"没有这层保护", 不是"无法确认"
-        if (!available) {
-            return DominionCheck.Allowed
+        if (!isAvailable()) {
+            return ProtectionCheck.Allowed
         }
         return try {
             val api = DominionAPI.getInstance()
@@ -80,13 +71,13 @@ object DominionHook {
                 val allowed = api.checkPrivilegeFlag(dominion, Flags.PLACE, player) &&
                     (!needBreak || api.checkPrivilegeFlag(dominion, Flags.BREAK_BLOCK, player))
                 if (!allowed) {
-                    return DominionCheck.Denied(dominion.name)
+                    return ProtectionCheck.Denied(name, dominion.name)
                 }
             }
-            DominionCheck.Allowed
+            ProtectionCheck.Allowed
         } catch (throwable: Throwable) {
             warning("[PlayerWorldEdit] 领地校验失败: $throwable")
-            DominionCheck.Failed(throwable)
+            ProtectionCheck.Failed(throwable)
         }
     }
 }

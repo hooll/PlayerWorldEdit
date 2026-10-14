@@ -1,8 +1,8 @@
 package cn.stingcraft.plugin.manager
 
 import cn.stingcraft.plugin.PlayerWorldEdit
-import cn.stingcraft.plugin.hook.DominionCheck
-import cn.stingcraft.plugin.hook.DominionHook
+import cn.stingcraft.plugin.hook.ProtectionCheck
+import cn.stingcraft.plugin.hook.ProtectionHooks
 import cn.stingcraft.plugin.until.AreaDisplay
 import cn.stingcraft.plugin.until.EditBudget
 import cn.stingcraft.plugin.until.RegionSlice
@@ -2090,22 +2090,31 @@ class WorldEditManager {
     }
 
     /**
-     * 领地校验 (fail-closed), 通过返回 true
+     * 领地保护校验 (fail-closed), 通过返回 true
      *
-     * 抽出来是因为有两个调用方: 选区操作拿 pos1/pos2 去查, 而圆柱**没有选区**, 只能拿它的
-     * 外接长方体去查 —— 但"拒绝 / 无法确认"的处理必须一模一样, 不能各写一份。
+     * 这里是全部"写方块 / 读选区"操作的**唯一收口**: 装了哪几层保护 (Dominion / Residence /
+     * WorldGuard) 交给 [ProtectionHooks] 逐个问, 任何一层拒绝、或任何一层无法确认都拒绝。
+     *
+     * 抽成一处的理由没变: 选区操作拿 pos1/pos2 去查, 而圆柱**没有选区**, 只能拿它的外接长方体
+     * 去查 —— 但"拒绝 / 无法确认"的处理必须一模一样, 不能各写一份。
      */
     private fun checkDominion(player: Player, corner1: Location, corner2: Location, needBreak: Boolean): Boolean {
-        return when (val check = DominionHook.checkAreaEdit(player, corner1, corner2, needBreak)) {
-            is DominionCheck.Allowed -> true
-            is DominionCheck.Denied -> {
-                player.sendLang("message-dominion-denied", pluginId to "pluginId", check.dominion to "dominion")
+        return when (val check = ProtectionHooks.checkAreaEdit(player, corner1, corner2, needBreak)) {
+            is ProtectionCheck.Allowed -> true
+            is ProtectionCheck.Denied -> {
+                // 提示里带上是谁拦的 (source) 与它的原因 (detail): 三个钩子共用这一条消息
+                player.sendLang(
+                    "message-protection-denied",
+                    pluginId to "pluginId",
+                    check.source to "source",
+                    check.detail to "detail"
+                )
                 false
             }
-            is DominionCheck.Failed -> {
+            is ProtectionCheck.Failed -> {
                 // 校验过程出错 = 无法确认有没有领地, 按 fail-closed 拒绝
                 // (具体异常已经打进控制台, 这里只告诉玩家操作被拒)
-                player.sendLang("message-dominion-check-failed", pluginId to "pluginId")
+                player.sendLang("message-protection-check-failed", pluginId to "pluginId")
                 false
             }
         }

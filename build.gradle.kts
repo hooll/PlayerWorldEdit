@@ -52,6 +52,11 @@ taboolib {
         dependencies {
             name("WorldEdit")
             name("Dominion").optional(true)
+            // Residence / WorldGuard 的领地保护钩子: 都按"没装就静默跳过"处理, 所以是 softdepend
+            // (softdepend 同时让它们的类在运行期能被本插件的类加载器看到 —— Residence 钩子是反射,
+            //  WorldGuard 钩子是 compileOnly 直接调用, 两种都需要这一条)
+            name("Residence").optional(true)
+            name("WorldGuard").optional(true)
         }
     }
     version { taboolib = "6.3.0-0e3a911" }
