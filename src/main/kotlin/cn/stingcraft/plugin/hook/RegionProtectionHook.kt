@@ -57,12 +57,15 @@ interface RegionProtectionHook {
 private const val PROBE_STEP = 16
 
 /**
- * "按点查询"型钩子 (Residence / WorldGuard) 的采样点
+ * "按点查询"型钩子的采样点 (目前只有 [ResidenceHook] 用)
  *
- * 这两个插件的公开查询入口都是"给我一个坐标", 没有 Dominion 那种"遍历相交领地"的批量入口,
- * 所以只能在外接框里按 [PROBE_STEP] 格取格点 (两端一定取到)。代价说清楚: 比采样间距还小、又
- * 正好落在两个采样点之间的领地可能查不到 —— 要 100% 覆盖只能逐格查, 那是 O(体积) 次查询。
- * 真正安全的做法是像 Dominion 那样遍历相交区域, 见报告里的取舍说明。
+ * Residence 的公开查询入口是"给我一个坐标"(`ResidenceManager.getByLoc`), 没有"遍历相交领地"的
+ * 批量入口, 所以只能在外接框里按 [PROBE_STEP] 格取格点 (两端一定取到)。代价说清楚: 比采样间距
+ * 还小、又正好落在两个采样点之间的领地可能查不到 —— 要 100% 覆盖只能逐格查, 那是 O(体积) 次查询。
+ *
+ * [WorldGuardHook] 曾经也用这套采样, 现在已经换成 WG 的区域相交入口
+ * (`RegionManager.getApplicableRegions(ProtectedRegion)`, 一次调用零盲区); Residence 走反射,
+ * 反射面受限没有等价入口, 所以只有它还在采样。
  */
 internal fun protectionProbePoints(corner1: Location, corner2: Location): List<Location> {
     val world = corner1.world ?: return emptyList()

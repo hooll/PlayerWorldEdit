@@ -1,30 +1,37 @@
 package cn.stingcraft.plugin.hook
 
 import com.sk89q.worldedit.bukkit.BukkitAdapter
+import com.sk89q.worldedit.math.BlockVector3
+import com.sk89q.worldguard.LocalPlayer
 import com.sk89q.worldguard.WorldGuard
 import com.sk89q.worldguard.bukkit.WorldGuardPlugin
+import com.sk89q.worldguard.protection.ApplicableRegionSet
 import com.sk89q.worldguard.protection.flags.Flags
-import com.sk89q.worldguard.protection.regions.RegionQuery
+import com.sk89q.worldguard.protection.flags.StateFlag
+import com.sk89q.worldguard.protection.regions.ProtectedCuboidRegion
 import org.bukkit.Bukkit
 import org.bukkit.Location
 import org.bukkit.entity.Player
 import taboolib.common.platform.function.warning
 
+/** 相交查询用的临时区域 id (只用来做相交判定, 从不注册进 WG; 得是 WG 认的合法 id) */
+private const val PROBE_REGION_ID = "pwe-probe"
+
 /**
  * WorldGuard 的领地保护钩子 (官方 API, 不反射)
  *
  * `worldguard-bukkit` + `worldguard-core` 7.0.14 放在 `libs/` 里 compileOnly; 没装 WG 时整条路径
- * 不会被走到 ([isAvailable] 先挡住)。用 `RegionQuery` 而不是遍历 `RegionManager`: 前者是 WG 官方
- * 推荐的只读查询入口, 线程安全 (WG 7.0.9+ 官方支持 Folia), 而且权限解析 (优先级 / 继承 / 成员)
- * 由 WG 自己做, 我们不去重新实现一遍它的 flag 规则。
+ * 不会被走到 ([isAvailable] 先挡住)。
  *
- * **flag 组合来自 `RegionQuery.testBuild` 的字节码**:
- * `testBuild(loc, player, flag)` = `StateFlag.test(combine(denyToNone(queryState(BUILD)), queryState(flag)))`,
- * 即"BUILD **或** 传入的那个 flag 允许"; 所以:
- * - `needBreak = false` -> `testBuild(..., Flags.BLOCK_PLACE)` = BUILD 或 PLACE
- * - `needBreak = true`  -> 再要求 `testBuild(..., Flags.BLOCK_BREAK)` = BUILD 或 BREAK
- * 两次取与 —— 与 Dominion 钩子的 `PLACE && (!needBreak || BREAK_BLOCK)` 结构逐字对应, 三个钩子
- * 对同一个操作给出的结论因此是一致的。
+ * **一次相交查询覆盖整个选区框** (REV-R8-01 的修法): 按选区对角造一个临时 `ProtectedCuboidRegion`,
+ * 交给 `RegionManager.getApplicableRegions(ProtectedRegion)` —— WG 用区域索引自己做精确相交判定,
+ * 返回所有相交的区域 (含 `__global__`, 见下), 一次调用、零盲区。改之前是每 16 格取一个采样点逐点
+ * 查, 小于采样间距又正好卡在两点之间的区域会被漏放行 —— 对保护插件来说等于保护失效。
+ *
+ * **为什么不用 `RegionQuery`**: 它只有"按点查询"的入口 (`testBuild(Location, ...)`), 要覆盖一个
+ * 盒子就得逐格/逐采样点查; 区域相交的入口只在 `RegionManager` 上。两者最终都落到同一个
+ * `ApplicableRegionSet` + 同一套 flag 解析 (见 [testBuild] 的字节码证据), 所以换成相交查询只改了
+ * "集合里有谁", 没改判定规则。
  */
 object WorldGuardHook : RegionProtectionHook {
 
@@ -38,18 +45,19 @@ object WorldGuardHook : RegionProtectionHook {
         if (!isAvailable()) {
             return ProtectionCheck.Allowed
         }
+        // Location 的 world 在正常调用路径上不会为 null, 拿不到世界就当这层保护管不到
+        val world = corner1.world ?: return ProtectionCheck.Allowed
         return try {
-            val query = WorldGuard.getInstance().platform.regionContainer.createQuery()
+            // 世界没被 WG 管 (未加载 / 未启用该世界): 这个世界里没有任何 WG 领地
+            val regionManager = WorldGuard.getInstance().platform.regionContainer.get(BukkitAdapter.adapt(world))
+                ?: return ProtectionCheck.Allowed
+            val applicable = regionManager.getApplicableRegions(probeRegion(corner1, corner2))
             val local = WorldGuardPlugin.inst().wrapPlayer(player)
-            for (point in protectionProbePoints(corner1, corner2)) {
-                val wePoint = BukkitAdapter.adapt(point)
-                val placeOk = query.testBuild(wePoint, local, Flags.BLOCK_PLACE)
-                val breakOk = !needBreak || query.testBuild(wePoint, local, Flags.BLOCK_BREAK)
-                if (!placeOk || !breakOk) {
-                    return ProtectionCheck.Denied(name, regionNameAt(query, wePoint))
-                }
+            if (testBuild(applicable, local, needBreak)) {
+                ProtectionCheck.Allowed
+            } else {
+                ProtectionCheck.Denied(name, regionNameAt(applicable))
             }
-            ProtectionCheck.Allowed
         } catch (throwable: Throwable) {
             // WG 版本不兼容 (NoSuchMethodError 之类) = 无法确认, 按 fail-closed 拒绝
             warning("[PlayerWorldEdit] WorldGuard 领地校验失败: $throwable")
@@ -57,14 +65,49 @@ object WorldGuardHook : RegionProtectionHook {
         }
     }
 
-    /**
-     * 这一点上优先级最高的区域名, 只用于提示文案
-     *
-     * 只在"已经判定为拒绝"之后才多问一次 —— 允许的路径上一次都不查, 不给正常操作加开销。
-     */
-    private fun regionNameAt(query: RegionQuery, location: com.sk89q.worldedit.util.Location): String {
-        return runCatching {
-            query.getApplicableRegions(location).regions.maxByOrNull { it.priority }?.id
-        }.getOrNull() ?: location.toString()
+    /** 按两个对角点造一个临时区域 (只用于相交查询, 从不注册进 WG) */
+    private fun probeRegion(corner1: Location, corner2: Location): ProtectedCuboidRegion {
+        val min = BlockVector3.at(
+            minOf(corner1.blockX, corner2.blockX),
+            minOf(corner1.blockY, corner2.blockY),
+            minOf(corner1.blockZ, corner2.blockZ)
+        )
+        val max = BlockVector3.at(
+            maxOf(corner1.blockX, corner2.blockX),
+            maxOf(corner1.blockY, corner2.blockY),
+            maxOf(corner1.blockZ, corner2.blockZ)
+        )
+        return ProtectedCuboidRegion(PROBE_REGION_ID, min, max)
     }
+
+    /**
+     * 判定"这个相交区域集允许玩家放置 (需要破坏时再要求破坏) 吗"
+     *
+     * 组合方式与 WG 的 `RegionQuery.testBuild` **逐字相同** —— 7.0.14 的字节码是
+     * `StateFlag.test(StateFlag.combine(StateFlag.denyToNone(queryState(BUILD)), queryState(flag)))`,
+     * 即"BUILD **或** 传入的那个 flag 允许":
+     * - `needBreak = false` -> BUILD 或 PLACE
+     * - `needBreak = true`  -> 再要求 BUILD 或 BREAK, 两次取与
+     *
+     * 结构上与 Dominion 钩子的 `PLACE && (!needBreak || BREAK_BLOCK)` 逐字对应, 三个钩子对同一个
+     * 操作给出的结论因此是一致的。
+     *
+     * **不能用 `ApplicableRegionSet.testState`**: 它的字节码是 `StateFlag.test(queryState(flags))`,
+     * 把传进去的多个 flag 当"与", 而且不含 BUILD —— `testState(player, BUILD, PLACE)` 会变成
+     * "BUILD 且 PLACE", 与 `testBuild` 的"BUILD 或 PLACE"不是一个语义。
+     */
+    private fun testBuild(applicable: ApplicableRegionSet, player: LocalPlayer, needBreak: Boolean): Boolean {
+        val buildState = applicable.queryState(player, Flags.BUILD)
+        val flagState = applicable.queryState(player, if (needBreak) Flags.BLOCK_BREAK else Flags.BLOCK_PLACE)
+        return StateFlag.test(StateFlag.combine(StateFlag.denyToNone(buildState), flagState))
+    }
+
+    /**
+     * 相交区域里优先级最高的那个区域名, 只用于提示文案
+     *
+     * 相交集合里一定含 `__global__` (WG 的 `getApplicableRegions(ProtectedRegion)` 显式把它塞进
+     * 结果集), 所以"只碰了全局区域"时提示里报的就是 `__global__` —— 与按点查询时的提示一致。
+     */
+    private fun regionNameAt(applicable: ApplicableRegionSet): String =
+        applicable.regions.maxByOrNull { it.priority }?.id ?: PROBE_REGION_ID
 }

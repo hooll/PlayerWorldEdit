@@ -20,6 +20,10 @@ import java.util.function.BiConsumer
  * **签名**: 只用 Bukkit 类型 (`Player` / `Location` / `Material` / `Int`) —— WorldEdit 的内部类型
  * (`CuboidRegion` / `BlockState` 等) 一律不出现在对外签名里。
  *
+ * **依赖**: [getSelection] 返回的 `Pair` 是 kotlin-stdlib 的类型, 所以 Java 调用方需要
+ * kotlin-stdlib 在 classpath 上 (绝大多数服务端本来就有; 本插件自身也依赖它)。其余方法只用
+ * JDK 与 Bukkit 的类型。
+ *
  * 写方块的方法都是**异步收尾**的 (大选区要跨很多 tick): 方法返回时操作可能还没写完, 想知道结果
  * 请监听 [cn.stingcraft.plugin.api.event.WorldEditOperationCompleteEvent], 或看 [undo] 的回调。
  */

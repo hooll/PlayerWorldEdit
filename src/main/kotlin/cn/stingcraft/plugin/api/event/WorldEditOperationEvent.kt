@@ -15,7 +15,8 @@ import org.bukkit.event.HandlerList
  *
  * [affectedRegion] 是这次操作**会改动的包围盒** (两个对角方块坐标), 不是精确到方块的集合:
  * 例如 replace 只会改选区里匹配的那些方块, 但包围盒仍是整个选区。需要精确范围请按 [operation]
- * 自行判断。
+ * 自行判断。`Pair` 是 kotlin-stdlib 的类型 (Java 调用方需依赖 kotlin-stdlib, 用 `getFirst()` /
+ * `getSecond()` 取两个角)。
  */
 class WorldEditOperationEvent(
     val player: Player,
