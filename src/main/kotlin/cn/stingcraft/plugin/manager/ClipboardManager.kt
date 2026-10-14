@@ -2,10 +2,10 @@ package cn.stingcraft.plugin.manager
 
 import cn.stingcraft.plugin.PlayerWorldEdit
 import cn.stingcraft.plugin.api.event.OperationType
-import cn.stingcraft.plugin.until.RegionSlice
-import cn.stingcraft.plugin.until.WorldEditTool
-import cn.stingcraft.plugin.until.runOnChunkThreads
-import cn.stingcraft.plugin.until.splitByChunk
+import cn.stingcraft.plugin.util.RegionSlice
+import cn.stingcraft.plugin.util.WorldEditTool
+import cn.stingcraft.plugin.util.runOnChunkThreads
+import cn.stingcraft.plugin.util.splitByChunk
 import com.sk89q.worldedit.bukkit.BukkitAdapter
 import com.sk89q.worldedit.extent.transform.BlockTransformExtent
 import com.sk89q.worldedit.math.BlockVector3
@@ -280,7 +280,7 @@ class ClipboardManager(
         val box = CuboidRegion(BlockVector3.at(min[0], min[1], min[2]), BlockVector3.at(max[0], max[1], max[2]))
         // 领地校验覆盖整份要写的范围 (含空气会清到的那些格子); 粘贴会覆盖已有建筑, 所以按替换操作
         // 要求破坏权限 (needBreak = true)
-        if (!pipeline.checkDominion(player, locationOf(player, min), locationOf(player, max), needBreak = true)) return null
+        if (!pipeline.checkProtection(player, locationOf(player, min), locationOf(player, max), needBreak = true)) return null
         // 计费: 目标框里逐格查剪贴板, 非空气按材料累加 —— 纯算术、不读世界, 且与下面写的是同一份内容
         val charges = LinkedHashMap<Material, Int>()
         for (y in min[1]..max[1]) {

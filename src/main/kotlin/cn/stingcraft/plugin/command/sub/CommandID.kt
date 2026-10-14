@@ -1,6 +1,6 @@
 package cn.stingcraft.plugin.command.sub
 
-import cn.stingcraft.plugin.until.displayName
+import cn.stingcraft.plugin.util.displayName
 import org.bukkit.entity.Player
 import taboolib.common.platform.command.CommandContext
 import taboolib.common.platform.command.subCommand

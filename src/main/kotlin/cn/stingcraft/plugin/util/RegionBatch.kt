@@ -1,4 +1,4 @@
-package cn.stingcraft.plugin.until
+package cn.stingcraft.plugin.util
 
 import com.sk89q.worldedit.math.BlockVector3
 import com.sk89q.worldedit.regions.CuboidRegion

@@ -2,12 +2,12 @@ package cn.stingcraft.plugin.manager
 
 import cn.stingcraft.plugin.PlayerWorldEdit
 import cn.stingcraft.plugin.api.event.OperationType
-import cn.stingcraft.plugin.until.EditBudget
-import cn.stingcraft.plugin.until.RegionSlice
-import cn.stingcraft.plugin.until.WorldEditTool
-import cn.stingcraft.plugin.until.displayName
-import cn.stingcraft.plugin.until.runOnChunkThreads
-import cn.stingcraft.plugin.until.splitByChunk
+import cn.stingcraft.plugin.util.EditBudget
+import cn.stingcraft.plugin.util.RegionSlice
+import cn.stingcraft.plugin.util.WorldEditTool
+import cn.stingcraft.plugin.util.displayName
+import cn.stingcraft.plugin.util.runOnChunkThreads
+import cn.stingcraft.plugin.util.splitByChunk
 import com.sk89q.worldedit.bukkit.BukkitAdapter
 import com.sk89q.worldedit.math.BlockVector3
 import com.sk89q.worldedit.regions.CuboidRegion
@@ -136,13 +136,9 @@ class ShapeManager(
         val centerZ = location.blockZ
         val baseY = location.blockY.coerceIn(weWorld.minY, weWorld.maxY)
         // 顶面按**夹取后**的底面算 (WE 的语义): 站在世界最低高度以下时底面先往上贴, 高度不会被
-        // 凭空吃掉几层; 反过来贴完仍然一层都放不下 (站在世界顶) 才交给下面的守卫兜底
+        // 凭空吃掉几层。baseY 已经夹在 [minY, maxY] 内、height 又 >= 1 (见 validateShapeSize),
+        // 所以 topY 恒 >= baseY —— 原来那条 "baseY > topY 就返回" 的守卫不可达, 第 9 轮删掉
         val topY = (baseY + height - 1).coerceAtMost(weWorld.maxY)
-        if (baseY > topY) {
-            // 夹取后一层都不剩: 直接提示返回, 别留下一条 0 材料的撤销记录
-            player.sendLang("message-shape-none", pluginId to "pluginId")
-            return
-        }
         val world = player.world
         // X/Z 世界边界夹取 (REV-06): 夹掉的部分不写也不计费, 夹取后照常执行 (与 move 的整体拒绝
         // 相反)。形状仍由**未夹取**的外接框定义 —— ShapeVolume 的圆心是从框推出来的, 把框夹小会把
@@ -161,7 +157,7 @@ class ShapeManager(
             BlockVector3.at(boxMax[0], boxMax[1], boxMax[2])
         )
         // 领地校验按**实际会写到的范围** (夹取之后) 查, 而不是形状的外接框
-        if (!pipeline.checkDominion(
+        if (!pipeline.checkProtection(
                 player,
                 locationOf(player, writeMin),
                 locationOf(player, writeMax),
@@ -413,7 +409,7 @@ class ShapeManager(
         // 老选区), 收缩清掉的是被砍掉的层 (老选区 ⊇ 新选区), 取并集两条路都不会漏。fail-closed。
         val checkMin = IntArray(3) { minOf(min[it], moved.first[it], moved.second[it]) }
         val checkMax = IntArray(3) { maxOf(max[it], moved.first[it], moved.second[it]) }
-        if (!pipeline.checkDominion(player, locationOf(player, checkMin), locationOf(player, checkMax), needBreak = false)) {
+        if (!pipeline.checkProtection(player, locationOf(player, checkMin), locationOf(player, checkMax), needBreak = false)) {
             return
         }
         if (expand) expandSelection(player, moved, axis, positive, min, max)
@@ -677,7 +673,7 @@ class ShapeManager(
         // 替换操作要求破坏权限, 与 replace/paste 同类)。fail-closed。
         val checkMin = intArrayOf(minOf(min[0], targetMin[0]), minOf(min[1], targetMin[1]), minOf(min[2], targetMin[2]))
         val checkMax = intArrayOf(maxOf(max[0], targetMax[0]), maxOf(max[1], targetMax[1]), maxOf(max[2], targetMax[2]))
-        if (!pipeline.checkDominion(player, locationOf(player, checkMin), locationOf(player, checkMax), needBreak = true)) return
+        if (!pipeline.checkProtection(player, locationOf(player, checkMin), locationOf(player, checkMax), needBreak = true)) return
         // 源 ∪ 目标的并集: 既是领地校验的框, 也是操作前事件报的范围、第二轮要写的范围 —— 一处算好
         val union = CuboidRegion(
             BlockVector3.at(checkMin[0], checkMin[1], checkMin[2]),

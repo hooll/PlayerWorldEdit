@@ -1,9 +1,9 @@
 package cn.stingcraft.plugin.manager
 
 import cn.stingcraft.plugin.PlayerWorldEdit
-import cn.stingcraft.plugin.until.AreaDisplay
-import cn.stingcraft.plugin.until.markAsTool
-import cn.stingcraft.plugin.until.parseBlockOrNull
+import cn.stingcraft.plugin.util.AreaDisplay
+import cn.stingcraft.plugin.util.markAsTool
+import cn.stingcraft.plugin.util.parseBlockOrNull
 import com.sk89q.worldedit.bukkit.BukkitAdapter
 import com.sk89q.worldedit.math.BlockVector3
 import com.sk89q.worldedit.regions.CuboidRegion

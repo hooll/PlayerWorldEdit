@@ -2,12 +2,12 @@ package cn.stingcraft.plugin.manager
 
 import cn.stingcraft.plugin.PlayerWorldEdit
 import cn.stingcraft.plugin.api.event.OperationType
-import cn.stingcraft.plugin.until.EditBudget
-import cn.stingcraft.plugin.until.WorldEditTool
-import cn.stingcraft.plugin.until.displayName
-import cn.stingcraft.plugin.until.runOnChunkThreads
-import cn.stingcraft.plugin.until.runOnOwnThread
-import cn.stingcraft.plugin.until.splitByChunk
+import cn.stingcraft.plugin.util.EditBudget
+import cn.stingcraft.plugin.util.WorldEditTool
+import cn.stingcraft.plugin.util.displayName
+import cn.stingcraft.plugin.util.runOnChunkThreads
+import cn.stingcraft.plugin.util.runOnOwnThread
+import cn.stingcraft.plugin.util.splitByChunk
 import com.sk89q.worldedit.world.block.BlockState
 import org.bukkit.Bukkit
 import org.bukkit.Location
@@ -340,7 +340,7 @@ class WorldEditManager {
     /**
      * 刷新选区可视化
      *
-     * 默认用半透明玻璃盒子 (见 [cn.stingcraft.plugin.until.AreaDisplay]), 关掉 `region-display` 或
+     * 默认用半透明玻璃盒子 (见 [cn.stingcraft.plugin.util.AreaDisplay]), 关掉 `region-display` 或
      * 盒子建不出来时退回粒子边框。
      *
      * @param player 玩家

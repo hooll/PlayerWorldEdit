@@ -1,4 +1,4 @@
-package cn.stingcraft.plugin.until
+package cn.stingcraft.plugin.util
 
 import org.bukkit.Material
 import org.bukkit.NamespacedKey

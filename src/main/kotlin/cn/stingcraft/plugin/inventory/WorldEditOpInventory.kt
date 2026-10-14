@@ -1,7 +1,7 @@
 package cn.stingcraft.plugin.inventory
 
 import cn.stingcraft.plugin.PlayerWorldEdit
-import cn.stingcraft.plugin.until.displayName
+import cn.stingcraft.plugin.util.displayName
 import org.bukkit.Material
 import org.bukkit.entity.Player
 import org.bukkit.inventory.Inventory

@@ -3,7 +3,7 @@ package cn.stingcraft.plugin
 import cn.stingcraft.plugin.manager.SettingManager
 import cn.stingcraft.plugin.manager.MaterialPackManager
 import cn.stingcraft.plugin.manager.WorldEditManager
-import cn.stingcraft.plugin.until.cancelWatchdogs
+import cn.stingcraft.plugin.util.cancelWatchdogs
 import com.google.gson.GsonBuilder
 import taboolib.common.platform.Plugin
 import taboolib.common.platform.function.info

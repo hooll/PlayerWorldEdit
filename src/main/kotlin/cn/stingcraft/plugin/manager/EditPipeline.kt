@@ -6,12 +6,12 @@ import cn.stingcraft.plugin.api.event.WorldEditOperationCompleteEvent
 import cn.stingcraft.plugin.api.event.WorldEditOperationEvent
 import cn.stingcraft.plugin.hook.ProtectionCheck
 import cn.stingcraft.plugin.hook.ProtectionHooks
-import cn.stingcraft.plugin.until.EditBudget
-import cn.stingcraft.plugin.until.RegionSlice
-import cn.stingcraft.plugin.until.WorldEditTool
-import cn.stingcraft.plugin.until.displayName
-import cn.stingcraft.plugin.until.runOnChunkThreads
-import cn.stingcraft.plugin.until.runOnOwnThread
+import cn.stingcraft.plugin.util.EditBudget
+import cn.stingcraft.plugin.util.RegionSlice
+import cn.stingcraft.plugin.util.WorldEditTool
+import cn.stingcraft.plugin.util.displayName
+import cn.stingcraft.plugin.util.runOnChunkThreads
+import cn.stingcraft.plugin.util.runOnOwnThread
 import com.sk89q.worldedit.bukkit.BukkitAdapter
 import com.sk89q.worldedit.extension.platform.Actor
 import com.sk89q.worldedit.regions.CuboidRegion
@@ -234,7 +234,7 @@ class EditPipeline(private val selection: SelectionManager) {
         val region = selection.selectionRegion(player) ?: return null
         val pos1 = selection.getPlayerPos1(player) ?: return null
         val pos2 = selection.getPlayerPos2(player) ?: return null
-        if (!checkDominion(player, pos1, pos2, needBreak)) return null
+        if (!checkProtection(player, pos1, pos2, needBreak)) return null
         return region
     }
 
@@ -247,7 +247,7 @@ class EditPipeline(private val selection: SelectionManager) {
      * 抽成一处的理由没变: 选区操作拿 pos1/pos2 去查, 而圆柱**没有选区**, 只能拿它的外接长方体
      * 去查 —— 但"拒绝 / 无法确认"的处理必须一模一样, 不能各写一份。
      */
-    internal fun checkDominion(player: Player, corner1: Location, corner2: Location, needBreak: Boolean): Boolean {
+    internal fun checkProtection(player: Player, corner1: Location, corner2: Location, needBreak: Boolean): Boolean {
         return when (val check = ProtectionHooks.checkAreaEdit(player, corner1, corner2, needBreak)) {
             is ProtectionCheck.Allowed -> true
             is ProtectionCheck.Denied -> {

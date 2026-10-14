@@ -66,8 +66,6 @@ message-id-insert: "&7[点击复制]"
 message-undo-none: '&8[&3&l{pluginId}&8] &7没有可以撤销的操作'
 message-undo-susses: '&8[&3&l{pluginId}&8] &7已撤销 {times} 次操作, 材料已返还'
 message-undo-timeout: '&8[&3&l{pluginId}&8] &7已撤销 {times} 次操作, 但有一次还原超时未完成 (已放回, 可重试)'
-message-dominion-denied: '&8[&3&l{pluginId}&8] &7选区包含领地 &f{dominion}&7, 你在此没有编辑权限'
-message-dominion-check-failed: '&8[&3&l{pluginId}&8] &7领地校验失败, 本次操作已被拒绝 (请联系管理员查看控制台)'
 # 上面两条是"只有 Dominion 一层保护"时代的旧键, 保留兼容; 现在三个钩子共用下面两条 (带钩子名)
 message-protection-denied: '&8[&3&l{pluginId}&8] &7选区包含了 &f{source} &7的区域 &f{detail}&7, 你在此没有编辑权限'
 message-protection-check-failed: '&8[&3&l{pluginId}&8] &7领地校验失败, 本次操作已被拒绝 (请联系管理员查看控制台)'

@@ -1,7 +1,7 @@
 package cn.stingcraft.plugin.command.sub
 
 import cn.stingcraft.plugin.PlayerWorldEdit
-import cn.stingcraft.plugin.until.parseBlockOrNull
+import cn.stingcraft.plugin.util.parseBlockOrNull
 import org.bukkit.Material
 import org.bukkit.entity.Player
 import taboolib.common.platform.command.CommandContext

@@ -1,4 +1,4 @@
-package cn.stingcraft.plugin.until
+package cn.stingcraft.plugin.util
 
 import taboolib.common.platform.function.submit
 import java.util.concurrent.atomic.AtomicInteger
