@@ -189,6 +189,19 @@ object WorldEditOpInventory {
                 player.closeInventory()
                 worldEditManager.tryPaste(player)
             }
+            // 镜像: 与旋转同一类"只改剪贴板"的变换, 所以排在粘贴右边 (38/40/42 是复制/旋转/粘贴,
+            // 不动)。这里只给一个按钮 = 按玩家朝向镜像 (与 WE 的 //flip 默认一致); 上下镜像等
+            // 需要指定方向的情况走命令, 不为一个按钮再加一层方向选择界面。
+            set(44, buildItem(XMaterial.SHIELD) {
+                name = "&f| 镜像剪贴板"
+                lore += "&7| 沿你面朝的方向镜像 (左右或前后)"
+                lore += "&7| 方块朝向会一起镜像"
+                lore += "&7| 要上下镜像用命令: &f/pwe flip u"
+                colored()
+            }) {
+                player.closeInventory()
+                worldEditManager.flipClipboard(player, "me")
+            }
         }
     }
 

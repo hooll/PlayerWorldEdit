@@ -1212,6 +1212,50 @@ class WorldEditManager {
     }
 
     /**
+     * 沿某个方向镜像剪贴板 (对齐 WE 的 `//flip`)
+     *
+     * 与 [rotateClipboard] 完全同一条通道 ([ClipboardVolume.transformed]): 只换内存里的那一份,
+     * 不写方块、不扣料、不记撤销。方向语义与 WE 一致 —— 镜像平面**垂直于**该方向, 所以
+     * e/w 镜像 X、n/s 镜像 Z、u/d 镜像 Y; `me` 取玩家的**水平**朝向 (抬头低头不影响结果, 与 WE
+     * 的 `@Direction` 默认方向一致)。
+     */
+    fun flipClipboard(player: Player, direction: String) {
+        val axis = when (direction.lowercase()) {
+            "n", "s" -> AXIS_Z
+            "e", "w" -> AXIS_X
+            "u", "d" -> AXIS_Y
+            "me", "" -> {
+                // 只看水平分量: 视线朝东西镜像 X、朝南北镜像 Z (平局取 X, 与 snapAxis 同一套取法)
+                val look = player.eyeLocation.direction
+                if (abs(look.x) >= abs(look.z)) AXIS_X else AXIS_Z
+            }
+            else -> {
+                player.sendLang(
+                    "message-flip-invalid-direction",
+                    pluginId to "pluginId",
+                    FLIP_DIRECTIONS.joinToString("/") to "directions"
+                )
+                return
+            }
+        }
+        val clipboard = clipboards[player.uniqueId] ?: run {
+            player.sendLang("message-clipboard-empty", pluginId to "pluginId")
+            return
+        }
+        if (!beginEdit(player)) return
+        // 与 rotate 一样换一份新对象进表: 并发读的一方要么看到镜像前、要么看到镜像后
+        clipboards[player.uniqueId] = clipboard.flipped(axis)
+        endEdit(player)
+        // 报轴名而不是回显输入: me 没有可回显的字面量, 而"沿哪一轴镜像"正是玩家想确认的
+        val axisName = when (axis) {
+            AXIS_X -> "X"
+            AXIS_Y -> "Y"
+            else -> "Z"
+        }
+        player.sendLang("message-flip-susses", pluginId to "pluginId", axisName to "axis")
+    }
+
+    /**
      * 把剪贴板贴到玩家所在的位置 (对齐 WE 的 `//paste`)
      *
      * 锚点: WE 的 `getPlacementPosition` 对玩家就是"玩家脚下那一格", 剪贴板**原点**落到这里 ——
@@ -1300,6 +1344,13 @@ class WorldEditManager {
     fun rotateAngles(): List<Int> = ROTATE_ANGLES
 
     /**
+     * `/pwe flip` 的合法方向
+     *
+     * 命令补全与"方向非法"的提示共用这一份, 免得补全能给的选项和真能解析的选项对不上。
+     */
+    fun flipDirections(): List<String> = FLIP_DIRECTIONS
+
+    /**
      * 一次 copy 的结果: 剪贴板原点 + 相对原点的偏移框 + 逐格方块状态
      *
      * 原点 = 复制时玩家所在的那一格 (WE 的 clipboard origin 语义): [rotated] 绕它转, 粘贴时把它
@@ -1345,18 +1396,20 @@ class WorldEditManager {
         fun isComplete(): Boolean = states.none { it == null }
 
         /**
-         * 绕 Y 轴旋转 [degrees] 度 (只允许 90 的整数倍), 返回一份**新**剪贴板 (原点不动)
+         * 把整份剪贴板按 [transform] 变换 (旋转 / 镜像共用这一条通道), 返回一份**新**剪贴板 (原点不动)
          *
-         * 方块状态用 WE 自己的 [BlockTransformExtent.transform]: 它会按属性逐个旋转 ——
+         * 方块状态用 WE 自己的 [BlockTransformExtent.transform]: 它会按属性逐个变换 ——
          * facing 这类 [com.sk89q.worldedit.registry.state.DirectionalProperty] 走
          * `Direction.findClosest(transform.apply(direction.toVector()))`, axis / half / shape /
-         * orientation / rotation 也各有处理, 所以楼梯、门、告示牌转完朝向跟着转。偏移用同一个
-         * [AffineTransform.rotateY] 变换 —— 与 WE 的 `ClipboardHolder.transform` 是同一套做法。
+         * orientation / rotation 也各有处理 (楼梯的 `type` left/right 只在 `isHorizontalFlip()`
+         * 时互换, 见报告里任务 15 留的字节码证据), 所以楼梯、门、告示牌变换后朝向跟着变。
+         * 偏移用**同一个** transform —— 与 WE 的 `ClipboardHolder.transform` 是同一套做法, 双格
+         * 方块 (门/床) 的两半因此仍然配对。原点不动, 所以 rotate/flip 之后 paste 的锚点语义不变。
+         *
+         * 90 的整数倍旋转与 ±1 镜像的系数精确为 0/±1 (实测), 所以整数偏移变换后还是整数。
          */
-        fun rotated(degrees: Int): ClipboardVolume {
-            // 90 的整数倍下 rotateY 的系数精确为 0/±1 (实测), 所以整数偏移转出来还是整数
-            val transform = AffineTransform().rotateY(degrees.toDouble())
-            // 先转 8 个角求出新的偏移框: 旋转后的框要用新下标, 得先知道边界再逐格搬
+        fun transformed(transform: Transform): ClipboardVolume {
+            // 先变换 8 个角求出新的偏移框: 变换后的框要用新下标, 得先知道边界再逐格搬
             var newMinX = Int.MAX_VALUE
             var newMaxX = Int.MIN_VALUE
             var newMinY = Int.MAX_VALUE
@@ -1376,7 +1429,7 @@ class WorldEditManager {
                     }
                 }
             }
-            val rotated = ClipboardVolume(
+            val result = ClipboardVolume(
                 originX, originY, originZ,
                 newMinX, newMinY, newMinZ, newMaxX, newMaxY, newMaxZ,
                 arrayOfNulls(sizeOf(newMinX, newMaxX, newMinY, newMaxY, newMinZ, newMaxZ))
@@ -1386,12 +1439,31 @@ class WorldEditManager {
                     for (dx in minX..maxX) {
                         val state = states[indexOf(dx, dy, dz)] ?: continue
                         val target = transformedOffset(transform, dx, dy, dz)
-                        rotated.put(target[0], target[1], target[2], BlockTransformExtent.transform(state, transform))
+                        result.put(target[0], target[1], target[2], BlockTransformExtent.transform(state, transform))
                     }
                 }
             }
-            return rotated
+            return result
         }
+
+        /** 绕 Y 轴旋转 [degrees] 度 (只允许 90 的整数倍) */
+        fun rotated(degrees: Int): ClipboardVolume =
+            transformed(AffineTransform().rotateY(degrees.toDouble()))
+
+        /**
+         * 沿 [axis] 镜像 (对齐 WE 的 `//flip`)
+         *
+         * WE 的 `//flip` 是 `AffineTransform().scale(|方向| * -2 + 1)` (javap 字节码, 见报告):
+         * 对 6 个轴向来说就是下面三个缩放向量之一。因为取的是绝对值, 正负方向结果相同, 所以这里
+         * 只按轴取 —— 也正因为镜像平面垂直于该轴, 楼梯的 `type` 会在水平镜像下互换 (WE 的行为)。
+         */
+        fun flipped(axis: Int): ClipboardVolume = transformed(
+            when (axis) {
+                AXIS_X -> AffineTransform().scale(-1.0, 1.0, 1.0)
+                AXIS_Y -> AffineTransform().scale(1.0, -1.0, 1.0)
+                else -> AffineTransform().scale(1.0, 1.0, -1.0)
+            }
+        )
 
         /** 相对偏移写一格 (copy 与 rotate 共用; 下标一定在框内) */
         private fun put(dx: Int, dy: Int, dz: Int, state: BlockState) {
@@ -1844,6 +1916,15 @@ class WorldEditManager {
          * 时也只能把朝向吸附到最接近的那个值, 与其做一件做不到位的事, 不如直接拒绝。
          */
         val ROTATE_ANGLES = listOf(90, 180, 270)
+
+        /**
+         * `/pwe flip` 的合法方向
+         *
+         * `me` = 按玩家水平朝向 (WE 的 `//flip` 不传方向时也是取玩家朝向); n/s 镜像 Z、e/w 镜像 X、
+         * u/d 镜像 Y —— 镜像平面垂直于该方向。只收 6 个轴向: WE 的 `//flip` 允许任意方向向量,
+         * 但斜向会同时镜像两轴, 那种结果对玩家没有意义。
+         */
+        val FLIP_DIRECTIONS = listOf("me", "n", "s", "e", "w", "u", "d")
 
         /** 轴索引 (与 [snapAxis] 的 0=X, 1=Y, 2=Z 顺序一致) —— 6 个面里只有 Y 需要世界高度夹取 */
         const val AXIS_X = 0
