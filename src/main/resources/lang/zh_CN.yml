@@ -83,7 +83,7 @@ message-move-empty: '&8[&3&l{pluginId}&8] &7选区里没有可以搬动的方块
 message-move-out-of-bounds: '&8[&3&l{pluginId}&8] &7目标位置超出世界高度或边界, 这次平移已取消 (一个方块都没动)'
 message-selection-expand-empty: '&8[&3&l{pluginId}&8] &7这一面最外层没有方块可以复制'
 message-selection-contract-limit: '&8[&3&l{pluginId}&8] &7该方向只剩 &f{extent} &7格, 不能再收缩了'
-message-selection-expand-limit: '&8[&3&l{pluginId}&8] &7受世界高度限制, 最多只能扩展到 &f{y} &7这一层'
+message-selection-expand-limit: '&8[&3&l{pluginId}&8] &7这一面已经到世界边界了, &f{axis} &7方向最多只能到 &f{pos}'
 message-wall-susses: '&8[&3&l{pluginId}&8] &7墙生成成功！'
 message-cyl-susses: '&8[&3&l{pluginId}&8] &7实心圆柱生成成功！'
 message-hcyl-susses: '&8[&3&l{pluginId}&8] &7空心圆柱生成成功！'

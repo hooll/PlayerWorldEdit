@@ -533,14 +533,27 @@ class WorldEditManager {
             return
         }
         val world = player.world
+        // X/Z 世界边界夹取 (REV-06): 夹掉的部分不写也不计费, 夹取后照常执行 (与 move 的整体拒绝
+        // 相反)。形状仍由**未夹取**的外接框定义 —— ShapeVolume 的圆心是从框推出来的, 把框夹小会把
+        // 圆柱挪位, 所以"形状定义框"和"实际写入范围"分开传给 generateShape。
+        val boxMin = intArrayOf(centerX - radius, baseY, centerZ - radius)
+        val boxMax = intArrayOf(centerX + radius, topY, centerZ + radius)
+        val writeMin = boxMin.copyOf()
+        val writeMax = boxMax.copyOf()
+        if (!clampXZToBorder(world, writeMin, writeMax)) {
+            // 整个外接框都在世界边界之外: 没有可放的位置
+            player.sendLang("message-shape-none", pluginId to "pluginId")
+            return
+        }
         val box = CuboidRegion(
-            BlockVector3.at(centerX - radius, baseY, centerZ - radius),
-            BlockVector3.at(centerX + radius, topY, centerZ + radius)
+            BlockVector3.at(boxMin[0], boxMin[1], boxMin[2]),
+            BlockVector3.at(boxMax[0], boxMax[1], boxMax[2])
         )
+        // 领地校验按**实际会写到的范围** (夹取之后) 查, 而不是形状的外接框
         if (!checkDominion(
                 player,
-                Location(world, (centerX - radius).toDouble(), baseY.toDouble(), (centerZ - radius).toDouble()),
-                Location(world, (centerX + radius).toDouble(), topY.toDouble(), (centerZ + radius).toDouble()),
+                locationOf(player, writeMin),
+                locationOf(player, writeMax),
                 needBreak = false
             )
         ) {
@@ -552,7 +565,11 @@ class WorldEditManager {
             material,
             box,
             radius,
-            successKey
+            successKey,
+            writeBox = CuboidRegion(
+                BlockVector3.at(writeMin[0], writeMin[1], writeMin[2]),
+                BlockVector3.at(writeMax[0], writeMax[1], writeMax[2])
+            )
         )
     }
 
@@ -583,7 +600,10 @@ class WorldEditManager {
         material: Material,
         box: CuboidRegion,
         radius: Int,
-        successKey: String
+        successKey: String,
+        // 实际要写的范围 (世界边界夹取之后)。形状仍由 [box] 定义 —— ShapeVolume 的圆心是从 [box]
+        // 推出来的, 直接把它夹小会把圆柱挪位, 所以两者分开。墙没有夹取, 用默认值即可。
+        writeBox: CuboidRegion = box
     ) {
         val blockType = resolveBlockType(material) ?: run {
             player.sendLang("message-invalid-material", pluginId to "pluginId", material.name to "material")
@@ -599,7 +619,7 @@ class WorldEditManager {
             min.z(), max.z(),
             radius
         )
-        val regions = box.splitByChunk()
+        val regions = writeBox.splitByChunk()
         // 计费: 每个区块各数自己那一块里的形状方块, 加总就是总量。失败退费按区块退, 口径一致。
         // 这里数的是"列 × 层", 与下面 work 里逐块判定的结果严格相等 (见 ShapeVolume.countIn)
         val costs = regions.map { chunk ->
@@ -822,29 +842,35 @@ class WorldEditManager {
         }
         val before = target[axis]
         val after = before + if (positive) steps else -steps
-        // 世界高度夹取 (只做 Y): 越界的选区点会让框画到世界外, 而且之后复制是按层数算的 —— 界外
-        // 那一层根本放不上, 等于白算。被世界高度吃掉的那几格就丢掉, 但夹取后的结果照旧应用
-        // (不整体放弃), 只额外提示一句, 免得玩家以为命令没生效。
-        // X/Z 不做边界处理 (那是另一个已知限制 REV-06, 不在本次范围)。
-        val clamped = if (axis == AXIS_Y) {
-            // 绕 WorldEdit 取边界: 编译期用的精简 API 里 org.bukkit.World 没有 getMinHeight()/
-            // getMaxHeight(); BukkitWorld.getMinY()/getMaxY() 的实现正好就是
-            // world.getMinHeight() 和 world.getMaxHeight() - 1 (上界即最高可放置层)
-            val weWorld = BukkitAdapter.adapt(player.world)
-            after.coerceIn(weWorld.minY, weWorld.maxY)
-        } else {
-            after
-        }
-        if (clamped == before) {
-            // 这一面已经顶在世界边界上, 一格都推不动: 只提示, 不写方块也不动选区
-            player.sendLang("message-selection-expand-limit", pluginId to "pluginId", clamped to "y")
+        // 世界边界夹取: Y 用世界高度 (BukkitWorld.getMinY()/getMaxY() 就是 world.getMinHeight() /
+        // world.getMaxHeight() - 1), X/Z 用世界边界 (REV-06)。越界的选区点会让框画到世界外, 而且
+        // 之后复制是按层数算的 —— 界外那一层根本放不上, 等于白算。被吃掉的那几格就丢掉, 但夹取后
+        // 的结果照旧应用 (不整体放弃), 只额外提示一句, 免得玩家以为命令没生效。
+        val clamped = clampAxis(player.world, axis, after)
+        // 夹完必须真的朝那一面移动了才算扩展: 顶在边界上, 或者选区本来就在界外 (夹取结果反向) 都算
+        // "到边界了" —— 只提示, 不写方块也不动选区
+        if (if (positive) clamped <= before else clamped >= before) {
+            sendExpandLimit(player, axis, clamped)
             return null
         }
         target[axis] = clamped
-        if (clamped != after) {
-            player.sendLang("message-selection-expand-limit", pluginId to "pluginId", clamped to "y")
-        }
+        if (clamped != after) sendExpandLimit(player, axis, clamped)
         return MovedFace(newFirst, newSecond)
+    }
+
+    /**
+     * 扩展被世界边界挡住时的提示 (推不动 / 只推动了一部分, 两处共用)
+     *
+     * 文案要中性: 挡住的可能是上下, 也可能是东西南北 —— REV-06 之前只做 Y 夹取, 文案里写死了
+     * "世界高度…这一层", X/Z 夹取上线后就对不上了 (LW-R3-01)。
+     */
+    private fun sendExpandLimit(player: Player, axis: Int, pos: Int) {
+        player.sendLang(
+            "message-selection-expand-limit",
+            pluginId to "pluginId",
+            axisName(axis) to "axis",
+            pos to "pos"
+        )
     }
 
     /**
@@ -869,13 +895,23 @@ class WorldEditManager {
         val targetCoord =
             if (positive) maxOf(moved.first[axis], moved.second[axis]) else minOf(moved.first[axis], moved.second[axis])
         val layers = abs(targetCoord - sourceCoord)
+        // 要写的窗口 = 老选区的平面范围 ∩ 世界边界 (X/Z, REV-06)。界外的格子写不了, 所以不读也不
+        // 计费 —— 计费按"源层这个窗口里的材料 × 层数"算, 天然就是夹取后的实际交集 (9C 红线:
+        // 计费 = 真正会写的方块)。选区本身不动: 夹取只影响这次读什么、写什么、扣什么。
+        val writeMin = intArrayOf(min[0], min[1], min[2])
+        val writeMax = intArrayOf(max[0], max[1], max[2])
+        if (!clampXZToBorder(world, writeMin, writeMax)) {
+            // 整块都在世界边界之外: 没有可写的位置, 一个方块都不读不写
+            player.sendLang("message-shape-none", pluginId to "pluginId")
+            return
+        }
         if (!beginEdit(player)) return
         EditBudget.configure(blocksPerTick())
         // 源层沿 [axis] 平移复制, 平面内两个坐标原样对应, 所以把源层压成一维数组存起来最省事
-        val plane = PlaneIndex(axis, min, max)
+        val plane = PlaneIndex(axis, writeMin, writeMax)
         val source = arrayOfNulls<BlockState>(plane.size)
         runOnChunkThreads(
-            slabRegion(axis, sourceCoord, sourceCoord, min, max).splitByChunk(),
+            slabRegion(axis, sourceCoord, sourceCoord, writeMin, writeMax).splitByChunk(),
             world,
             work = { _, slice ->
                 val weWorld = BukkitAdapter.adapt(world)
@@ -909,7 +945,7 @@ class WorldEditManager {
                     prepareEdit(needed.values.sum(), player)
                     val actor = actorOf(player)
                     val targetChunks =
-                        slabRegion(axis, sourceCoord + if (positive) 1 else -1, targetCoord, min, max).splitByChunk()
+                        slabRegion(axis, sourceCoord + if (positive) 1 else -1, targetCoord, writeMin, writeMax).splitByChunk()
                     // 每个区块实际写下去多少 (按材料记), 收尾时当成本表用
                     val written = AtomicReferenceArray<HashMap<Material, Int>?>(targetChunks.size)
                     writeChunks(
@@ -1135,6 +1171,46 @@ class WorldEditManager {
             ceil(center.z - half - 0.5).toInt(),
             floor(center.z + half - 0.5).toInt()
         )
+    }
+
+    /**
+     * 把某一轴的坐标夹进世界边界 (Y = 世界高度, X/Z = 世界边界); 读不到边界就原样返回
+     *
+     * expand 推选区那一面时用它 —— 夹取后照旧应用 (与 move 的"整体拒绝"正好相反)。
+     */
+    private fun clampAxis(world: World, axis: Int, value: Int): Int {
+        if (axis == AXIS_Y) {
+            val weWorld = BukkitAdapter.adapt(world)
+            return value.coerceIn(weWorld.minY, weWorld.maxY)
+        }
+        val border = worldBorderBounds(world) ?: return value
+        return when (axis) {
+            AXIS_X -> value.coerceIn(border[0], border[1])
+            else -> value.coerceIn(border[2], border[3])
+        }
+    }
+
+    /**
+     * 把长方体在 X/Z 上夹进世界边界, 返回夹取后还剩没剩东西
+     *
+     * 只改传进来的两个数组, 由调用方决定"夹取后照常执行"还是"整体拒绝"; 边界读不到时不动并返回
+     * true (退回改动前的行为)。expand / 圆柱外接框 / paste 目标框都用它 —— 夹掉的部分不写也不
+     * 计费 (9C 红线: 计费 = 真正会写的方块)。
+     */
+    private fun clampXZToBorder(world: World, min: IntArray, max: IntArray): Boolean {
+        val border = worldBorderBounds(world) ?: return true
+        min[AXIS_X] = maxOf(min[AXIS_X], border[0])
+        max[AXIS_X] = minOf(max[AXIS_X], border[1])
+        min[AXIS_Z] = maxOf(min[AXIS_Z], border[2])
+        max[AXIS_Z] = minOf(max[AXIS_Z], border[3])
+        return min[AXIS_X] <= max[AXIS_X] && min[AXIS_Z] <= max[AXIS_Z]
+    }
+
+    /** 轴名 (提示文案用): 与 [AXIS_X] 等常量的下标一致 */
+    private fun axisName(axis: Int): String = when (axis) {
+        AXIS_X -> "X"
+        AXIS_Y -> "Y"
+        else -> "Z"
     }
 
     /**
@@ -1432,12 +1508,7 @@ class WorldEditManager {
         clipboards[player.uniqueId] = clipboard.flipped(axis)
         endEdit(player)
         // 报轴名而不是回显输入: me 没有可回显的字面量, 而"沿哪一轴镜像"正是玩家想确认的
-        val axisName = when (axis) {
-            AXIS_X -> "X"
-            AXIS_Y -> "Y"
-            else -> "Z"
-        }
-        player.sendLang("message-flip-susses", pluginId to "pluginId", axisName to "axis")
+        player.sendLang("message-flip-susses", pluginId to "pluginId", axisName(axis) to "axis")
     }
 
     /**
@@ -1550,17 +1621,23 @@ class WorldEditManager {
             player.sendLang("message-shape-none", pluginId to "pluginId")
             return null
         }
-        val box = CuboidRegion(BlockVector3.at(minX, minY, minZ), BlockVector3.at(maxX, maxY, maxZ))
+        // X/Z 世界边界夹取 (REV-06): 下面整段 (领地校验、计费、目标框) 都用夹取后的范围, 所以夹掉的
+        // 部分不写也不计费, "预览报的数 = 真贴扣的数"照样成立
+        val min = intArrayOf(minX, minY, minZ)
+        val max = intArrayOf(maxX, maxY, maxZ)
+        if (!clampXZToBorder(player.world, min, max)) {
+            player.sendLang("message-shape-none", pluginId to "pluginId")
+            return null
+        }
+        val box = CuboidRegion(BlockVector3.at(min[0], min[1], min[2]), BlockVector3.at(max[0], max[1], max[2]))
         // 领地校验覆盖整份要写的范围 (含空气会清到的那些格子); 粘贴会覆盖已有建筑, 所以按替换操作
         // 要求破坏权限 (needBreak = true)
-        val corner1 = locationOf(player, intArrayOf(minX, minY, minZ))
-        val corner2 = locationOf(player, intArrayOf(maxX, maxY, maxZ))
-        if (!checkDominion(player, corner1, corner2, needBreak = true)) return null
+        if (!checkDominion(player, locationOf(player, min), locationOf(player, max), needBreak = true)) return null
         // 计费: 目标框里逐格查剪贴板, 非空气按材料累加 —— 纯算术、不读世界, 且与下面写的是同一份内容
         val charges = LinkedHashMap<Material, Int>()
-        for (y in minY..maxY) {
-            for (z in minZ..maxZ) {
-                for (x in minX..maxX) {
+        for (y in min[1]..max[1]) {
+            for (z in min[2]..max[2]) {
+                for (x in min[0]..max[0]) {
                     val state = clipboard.stateAt(x - anchorX, y - anchorY, z - anchorZ) ?: continue
                     if (!state.blockType.isAir()) charges.add(state.blockType)
                 }

@@ -76,14 +76,23 @@ object WorldEditTool {
         contains: (x: Int, y: Int, z: Int) -> Boolean
     ) = writeBlocks(world, region, actor, { x, y, z -> if (contains(x, y, z)) blockState else null })
 
-    /** 按 [RegionSlice] 把整块快照里对应的那一段写回这片区域 */
+    /**
+     * 按 [RegionSlice] 把整块快照里对应的那一段写回这片区域
+     *
+     * 逐格先跟快照比一次, 相同就跳过。快照是按**整块**读的, 撤销的大部分格子本来就没被改过,
+     * 把原值写回去只有一个坏处: CoreProtect 会给这些"其实没动"的方块也记一笔 (2026-10-13 的
+     * 遗留项)。代价是每个方块多一次区域线程上的读 —— 读与写在同一次 [RegionSlice] 迭代里,
+     * 每 tick 的预算仍按写入量算, 所以不会额外多占 tick (见报告)。
+     */
     fun restoreBlocks(world: World, slice: RegionSlice, states: List<BlockState>, actor: Actor? = null) {
         val end = minOf(slice.offset + slice.size, states.size)
         newSession(world, actor).use { session ->
             var index = slice.offset
             for (vector in slice.region) {
                 if (index >= end) break
-                session.setBlock(vector, states[index++])
+                val state = states[index++]
+                if (session.getBlock(vector) == state) continue
+                session.setBlock(vector, state)
             }
         }
     }
