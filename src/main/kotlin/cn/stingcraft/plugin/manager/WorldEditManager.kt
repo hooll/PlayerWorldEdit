@@ -427,8 +427,9 @@ class WorldEditManager {
     /**
      * 圆柱的几何与校验 —— 和墙的区别在于它**完全不看选区**
      *
-     * 中心 = 玩家所在的那一格, 底面 = 玩家脚下方块, 向上 [height] 层; 顶面夹进世界高度
-     * (被世界高度吃掉的那几层直接丢掉), 夹完一层都不剩 (例如站在世界顶) 时提示并返回。
+     * 中心 = 玩家所在的那一格, 底面 = 玩家脚下方块 (低于世界最低高度时先往上贴到 minY), 向上
+     * [height] 层; 顶面夹进世界高度 (被世界高度吃掉的那几层直接丢掉), 夹完一层都不剩 (例如站在
+     * 世界顶) 时提示并返回。
      *
      * 没有选区就走不了 [validatedRegion], 但领地校验一个都不能少: 对圆柱的**外接长方体**做同一套
      * fail-closed 校验 —— 要动的方块必须全部有权限, 和 /pwe set 检查选区是同一个道理。
@@ -447,7 +448,9 @@ class WorldEditManager {
         val centerX = location.blockX
         val centerZ = location.blockZ
         val baseY = location.blockY.coerceIn(weWorld.minY, weWorld.maxY)
-        val topY = (location.blockY + height - 1).coerceAtMost(weWorld.maxY)
+        // 顶面按**夹取后**的底面算 (WE 的语义): 站在世界最低高度以下时底面先往上贴, 高度不会被
+        // 凭空吃掉几层; 反过来贴完仍然一层都放不下 (站在世界顶) 才交给下面的守卫兜底
+        val topY = (baseY + height - 1).coerceAtMost(weWorld.maxY)
         if (baseY > topY) {
             // 夹取后一层都不剩: 直接提示返回, 别留下一条 0 材料的撤销记录
             player.sendLang("message-shape-none", pluginId to "pluginId")
@@ -581,7 +584,8 @@ class WorldEditManager {
      * 执行口径"就会多扣/少扣材料, 所以这里只留 [columnContains] 一个谓词, 计费只是把它按 X/Z
      * 每列数一遍。全部是纯算术, 一次世界访问都没有。
      *
-     * 坐标全部取整到方块坐标 (和 /pwe set 一样按方块算), 不引入小数偏移。
+     * 坐标全部取整到方块坐标 (和 /pwe set 一样按方块算), 不引入小数偏移。圆柱的光栅化与
+     * WorldEdit 的 `makeCylinder` 对齐: 半径先 +0.5, 再按**格元**判定 (见 [inCircle])。
      */
     private class ShapeVolume(
         private val kind: ShapeKind,
@@ -597,8 +601,10 @@ class WorldEditManager {
         // 算出来正好是玩家所在的那一格 cx; 墙的判定不看圆心, 算出来是什么都无所谓。
         private val centerX = (minX + maxX) / 2
         private val centerZ = (minZ + maxZ) / 2
-        private val outerRadiusSquared = radius * radius
-        private val innerRadiusSquared = (radius - 1) * (radius - 1)
+
+        // 判定阈值 (2r+1)², 即 (2(r+0.5))²: 半径先 +0.5 是 WE 的格元口径, ×4 是为了把
+        // a² + b² ≤ (r+0.5)² 变成纯整数比较, 不引入浮点。r ≤ SHAPE_MAX_SIZE, 不会溢出。
+        private val circleLimit = (2 * radius + 1) * (2 * radius + 1)
 
         /**
          * 这一列 (x, z) 的水平投影在不在形状里 (纯算术, 与 Y 无关)
@@ -606,13 +612,17 @@ class WorldEditManager {
          * 墙按"贴到选区某一条边"算, 所以 1 格宽的选区整条都算墙 (和 //walls 一致)。
          */
         fun columnContains(x: Int, z: Int): Boolean {
+            // 圆柱的两个分支都要"到圆心的格数偏移", 在这里算一次, 不在分支里各抄一遍
+            val a = abs(x - centerX)
+            val b = abs(z - centerZ)
             return when (kind) {
                 ShapeKind.WALL -> x == minX || x == maxX || z == minZ || z == maxZ
-                ShapeKind.CYLINDER -> distanceSquared(x, z) <= outerRadiusSquared
-                // 空心 = 半径 r 的圆盘减去半径 r-1 的圆盘, 也就是最外那一圈 (径向厚度 1)。
-                // r=1 时内圈半径为 0, 只剩中心列的正交邻居 —— 这是"壳"的定义, 不是漏算。
+                ShapeKind.CYLINDER -> inCircle(a, b)
+                // 空心 = 圆内挖掉"往 +X、+Z 各走一格都还在圆内"的格元 (WE 的判据), 剩下的就是径向
+                // 厚 1 的壳; 偏移取绝对值, 挖的四个方向对称, 形状天然四象限镜像。
+                // r=1 时壳是 3×3 的圈、实心是 3×3 的盘 —— 同一套谓词的自然结果, 与 WE 一致。
                 ShapeKind.HOLLOW_CYLINDER ->
-                    distanceSquared(x, z).let { it > innerRadiusSquared && it <= outerRadiusSquared }
+                    inCircle(a, b) && !(inCircle(a + 1, b) && inCircle(a, b + 1))
             }
         }
 
@@ -637,11 +647,13 @@ class WorldEditManager {
             return columns * layers
         }
 
-        private fun distanceSquared(x: Int, z: Int): Int {
-            val dx = x - centerX
-            val dz = z - centerZ
-            return dx * dx + dz * dz
-        }
+        /**
+         * 格元 (a, b) 在不在圆内 —— a / b 是**到圆心的格数偏移的绝对值**
+         *
+         * 与 WorldEdit `EditSession.makeCylinder` 同一套口径: 半径 +0.5 后按格元判定, 格子的
+         * 近角落在半径 r+0.5 的圆内才算入圆, 整数形式 4(a² + b²) ≤ (2r+1)²。
+         */
+        private fun inCircle(a: Int, b: Int): Boolean = 4 * (a * a + b * b) <= circleLimit
     }
 
     /**
