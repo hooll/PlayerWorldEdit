@@ -49,6 +49,7 @@ command-subCommands-rotate-usage: '&7[&890&7|&8180&7|&8270&7]'
 command-subCommands-flip-description: '沿某个方向镜像剪贴板 (方块朝向一起镜像)'
 command-subCommands-flip-usage: '&7[&8me&7|&8n&7|&8s&7|&8e&7|&8w&7|&8u&7|&8d&7]'
 command-subCommands-paste-description: '把剪贴板贴到你所在的位置'
+command-subCommands-paste-usage: '&7[&8preview&7]'
 
 message-no-region: '&8[&3&l{pluginId}&8] &7请先选择一个区域'
 message-region-select-pos1: '&8[&3&l{pluginId}&8] &7已选择点1为: {x} {y} {z} ({amount})'
@@ -90,3 +91,6 @@ message-flip-susses: '&8[&3&l{pluginId}&8] &7剪贴板已镜像 (沿 &f{axis} &7
 message-flip-invalid-direction: '&8[&3&l{pluginId}&8] &7方向只能是 &f{directions}'
 message-clipboard-empty: '&8[&3&l{pluginId}&8] &7剪贴板是空的, 先用 &f/pwe copy &7复制一个选区'
 message-paste-susses: '&8[&3&l{pluginId}&8] &7粘贴成功, 材料已按方块种类扣除'
+message-paste-preview:
+  - '&8[&3&l{pluginId}&8] &7将覆盖 &f{cells} &7格 (其中非空气 &f{blocks} &7格, 涉及 &f{kinds} &7种材料)'
+  - '&8[&3&l{pluginId}&8] &7确认就再点一次粘贴按钮, 或输入 &f/pwe paste'

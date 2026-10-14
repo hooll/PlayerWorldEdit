@@ -183,11 +183,14 @@ object WorldEditOpInventory {
                 name = "&f| 粘贴剪贴板"
                 lore += "&7| 剪贴板原点贴到你脚下"
                 lore += "&7| 空气会清掉目标位置的方块"
+                lore += "&7| 第一次点先看预览, 10 秒内再点才贴"
                 lore += "&7| 按材料消耗, 可撤销"
                 colored()
             }) {
-                player.closeInventory()
-                worldEditManager.tryPaste(player)
+                // 两段式: 先预览 (菜单留着, 方便再点一次确认), 真的贴了才把菜单关掉
+                if (worldEditManager.pasteOrPreview(player)) {
+                    player.closeInventory()
+                }
             }
             // 镜像: 与旋转同一类"只改剪贴板"的变换, 所以排在粘贴右边 (38/40/42 是复制/旋转/粘贴,
             // 不动)。这里只给一个按钮 = 按玩家朝向镜像 (与 WE 的 //flip 默认一致); 上下镜像等

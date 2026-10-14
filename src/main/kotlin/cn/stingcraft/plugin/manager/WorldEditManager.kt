@@ -78,6 +78,14 @@ class WorldEditManager {
      */
     private val pendingShapeSizes = ConcurrentHashMap<UUID, Pair<Int, Int>>()
 
+    /**
+     * GUI 的 paste 两段式: 玩家刚预览过的目标框 + 过期时间戳
+     *
+     * 条目只活到"过期"或"再贴一次"为止: 读的时候过期就删 (懒自清), 玩家退出时在 [clearPlayerPos]
+     * 里删 —— 与剪贴板/形状尺寸同一套, 不会变成按 UUID 只增不删的表。
+     */
+    private val pastePreviews = ConcurrentHashMap<UUID, PastePreview>()
+
     // 选区可视化 (半透明玻璃盒子), 用不了时退回粒子边框
     private val areaDisplay = AreaDisplay()
 
@@ -262,6 +270,8 @@ class WorldEditManager {
         clipboards.remove(player.uniqueId)
         // 形状尺寸选择器里那份待确认数值同理: 退出即丢, 下次登录重新从初值开始
         forgetShapeSize(player)
+        // paste 预览标志同理: 盒子和"再点一次即确认"的窗口都不该跨登录留着
+        pastePreviews.remove(player.uniqueId)
         endEdit(player)
     }
 
@@ -1266,18 +1276,94 @@ class WorldEditManager {
      * 只做纯算术的计费和调度。
      */
     fun tryPaste(player: Player) {
-        val clipboard = clipboards[player.uniqueId] ?: run {
-            player.sendLang("message-clipboard-empty", pluginId to "pluginId")
-            return
+        val clipboard = clipboardOf(player) ?: return
+        val target = pasteTarget(player, clipboard) ?: return
+        pasteAt(player, clipboard, target)
+    }
+
+    /**
+     * 预览粘贴: 只画目标框 + 报预估, 不写方块、不扣料、不记撤销
+     *
+     * 目标框与用量都从 [pasteTarget] 取 —— 与真贴同一份锚点/夹取数学、同一份材料统计, 所以
+     * "预览报的数 = 真贴会扣的数" (9C 口径), 不存在预览算一套、贴的时候算另一套的可能。
+     */
+    fun previewPaste(player: Player) {
+        val clipboard = clipboardOf(player) ?: return
+        val target = pasteTarget(player, clipboard) ?: return
+        showPreview(player, target)
+    }
+
+    /**
+     * GUI 粘贴按钮的两段式入口: 预览还有效就直接贴, 否则先预览
+     *
+     * "还有效" = [PASTE_PREVIEW_SECONDS] 秒内**且目标框没变**。玩家预览完走开了的话, 直贴会落到
+     * 与刚才看到的框不同的地方 —— 那正是预览要防的事, 所以这种情况重新预览一次, 让框和数字跟上。
+     *
+     * @return true 表示这次点击真的贴了 (调用方可以把菜单关掉), false 表示只显示了预览
+     */
+    fun pasteOrPreview(player: Player): Boolean {
+        val clipboard = clipboardOf(player) ?: return false
+        val target = pasteTarget(player, clipboard) ?: return false
+        val preview = pastePreviews[player.uniqueId]
+        val confirmed = preview != null &&
+            preview.expiresAt >= System.currentTimeMillis() &&
+            preview.box.minimumPoint == target.box.minimumPoint &&
+            preview.box.maximumPoint == target.box.maximumPoint
+        if (confirmed) {
+            pasteAt(player, clipboard, target)
+            return true
         }
-        val world = player.world
-        val weWorld = BukkitAdapter.adapt(world)
+        showPreview(player, target)
+        return false
+    }
+
+    /**
+     * 取玩家的剪贴板, 没有就提示
+     *
+     * paste 的三条入口 (直贴 / 预览 / GUI 两段式) 都要先过这一关, 所以抽出来一份。
+     */
+    private fun clipboardOf(player: Player): ClipboardVolume? =
+        clipboards[player.uniqueId] ?: run {
+            player.sendLang("message-clipboard-empty", pluginId to "pluginId")
+            null
+        }
+
+    /**
+     * paste 的落点: 目标框 + 锚点 + 按材料统计的用量
+     *
+     * [cells]/[blocks]/[kinds] 就是预览里报的那三个数, 而 [charges] 是真贴要扣的账 —— 同一份对象,
+     * 所以预览与真贴不可能对不上。
+     */
+    private class PasteTarget(
+        val box: CuboidRegion,
+        val charges: Map<Material, Int>,
+        val anchorX: Int,
+        val anchorY: Int,
+        val anchorZ: Int
+    ) {
+        /** 目标框里的格子数 (含会被清成空气的那些) */
+        val cells = box.volume.toInt()
+
+        /** 会被写上的非空气方块数 (= 真贴要扣的方块总数) */
+        val blocks = charges.values.sum()
+
+        /** 涉及多少种材料 */
+        val kinds = charges.size
+    }
+
+    /**
+     * 算出落点: 剪贴板的偏移框平移到玩家脚下, Y 夹进世界高度, 再统计材料
+     *
+     * 预览与真贴**共用**这一份计算 (锚点数学、夹取、计费循环都只写一份): 夹取掉的格子不写也不计费,
+     * 所以计费恒等于"真正会写的方块"。整份剪贴板落在世界高度之外、或目标框没有编辑权限时提示并返回
+     * null —— 领地校验放在这里, 预览也会照做: 在没权限的地方画个框说"将覆盖 N 格"是骗人。
+     */
+    private fun pasteTarget(player: Player, clipboard: ClipboardVolume): PasteTarget? {
+        val weWorld = BukkitAdapter.adapt(player.world)
         val anchor = player.location
         val anchorX = anchor.blockX
         val anchorY = anchor.blockY
         val anchorZ = anchor.blockZ
-        // 目标框 = 剪贴板的偏移框平移到锚点。Y 夹进世界高度: 被夹掉的格子不写、也不计费
-        // (与形状生成同一个口径 —— 计费必须等于"真正会写的方块", 否则会多扣)
         val minX = anchorX + clipboard.minX
         val maxX = anchorX + clipboard.maxX
         val minZ = anchorZ + clipboard.minZ
@@ -1287,14 +1373,14 @@ class WorldEditManager {
         if (minY > maxY) {
             // 整份剪贴板都落在世界高度之外
             player.sendLang("message-shape-none", pluginId to "pluginId")
-            return
+            return null
         }
         val box = CuboidRegion(BlockVector3.at(minX, minY, minZ), BlockVector3.at(maxX, maxY, maxZ))
         // 领地校验覆盖整份要写的范围 (含空气会清到的那些格子); 粘贴会覆盖已有建筑, 所以按替换操作
         // 要求破坏权限 (needBreak = true)
         val corner1 = locationOf(player, intArrayOf(minX, minY, minZ))
         val corner2 = locationOf(player, intArrayOf(maxX, maxY, maxZ))
-        if (!checkDominion(player, corner1, corner2, needBreak = true)) return
+        if (!checkDominion(player, corner1, corner2, needBreak = true)) return null
         // 计费: 目标框里逐格查剪贴板, 非空气按材料累加 —— 纯算术、不读世界, 且与下面写的是同一份内容
         val charges = LinkedHashMap<Material, Int>()
         for (y in minY..maxY) {
@@ -1305,22 +1391,34 @@ class WorldEditManager {
                 }
             }
         }
+        return PasteTarget(box, charges, anchorX, anchorY, anchorZ)
+    }
+
+    /**
+     * 真贴: 扣料 + 走既有写方块管线 (命令直贴与 GUI 的第二段共用)
+     *
+     * [target] 必须来自 [pasteTarget], 这样"预览报的数"和"这里扣的数"是同一份 charges。
+     */
+    private fun pasteAt(player: Player, clipboard: ClipboardVolume, target: PasteTarget) {
         if (!beginEdit(player)) return
         // 全有全无: 任何一种材料不够就一个方块都不写 (consumeAll 会把已扣的原样加回去)
-        if (!consumeAll(player, charges)) {
+        if (!consumeAll(player, target.charges)) {
             endEdit(player)
             return
         }
-        prepareEdit(box.volume.toInt(), player)
+        // 贴过了: 预览到此作废 (再点按钮应该重新预览, 而不是拿旧框直接贴)
+        pastePreviews.remove(player.uniqueId)
+        prepareEdit(target.cells, player)
+        val world = player.world
         val actor = actorOf(player)
-        val regions = box.splitByChunk()
+        val regions = target.box.splitByChunk()
         // 每个区块实际写下去多少 (空气也记: 撤销要能还原被清掉的位置), 收尾时当成本表用
         val written = AtomicReferenceArray<HashMap<Material, Int>?>(regions.size)
         writeChunks(
             player,
             regions,
             "message-paste-susses",
-            charged = charges,
+            charged = target.charges,
             costs = { regions.indices.map { written.get(it) ?: emptyMap() } }
         ) { index, slice, _ ->
             val counts = written.get(index)
@@ -1330,11 +1428,39 @@ class WorldEditManager {
                 slice.region,
                 actor,
                 // 剪贴板就在内存里: 这里的查表是纯算术, 不读世界
-                stateAt = { x, y, z -> clipboard.stateAt(x - anchorX, y - anchorY, z - anchorZ) },
+                stateAt = { x, y, z -> clipboard.stateAt(x - target.anchorX, y - target.anchorY, z - target.anchorZ) },
                 onWritten = { state -> counts.add(state.blockType) }
             )
         }
     }
+
+    /** 画预览: 记下标志 + 玻璃盒 (复用选区的显示设置与自动收盒子的时长机制) + 聊天报数 */
+    private fun showPreview(player: Player, target: PasteTarget) {
+        pastePreviews[player.uniqueId] =
+            PastePreview(target.box, System.currentTimeMillis() + PASTE_PREVIEW_SECONDS * 1000)
+        // 关掉玻璃盒显示 (region-display) 时只报数不画框: 预览的粒子版本不做 —— 粒子边框是按选区的
+        // 两个点画的, 而预览框是另一个区域, 为它再写一套粒子逻辑不值当
+        if (displayEnabled()) {
+            areaDisplay.show(
+                player,
+                target.box,
+                displayMaterial(),
+                // 预览是给自己看的: 不管选区盒子的"只发给主人"开关怎么设, 这里都只发给本人
+                ownerOnly = true,
+                durationTicks = PASTE_PREVIEW_SECONDS * 20
+            )
+        }
+        player.sendLang(
+            "message-paste-preview",
+            pluginId to "pluginId",
+            target.cells to "cells",
+            target.blocks to "blocks",
+            target.kinds to "kinds"
+        )
+    }
+
+    /** GUI 两段式里的"已预览"标志: 目标框 + 过期时间戳 */
+    private class PastePreview(val box: CuboidRegion, val expiresAt: Long)
 
     /**
      * 剪贴板支持的角度
@@ -1925,6 +2051,14 @@ class WorldEditManager {
          * 但斜向会同时镜像两轴, 那种结果对玩家没有意义。
          */
         val FLIP_DIRECTIONS = listOf("me", "n", "s", "e", "w", "u", "d")
+
+        /**
+         * paste 预览存活多久 (秒)
+         *
+         * 玻璃盒的显示时长与 GUI"再点一次即确认"的窗口共用一个数: 盒子消失了还能直接贴, 玩家会
+         * 以为框还在; 反过来窗口比盒子长也一样别扭。
+         */
+        const val PASTE_PREVIEW_SECONDS = 10L
 
         /** 轴索引 (与 [snapAxis] 的 0=X, 1=Y, 2=Z 顺序一致) —— 6 个面里只有 Y 需要世界高度夹取 */
         const val AXIS_X = 0
