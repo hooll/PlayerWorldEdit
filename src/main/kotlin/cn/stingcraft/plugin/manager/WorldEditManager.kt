@@ -1,6 +1,9 @@
 package cn.stingcraft.plugin.manager
 
 import cn.stingcraft.plugin.PlayerWorldEdit
+import cn.stingcraft.plugin.api.event.OperationType
+import cn.stingcraft.plugin.api.event.WorldEditOperationCompleteEvent
+import cn.stingcraft.plugin.api.event.WorldEditOperationEvent
 import cn.stingcraft.plugin.hook.ProtectionCheck
 import cn.stingcraft.plugin.hook.ProtectionHooks
 import cn.stingcraft.plugin.until.AreaDisplay
@@ -323,6 +326,7 @@ class WorldEditManager {
             player.sendLang("message-no-region", pluginId to "pluginId")
             return
         }
+        if (!fireOperation(player, OperationType.SET, region)) return
         if (!beginEdit(player)) return
         // 检查与扣费必须在一次原子操作里完成: 原来是"查够不够"和"扣"两次调用,
         // 中间别的线程也能通过检查, 同一个玩家并发操作时会被各扣一次。
@@ -355,7 +359,8 @@ class WorldEditManager {
                         regions.indices.map { snapshots[it] },
                         mapOf(material to amount),
                         regions.map { mapOf(material to it.volume.toInt()) },
-                        "message-set-susses"
+                        "message-set-susses",
+                        OperationType.SET
                     )
                 }
             }
@@ -377,6 +382,8 @@ class WorldEditManager {
                 (if (fromType == null) from else to).name to "material")
             return
         }
+        // 事件报的包围盒是整个选区: replace 只会改选区里匹配的那些方块, 但能改的范围就是选区
+        if (!fireOperation(player, OperationType.REPLACE, region)) return
         if (!beginEdit(player)) return
         val regions = region.splitByChunk()
         val snapshots = AtomicReferenceArray<Array<BlockState?>?>(regions.size)
@@ -423,7 +430,8 @@ class WorldEditManager {
                                     batchSnapshots,
                                     mapOf(to to amount),
                                     costs,
-                                    "message-replace-susses"
+                                    "message-replace-susses",
+                                    OperationType.REPLACE
                                 )
                             }
                         }
@@ -631,6 +639,14 @@ class WorldEditManager {
             player.sendLang("message-shape-none", pluginId to "pluginId")
             return
         }
+        // 形状种类与事件里的操作类型一一对应 (名字跟命令走: /pwe cyl → CYL, /pwe hcyl → HCYL)
+        val operation = when (kind) {
+            ShapeKind.WALL -> OperationType.WALL
+            ShapeKind.CYLINDER -> OperationType.CYL
+            ShapeKind.HOLLOW_CYLINDER -> OperationType.HCYL
+        }
+        // 事件报的是实际要写的范围 (世界边界夹取之后), 不是形状的外接框
+        if (!fireOperation(player, operation, writeBox)) return
         if (!beginEdit(player)) return
         // 同 trySetArea: 查与扣合成一次原子操作; 先扣, 有区块没跑成再按区块退
         if (!PlayerWorldEdit.packManager.tryConsume(player, material, amount)) {
@@ -663,7 +679,8 @@ class WorldEditManager {
                         regions.indices.map { snapshots[it] },
                         mapOf(material to amount),
                         costs,
-                        successKey
+                        successKey,
+                        operation
                     )
                 }
             }
@@ -905,6 +922,9 @@ class WorldEditManager {
             player.sendLang("message-shape-none", pluginId to "pluginId")
             return
         }
+        // 实际会写下去的那几层 —— 操作前事件报的就是它
+        val targetSlab = slabRegion(axis, sourceCoord + if (positive) 1 else -1, targetCoord, writeMin, writeMax)
+        if (!fireOperation(player, OperationType.EXPAND, targetSlab)) return
         if (!beginEdit(player)) return
         EditBudget.configure(blocksPerTick())
         // 源层沿 [axis] 平移复制, 平面内两个坐标原样对应, 所以把源层压成一维数组存起来最省事
@@ -944,8 +964,7 @@ class WorldEditManager {
                     updateSelection(player, moved.first, moved.second)
                     prepareEdit(needed.values.sum(), player)
                     val actor = actorOf(player)
-                    val targetChunks =
-                        slabRegion(axis, sourceCoord + if (positive) 1 else -1, targetCoord, writeMin, writeMax).splitByChunk()
+                    val targetChunks = targetSlab.splitByChunk()
                     // 每个区块实际写下去多少 (按材料记), 收尾时当成本表用
                     val written = AtomicReferenceArray<HashMap<Material, Int>?>(targetChunks.size)
                     writeChunks(
@@ -953,7 +972,8 @@ class WorldEditManager {
                         targetChunks,
                         "message-selection-expand-susses",
                         charged = needed,
-                        costs = { targetChunks.indices.map { written.get(it) ?: emptyMap() } }
+                        costs = { targetChunks.indices.map { written.get(it) ?: emptyMap() } },
+                        operation = OperationType.EXPAND
                     ) { index, slice, _ ->
                         val counts = written.get(index)
                             ?: HashMap<Material, Int>().also { written.set(index, it) }
@@ -985,14 +1005,17 @@ class WorldEditManager {
         min: IntArray,
         max: IntArray
     ) {
-        if (!beginEdit(player)) return
-        updateSelection(player, moved.first, moved.second)
         val newCoord =
             if (positive) maxOf(moved.first[axis], moved.second[axis]) else minOf(moved.first[axis], moved.second[axis])
         // 被砍掉的层 = 老选区里、新选区之外的那几层
         val from = if (positive) newCoord + 1 else min[axis]
         val to = if (positive) max[axis] else newCoord - 1
-        val regions = slabRegion(axis, from, to, min, max).splitByChunk()
+        val clearedLayers = slabRegion(axis, from, to, min, max)
+        // 操作前事件必须在**任何状态改动之前**: 下面的 updateSelection 会真的动选区
+        if (!fireOperation(player, OperationType.CONTRACT, clearedLayers)) return
+        if (!beginEdit(player)) return
+        updateSelection(player, moved.first, moved.second)
+        val regions = clearedLayers.splitByChunk()
         // 每个区块被清掉多少非空气方块 —— 同一区块的切片在同一线程上顺序执行, 普通 IntArray 就够
         val cleared = IntArray(regions.size)
         // 处理提示用上界 (这一层里所有方块数), 真正扣的是 0 (空气不计材料)
@@ -1005,7 +1028,8 @@ class WorldEditManager {
             regions,
             "message-selection-contract-susses",
             charged = emptyMap(),
-            costs = { regions.indices.map { index -> if (cleared[index] == 0) emptyMap() else mapOf(Material.AIR to cleared[index]) } }
+            costs = { regions.indices.map { index -> if (cleared[index] == 0) emptyMap() else mapOf(Material.AIR to cleared[index]) } },
+            operation = OperationType.CONTRACT
         ) { index, slice, states ->
             for (position in slice.offset until slice.offset + slice.size) {
                 val state = states[position] ?: continue
@@ -1051,6 +1075,12 @@ class WorldEditManager {
         val checkMin = intArrayOf(minOf(min[0], targetMin[0]), minOf(min[1], targetMin[1]), minOf(min[2], targetMin[2]))
         val checkMax = intArrayOf(maxOf(max[0], targetMax[0]), maxOf(max[1], targetMax[1]), maxOf(max[2], targetMax[2]))
         if (!checkDominion(player, locationOf(player, checkMin), locationOf(player, checkMax), needBreak = true)) return
+        // 源 ∪ 目标的并集: 既是领地校验的框, 也是操作前事件报的范围、第二轮要写的范围 —— 一处算好
+        val union = CuboidRegion(
+            BlockVector3.at(checkMin[0], checkMin[1], checkMin[2]),
+            BlockVector3.at(checkMax[0], checkMax[1], checkMax[2])
+        )
+        if (!fireOperation(player, OperationType.MOVE, union)) return
         if (!beginEdit(player)) return
         EditBudget.configure(blocksPerTick())
         val world = player.world
@@ -1090,12 +1120,8 @@ class WorldEditManager {
                         return@onPlayerThread
                     }
                     val actor = actorOf(player)
-                    // 源 ∪ 目标 的并集按区块切分: 同一区块只出现一次、只取一份快照 —— 源区与目标区
-                    // 重叠时若分成两批处理, 后一批的快照会拍到前一批刚写下去的内容, 撤销就还原不回去
-                    val union = CuboidRegion(
-                        BlockVector3.at(checkMin[0], checkMin[1], checkMin[2]),
-                        BlockVector3.at(checkMax[0], checkMax[1], checkMax[2])
-                    )
+                    // 并集按区块切分: 同一区块只出现一次、只取一份快照 —— 源区与目标区重叠时若分成
+                    // 两批处理, 后一批的快照会拍到前一批刚写下去的内容, 撤销就还原不回去
                     prepareEdit(union.volume.toInt(), player)
                     val regions = union.splitByChunk()
                     // 每个区块实际写下去多少 (空气也记: 撤销要能还原被清掉的源区), 收尾时当成本表
@@ -1106,7 +1132,8 @@ class WorldEditManager {
                         regions,
                         "message-move-susses",
                         charged = moved,
-                        costs = { regions.indices.map { written.get(it) ?: emptyMap() } }
+                        costs = { regions.indices.map { written.get(it) ?: emptyMap() } },
+                        operation = OperationType.MOVE
                     ) { chunkIndex, slice, _ ->
                         val counts = written.get(chunkIndex)
                             ?: HashMap<Material, Int>().also { written.set(chunkIndex, it) }
@@ -1245,6 +1272,7 @@ class WorldEditManager {
         successKey: String,
         charged: Map<Material, Int>,
         costs: () -> List<Map<Material, Int>>,
+        operation: OperationType,
         writeSlice: (index: Int, slice: RegionSlice, states: Array<BlockState?>) -> Unit
     ) {
         val snapshots = AtomicReferenceArray<Array<BlockState?>?>(regions.size)
@@ -1258,7 +1286,15 @@ class WorldEditManager {
             },
             done = { _ ->
                 onPlayerThread(player) {
-                    finishEdit(player, regions, regions.indices.map { snapshots[it] }, charged, costs(), successKey)
+                    finishEdit(
+                        player,
+                        regions,
+                        regions.indices.map { snapshots[it] },
+                        charged,
+                        costs(),
+                        successKey,
+                        operation
+                    )
                 }
             })
     }
@@ -1652,6 +1688,7 @@ class WorldEditManager {
      * [target] 必须来自 [pasteTarget], 这样"预览报的数"和"这里扣的数"是同一份 charges。
      */
     private fun pasteAt(player: Player, clipboard: ClipboardVolume, target: PasteTarget) {
+        if (!fireOperation(player, OperationType.PASTE, target.box)) return
         if (!beginEdit(player)) return
         // 全有全无: 任何一种材料不够就一个方块都不写 (consumeAll 会把已扣的原样加回去)
         if (!consumeAll(player, target.charges)) {
@@ -1671,7 +1708,8 @@ class WorldEditManager {
             regions,
             "message-paste-susses",
             charged = target.charges,
-            costs = { regions.indices.map { written.get(it) ?: emptyMap() } }
+            costs = { regions.indices.map { written.get(it) ?: emptyMap() } },
+            operation = OperationType.PASTE
         ) { index, slice, _ ->
             val counts = written.get(index)
                 ?: HashMap<Material, Int>().also { written.set(index, it) }
@@ -2008,11 +2046,12 @@ class WorldEditManager {
     }
 
     /**
-     * 编辑收尾 (走 [onPlayerThread]): 记录撤销、退还失败部分的材料并提示
+     * 编辑收尾 (走 [onPlayerThread]): 记录撤销、退还失败部分的材料、发完成事件并提示
      *
      * @param snapshots 与 regions 一一对应, null 或含 null 表示该区块没跑完
      * @param charged 这次操作**预扣**的材料 (整笔; 填充/替换/形状是整块预扣, 扩展是按源层算出的整笔)
      * @param costs 与 regions 一一对应, 表示该区块**实际写入**的材料数量
+     * @param operation 完成事件里报的操作类型 (与 [fireOperation] 用的是同一个值)
      */
     private fun finishEdit(
         player: Player,
@@ -2020,7 +2059,8 @@ class WorldEditManager {
         snapshots: List<Array<BlockState?>?>,
         charged: Map<Material, Int>,
         costs: List<Map<Material, Int>>,
-        successKey: String
+        successKey: String,
+        operation: OperationType
     ) {
         endEdit(player)
         val succeeded = regions.indices.filter { isComplete(snapshots[it]) }
@@ -2055,6 +2095,11 @@ class WorldEditManager {
                 undoLimit()
             )
         }
+        // 完成事件: 整个流程里只在这里发一次 (上面"没有区块成功"已经 return, 所以失败不发)。
+        // 报的是**实际写入**的统计而不是预扣量 —— 部分区块跑失败时与退费口径一致。
+        Bukkit.getPluginManager().callEvent(
+            WorldEditOperationCompleteEvent(player, operation, actual.values.sum(), actual)
+        )
         // 只要有一个区块没跑完就算失败: 收缩这类不产生退费的操作, 只看退费会把它误报成成功。
         // {amount} 给扩展 / 收缩报"实际写入 / 清掉的方块数"; 其它操作的提示里没这个占位符, 忽略即可。
         if (succeeded.size < regions.size) {
@@ -2146,6 +2191,23 @@ class WorldEditManager {
         if (amount > EditBudget.perTick) {
             player.sendLang("message-edit-processing", pluginId to "pluginId", amount to "amount")
         }
+    }
+
+    /**
+     * 操作前的统一触发点: 返回 false = 被监听方取消, 调用方直接 return (零写入、零扣料、不记撤销)
+     *
+     * 事件对象只在这里构造一次, 各操作各调一行 —— 字段与取消语义只有一份实现, 不在每个方法里
+     * 各写一遍 callEvent。调用点都在领地校验之后、[beginEdit] 之前, 所以被取消时玩家不会先看到
+     * 一条"没有权限", 也不会占住编辑锁。
+     */
+    private fun fireOperation(player: Player, operation: OperationType, box: CuboidRegion): Boolean {
+        val min = box.minimumPoint
+        val max = box.maximumPoint
+        val corners = locationOf(player, intArrayOf(min.x(), min.y(), min.z())) to
+            locationOf(player, intArrayOf(max.x(), max.y(), max.z()))
+        val event = WorldEditOperationEvent(player, operation, corners)
+        Bukkit.getPluginManager().callEvent(event)
+        return !event.isCancelled
     }
 
     /** 区块快照是否完整 (跑失败了会留下 null) */
