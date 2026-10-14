@@ -2,6 +2,7 @@ package cn.stingcraft.plugin.manager
 
 import cn.stingcraft.plugin.PlayerWorldEdit
 import cn.stingcraft.plugin.api.event.OperationType
+import cn.stingcraft.plugin.hook.AreaPermission
 import cn.stingcraft.plugin.util.EditBudget
 import cn.stingcraft.plugin.util.RegionSlice
 import cn.stingcraft.plugin.util.WorldEditTool
@@ -54,7 +55,9 @@ class ShapeManager(
      */
     fun tryGenerateWall(player: Player, material: Material) {
         // 墙保持"选区四周"的口径不变: 选区校验 (含 Dominion fail-closed) 与以前完全一样
-        val validated = pipeline.validatedSelection(player, needBreak = false) ?: return
+        // 权限按"真正会做什么": 空气 = 清空 (只破坏), 方块 = 覆盖 (破坏 + 放置) (R5)
+        val requirement = if (material.isAir) AreaPermission.BREAK else AreaPermission.PLACE_AND_BREAK
+        val validated = pipeline.validatedSelection(player, requirement) ?: return
         generateShape(
             player,
             ShapeKind.WALL,
@@ -166,12 +169,13 @@ class ShapeManager(
             BlockVector3.at(boxMin[0], boxMin[1], boxMin[2]),
             BlockVector3.at(boxMax[0], boxMax[1], boxMax[2])
         )
-        // 领地校验按**实际会写到的范围** (夹取之后) 查, 而不是形状的外接框
+        // 领地校验按**实际会写到的范围** (夹取之后) 查, 而不是形状的外接框; 权限按方块决定:
+        // 空气 = 清空 (只破坏), 方块 = 覆盖 (破坏 + 放置) (R5)
         if (!pipeline.checkProtection(
                 player,
                 locationOf(world, writeMin),
                 locationOf(world, writeMax),
-                needBreak = false
+                if (material.isAir) AreaPermission.BREAK else AreaPermission.PLACE_AND_BREAK
             )
         ) {
             return
@@ -425,9 +429,11 @@ class ShapeManager(
         val max = IntArray(3) { maxOf(first[it], second[it]) }
         // 领地校验覆盖**所有会被改动的方块**: 老选区 ∪ 新选区的包围盒。扩展动的是新层 (新选区 ⊇
         // 老选区), 收缩清掉的是被砍掉的层 (老选区 ⊇ 新选区), 取并集两条路都不会漏。fail-closed。
+        // 权限: 扩展会覆盖新层原有方块 (放置 + 破坏), 收缩只清空气 (只破坏) (R5)
         val checkMin = IntArray(3) { minOf(min[it], moved.first[it], moved.second[it]) }
         val checkMax = IntArray(3) { maxOf(max[it], moved.first[it], moved.second[it]) }
-        if (!pipeline.checkProtection(player, locationOf(world, checkMin), locationOf(world, checkMax), needBreak = false)) {
+        val requirement = if (expand) AreaPermission.PLACE_AND_BREAK else AreaPermission.BREAK
+        if (!pipeline.checkProtection(player, locationOf(world, checkMin), locationOf(world, checkMax), requirement)) {
             return
         }
         if (expand) expandSelection(player, world, moved, axis, positive, min, max)
@@ -694,11 +700,11 @@ class ShapeManager(
             player.sendLang("message-move-out-of-bounds", pluginId to "pluginId")
             return
         }
-        // 领地校验覆盖**会被改动的全部方块**: 源区 ∪ 目标区的包围盒 (清源区 + 覆盖目标区, 所以按
-        // 替换操作要求破坏权限, 与 replace/paste 同类)。fail-closed。
+        // 领地校验覆盖**会被改动的全部方块**: 源区 ∪ 目标区的包围盒 (清源区 + 覆盖目标区, 所以
+        // 放置与破坏两项都要, 与 replace/paste 同类)。fail-closed。
         val checkMin = intArrayOf(minOf(min[0], targetMin[0]), minOf(min[1], targetMin[1]), minOf(min[2], targetMin[2]))
         val checkMax = intArrayOf(maxOf(max[0], targetMax[0]), maxOf(max[1], targetMax[1]), maxOf(max[2], targetMax[2]))
-        if (!pipeline.checkProtection(player, locationOf(world, checkMin), locationOf(world, checkMax), needBreak = true)) return
+        if (!pipeline.checkProtection(player, locationOf(world, checkMin), locationOf(world, checkMax), AreaPermission.PLACE_AND_BREAK)) return
         // 源 ∪ 目标的并集: 既是领地校验的框, 也是操作前事件报的范围、第二轮要写的范围 —— 一处算好
         val union = CuboidRegion(
             BlockVector3.at(checkMin[0], checkMin[1], checkMin[2]),

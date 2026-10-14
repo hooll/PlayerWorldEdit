@@ -2,6 +2,7 @@ package cn.stingcraft.plugin.manager
 
 import cn.stingcraft.plugin.PlayerWorldEdit
 import cn.stingcraft.plugin.api.event.OperationType
+import cn.stingcraft.plugin.hook.AreaPermission
 import cn.stingcraft.plugin.util.EditBudget
 import cn.stingcraft.plugin.util.WorldEditTool
 import cn.stingcraft.plugin.util.displayName
@@ -81,7 +82,9 @@ class WorldEditManager {
      * 收尾时把"预扣 - 实际写入"退回去 —— 被 Folia 拒掉、或某片写失败的格子不该算钱 (R2)。
      */
     fun trySetArea(player: Player, material: Material) {
-        val validated = pipeline.validatedSelection(player, needBreak = false) ?: return
+        // 权限按"真正会做什么"声明: 填空气只破坏, 填方块既破坏原有方块又放上新的 (R5)
+        val requirement = if (material.isAir) AreaPermission.BREAK else AreaPermission.PLACE_AND_BREAK
+        val validated = pipeline.validatedSelection(player, requirement) ?: return
         val world = validated.world
         val region = validated.region
         val blockType = pipeline.resolveBlockType(material) ?: run {
@@ -146,7 +149,7 @@ class WorldEditManager {
      * 收尾时按第二轮的**实际写入数**结账, 第二轮整批失败就全额退费、不留撤销记录。
      */
     fun tryReplaceArea(player: Player, from: Material, to: Material) {
-        val validated = pipeline.validatedSelection(player, needBreak = true) ?: return
+        val validated = pipeline.validatedSelection(player, AreaPermission.PLACE_AND_BREAK) ?: return
         val world = validated.world
         val region = validated.region
         val fromType = pipeline.resolveBlockType(from)

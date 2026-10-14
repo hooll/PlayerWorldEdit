@@ -32,9 +32,11 @@ object DominionHook : RegionProtectionHook {
      * 校验出错返回 [ProtectionCheck.Failed] 而不是放行: Dominion 版本不兼容、内部 NPE 之类的问题
      * 会让领地保护静默失效, 而"无法确认"不等于"允许"。异常会打进控制台日志。
      *
-     * @param needBreak 是否同时需要破坏权限 (替换操作需要)
+     * 权限按 [AreaPermission] 的两个维度分别查原生 flag: 需要放置就查 `PLACE`, 需要破坏就查
+     * `BREAK_BLOCK`, 两项都要时**两项都查** (原来 needBreak=true 时只查破坏, 覆盖类操作因此漏了
+     * 放置权限 —— R5)。
      */
-    override fun check(player: Player, corner1: Location, corner2: Location, needBreak: Boolean): ProtectionCheck {
+    override fun check(player: Player, corner1: Location, corner2: Location, requirement: AreaPermission): ProtectionCheck {
         // 没装 / 没启用 Dominion 是"没有这层保护", 不是"无法确认"
         if (!isAvailable()) {
             return ProtectionCheck.Allowed
@@ -67,8 +69,8 @@ object DominionHook : RegionProtectionHook {
                     continue
                 }
                 // 只有真的相交的领地才做权限检查 (checkPrivilegeFlag 是这里最贵的一步)
-                val allowed = api.checkPrivilegeFlag(dominion, Flags.PLACE, player) &&
-                    (!needBreak || api.checkPrivilegeFlag(dominion, Flags.BREAK_BLOCK, player))
+                val allowed = (!requirement.needsPlace || api.checkPrivilegeFlag(dominion, Flags.PLACE, player)) &&
+                    (!requirement.needsBreak || api.checkPrivilegeFlag(dominion, Flags.BREAK_BLOCK, player))
                 if (!allowed) {
                     return ProtectionCheck.Denied(name, dominion.name)
                 }

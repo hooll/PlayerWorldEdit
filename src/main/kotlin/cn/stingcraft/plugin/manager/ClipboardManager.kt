@@ -2,6 +2,7 @@ package cn.stingcraft.plugin.manager
 
 import cn.stingcraft.plugin.PlayerWorldEdit
 import cn.stingcraft.plugin.api.event.OperationType
+import cn.stingcraft.plugin.hook.AreaPermission
 import cn.stingcraft.plugin.util.RegionSlice
 import cn.stingcraft.plugin.util.WorldEditTool
 import cn.stingcraft.plugin.util.runOnChunkThreads
@@ -63,7 +64,9 @@ class ClipboardManager(
      * 玩家线程上读。
      */
     fun tryCopy(player: Player) {
-        val validated = pipeline.validatedSelection(player, needBreak = false) ?: return
+        // copy 只读不写: 不触发操作前事件 (与既有行为一致), 但要拿编辑锁串行化同一个玩家的操作
+        // 权限按只读声明 (三个插件都没有读取 flag, 所以与放置同档 —— 见 AreaPermission.READ)
+        val validated = pipeline.validatedSelection(player, AreaPermission.READ) ?: return
         val world = validated.world
         val region = validated.region
         // copy 只读不写: 不触发操作前事件 (与既有行为一致), 但要拿编辑锁串行化同一个玩家的操作
@@ -286,9 +289,9 @@ class ClipboardManager(
             return null
         }
         val box = CuboidRegion(BlockVector3.at(min[0], min[1], min[2]), BlockVector3.at(max[0], max[1], max[2]))
-        // 领地校验覆盖整份要写的范围 (含空气会清到的那些格子); 粘贴会覆盖已有建筑, 所以按替换操作
-        // 要求破坏权限 (needBreak = true)
-        if (!pipeline.checkProtection(player, locationOf(world, min), locationOf(world, max), needBreak = true)) return null
+        // 领地校验覆盖整份要写的范围 (含空气会清到的那些格子); 粘贴会覆盖已有建筑, 所以放置与破坏
+        // 两项都要 (R5)
+        if (!pipeline.checkProtection(player, locationOf(world, min), locationOf(world, max), AreaPermission.PLACE_AND_BREAK)) return null
         // 计费: 目标框里逐格查剪贴板, 非空气按材料累加 —— 纯算术、不读世界, 且与下面写的是同一份内容
         val charges = LinkedHashMap<Material, Int>()
         for (y in min[1]..max[1]) {

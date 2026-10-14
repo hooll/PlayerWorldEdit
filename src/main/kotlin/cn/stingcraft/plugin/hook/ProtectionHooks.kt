@@ -18,12 +18,20 @@ object ProtectionHooks {
      *
      * 返回 [ProtectionCheck.Denied] 时 [ProtectionCheck.Denied.source] 就是拦下来的那个插件 ——
      * 提示里带上它, 玩家才知道该去找哪个插件要权限。
+     *
+     * @param requirement 这次操作需要哪几项权限 (见 [AreaPermission]); 三个钩子按同一份要求分别
+     *   查自己的原生 flag, 不再用一个"要不要破坏"的布尔把"破坏并放置"压成一项
      */
-    fun checkAreaEdit(player: Player, corner1: Location, corner2: Location, needBreak: Boolean): ProtectionCheck {
+    fun checkAreaEdit(
+        player: Player,
+        corner1: Location,
+        corner2: Location,
+        requirement: AreaPermission
+    ): ProtectionCheck {
         for (hook in hooks) {
             // 没装 = 没有这层保护, 不是"无法确认"
             if (!hook.isAvailable()) continue
-            when (val result = hook.check(player, corner1, corner2, needBreak)) {
+            when (val result = hook.check(player, corner1, corner2, requirement)) {
                 is ProtectionCheck.Allowed -> continue
                 // 被拒 / 无法确认都到此为止: 后面的钩子再问也不会改变"不放行"的结论
                 is ProtectionCheck.Denied -> return result

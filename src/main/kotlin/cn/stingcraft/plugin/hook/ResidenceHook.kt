@@ -23,12 +23,21 @@ import java.lang.reflect.Method
  * 4. 相交领地再递归 `getSubzones()` —— 子领地权限独立, 漏一个就是漏保护; 子领地同样先过相交预筛,
  *    所以"旗查询次数 = 相交领地数"对子领地也成立。
  *
+ * **父子语义: 按"有效空间范围"判定** (R7)。Residence 自己的解析是"取最具体的那个领地":
+ * `ResidenceManager.getByLoc` 的字节码在找到主领地后调 `ClaimedResidence.getSubzoneByLoc` 并**优先
+ * 返回子领地**; 旗的继承则由 `FlagPermissions.has(Flags, def, useParent)` 处理 —— 本领地显式设过就用
+ * 自己的, 没设才回退 `parent` (子领地的 permissions 链到父领地)。所以正确做法是: 每个领地只对
+ * **它独占的那部分空间**负责 (= 自己的各块区域 ∩ 操作框, 再挖掉所有子领地覆盖的部分), 子领地各自对
+ * 自己独占的部分负责。原来"父领地相交且拒绝就立刻返回"会把"完全落在许可子领地里"的操作也拒掉
+ * (2026-10-14 的 R7), 而只交换父子顺序又会让父领地的裸露部分失去检查。
+ *
  * 代价是 O(领地数) 次反射调用 (与 Dominion 的 `allDominions` 同量级), 换来的是零盲区。
  *
  * **语义与 Residence 自己的方块放置/破坏检查逐字一致** —— `ResidenceBlockListener` 的字节码是
  * `playerHas(player, Flags.place, playerHas(player, Flags.build, true))` (破坏那一路换 destroy),
- * 所以这里也这么问。`build` 的默认值传 **true** 而不是 false: Residence 的领地大多没有显式设过
- * `build` 旗, 传 false 会把本来有权限的玩家拦下来 (比 Residence 自己还严)。
+ * 所以这里也这么问; 需要破坏与放置两项时**两项都问** (原来 needBreak=true 时只问 destroy, 覆盖类
+ * 操作因此漏了放置权限 —— R5)。`build` 的默认值传 **true** 而不是 false: Residence 的领地大多没有
+ * 显式设过 `build` 旗, 传 false 会把本来有权限的玩家拦下来 (比 Residence 自己还严)。
  */
 object ResidenceHook : RegionProtectionHook {
 
@@ -43,14 +52,14 @@ object ResidenceHook : RegionProtectionHook {
     override fun isAvailable(): Boolean =
         runCatching { Bukkit.getPluginManager().isPluginEnabled("Residence") }.getOrDefault(false)
 
-    override fun check(player: Player, corner1: Location, corner2: Location, needBreak: Boolean): ProtectionCheck {
+    override fun check(player: Player, corner1: Location, corner2: Location, requirement: AreaPermission): ProtectionCheck {
         // 没装 / 没启用 Residence 是"没有这层保护", 不是"无法确认"
         if (!isAvailable()) {
             return ProtectionCheck.Allowed
         }
         // Location 的 world 在正常调用路径上不会为 null, 拿不到世界就当这层保护管不到
         val world = corner1.world ?: return ProtectionCheck.Allowed
-        val box = EditBox(
+        val box = ProtectionBox(
             world.name,
             intArrayOf(
                 minOf(corner1.blockX, corner2.blockX),
@@ -67,7 +76,7 @@ object ResidenceHook : RegionProtectionHook {
             val targets = Targets.resolve()
                 ?: throw IllegalStateException("Residence 已启用, 但反射目标解析失败 (版本不匹配?)")
             for (residence in targets.allResidences()) {
-                firstDenied(player, residence, box, needBreak, targets)?.let { return it }
+                firstDenied(player, residence, box, requirement, targets)?.let { return it }
             }
             ProtectionCheck.Allowed
         } catch (throwable: Throwable) {
@@ -78,43 +87,57 @@ object ResidenceHook : RegionProtectionHook {
     }
 
     /**
-     * 这个领地 (含其子领地) 里有没有拒绝: 返回第一个拒绝的结果, 全放行返回 null
+     * 这个领地**独占的那部分空间**里有没有拒绝: 返回第一个拒绝的结果, 全放行返回 null
      *
-     * 相交预筛在 [Targets.intersects] 里做, 而且**子领地也要过筛** —— 子领地不一定落在操作框里,
-     * 不筛的话会拦下本来碰不到它的操作。
+     * 独占 = 自己的各块区域与操作框的交集, 挖掉所有子领地覆盖的部分 (见 [subtract])。父领地只对
+     * 裸露的那部分负责 —— 完全落在许可子领地里的操作不会被父领地拒掉; 反过来, 父领地的裸露部分
+     * 依然照查 (不是简单交换父子顺序)。
      */
     private fun firstDenied(
         player: Player,
         residence: Any,
-        box: EditBox,
-        needBreak: Boolean,
+        box: ProtectionBox,
+        requirement: AreaPermission,
         targets: Targets
     ): ProtectionCheck.Denied? {
-        if (targets.intersects(residence, box) && !isAllowed(player, residence, needBreak, targets)) {
-            return ProtectionCheck.Denied(name, targets.nameOf(residence))
+        val children = targets.subzonesOf(residence)
+        val own = targets.intersections(residence, box)
+        if (own.isNotEmpty()) {
+            val covered = children.flatMap { targets.intersections(it, box) }
+            val effective = subtractBoxes(own, covered)
+            if (effective.isNotEmpty() && !isAllowed(player, residence, requirement, targets)) {
+                return ProtectionCheck.Denied(name, targets.nameOf(residence))
+            }
         }
-        for (subzone in targets.subzonesOf(residence)) {
-            firstDenied(player, subzone, box, needBreak, targets)?.let { return it }
+        for (subzone in children) {
+            firstDenied(player, subzone, box, requirement, targets)?.let { return it }
         }
         return null
     }
 
     /**
      * 与 Residence 自己一致: place / destroy 没设就退回 build 的值, 而 build 没设算 true
+     *
+     * [AreaPermission] 的两个维度**分别**问: 需要放置问 place, 需要破坏问 destroy, 两项都要就两项都问
+     * (原来 needBreak=true 时只问 destroy —— R5)。
      */
-    private fun isAllowed(player: Player, residence: Any, needBreak: Boolean, targets: Targets): Boolean {
+    private fun isAllowed(player: Player, residence: Any, requirement: AreaPermission, targets: Targets): Boolean {
         val permissions = targets.getPermissions.invoke(residence)
             ?: throw IllegalStateException("ClaimedResidence.getPermissions() 返回 null")
         val buildAllowed = targets.playerHas.invoke(permissions, player, targets.buildFlag, true) as Boolean
-        return if (needBreak) {
-            targets.playerHas.invoke(permissions, player, targets.destroyFlag, buildAllowed) as Boolean
-        } else {
-            targets.playerHas.invoke(permissions, player, targets.placeFlag, buildAllowed) as Boolean
+        if (requirement.needsPlace &&
+            !(targets.playerHas.invoke(permissions, player, targets.placeFlag, buildAllowed) as Boolean)
+        ) {
+            return false
         }
+        if (requirement.needsBreak &&
+            !(targets.playerHas.invoke(permissions, player, targets.destroyFlag, buildAllowed) as Boolean)
+        ) {
+            return false
+        }
+        return true
     }
 
-    /** 操作框 (方块坐标闭区间) + 世界名 —— 相交预筛与旗查询共用同一份口径 */
-    private class EditBox(val worldName: String, val min: IntArray, val max: IntArray)
 
     /**
      * 反射目标 (类 / 方法 / 枚举常量)
@@ -167,22 +190,38 @@ object ResidenceHook : RegionProtectionHook {
         }
 
         /**
-         * 领地与操作框是否相交
+         * 这个领地各块区域与操作框的**交集** (跨世界的区域跳过; 不相交的也不返回)
          *
          * 逐块 `CuboidArea` 比: 一个领地可以有多块区域 (getAreaArray), 每块带自己的世界名, 跨世界的
-         * 同名区域不能参与比较。取不到区域 (返回 null) 时按"相交"处理 —— 宁可多查一次旗, 也不能因为
-         * 反射拿不到区域就把保护漏过去。
+         * 同名区域不能参与比较。取不到区域 (返回 null) 或位置读不出来时按"整块操作框都算这个领地的"
+         * 处理 —— 宁可多查一次旗, 也不能因为反射拿不到区域就把保护漏过去。
+         *
+         * 返回交集而不是布尔值: 父领地只对"自己独占的那部分"负责, 需要用它算盒减法 (R7)。
          */
-        fun intersects(residence: Any, box: EditBox): Boolean {
-            val areas = getAreaArray.invoke(residence) as? Array<*> ?: return true
+        fun intersections(residence: Any, box: ProtectionBox): List<ProtectionBox> {
+            val areas = getAreaArray.invoke(residence) as? Array<*> ?: return listOf(box)
+            val result = ArrayList<ProtectionBox>(areas.size)
             for (area in areas) {
                 if (area == null) continue
                 if (getWorldName.invoke(area) != box.worldName) continue
-                val low = getLowLocation.invoke(area) as? Location ?: return true
-                val high = getHighLocation.invoke(area) as? Location ?: return true
-                if (overlaps(low, high, box)) return true
+                val low = getLowLocation.invoke(area) as? Location ?: return listOf(box)
+                val high = getHighLocation.invoke(area) as? Location ?: return listOf(box)
+                val areaBox = ProtectionBox(
+                    box.worldName,
+                    intArrayOf(
+                        minOf(low.blockX, high.blockX),
+                        minOf(low.blockY, high.blockY),
+                        minOf(low.blockZ, high.blockZ)
+                    ),
+                    intArrayOf(
+                        maxOf(low.blockX, high.blockX),
+                        maxOf(low.blockY, high.blockY),
+                        maxOf(low.blockZ, high.blockZ)
+                    )
+                )
+                areaBox.intersect(box)?.let { result += it }
             }
-            return false
+            return result
         }
 
         fun nameOf(residence: Any): String = getName.invoke(residence) as? String ?: "?"
@@ -193,23 +232,6 @@ object ResidenceHook : RegionProtectionHook {
 
             fun resolve(): Targets? = resolved
         }
-    }
-
-    /**
-     * 两个方块坐标闭区间是否相交 (**贴边也算相交**)
-     *
-     * 与 Dominion 钩子的 `<=` / `>=` 口径一致: 紧贴领地边界的选区也会被拦, 方向是"更严"而不是漏。
-     */
-    private fun overlaps(low: Location, high: Location, box: EditBox): Boolean {
-        val minX = minOf(low.blockX, high.blockX)
-        val minY = minOf(low.blockY, high.blockY)
-        val minZ = minOf(low.blockZ, high.blockZ)
-        val maxX = maxOf(low.blockX, high.blockX)
-        val maxY = maxOf(low.blockY, high.blockY)
-        val maxZ = maxOf(low.blockZ, high.blockZ)
-        return minX <= box.max[0] && maxX >= box.min[0] &&
-            minY <= box.max[1] && maxY >= box.min[1] &&
-            minZ <= box.max[2] && maxZ >= box.min[2]
     }
 
     /**

@@ -4,6 +4,7 @@ import cn.stingcraft.plugin.PlayerWorldEdit
 import cn.stingcraft.plugin.api.event.OperationType
 import cn.stingcraft.plugin.api.event.WorldEditOperationCompleteEvent
 import cn.stingcraft.plugin.api.event.WorldEditOperationEvent
+import cn.stingcraft.plugin.hook.AreaPermission
 import cn.stingcraft.plugin.hook.ProtectionCheck
 import cn.stingcraft.plugin.hook.ProtectionHooks
 import cn.stingcraft.plugin.util.ChunkBatchResult
@@ -363,14 +364,17 @@ class EditPipeline(private val selection: SelectionManager) {
      * 选区校验: 区域必须完整、两点与玩家同世界, 且没有领地拦截
      *
      * 返回的 [ValidatedSelection.world] 就是这次操作固定下来的世界 (见 [EditOperation])。
+     *
+     * @param requirement 这次操作需要哪几项权限 (见 [AreaPermission]) —— 由调用方按"真正会做什么"
+     *   声明, 收口只负责把它原样传给三层保护
      */
-    internal fun validatedSelection(player: Player, needBreak: Boolean): ValidatedSelection? {
+    internal fun validatedSelection(player: Player, requirement: AreaPermission): ValidatedSelection? {
         // 世界先校验: 两点跨世界、或者玩家已经不在选区那个世界, 都不能往下走 (R4)
         val world = selection.selectionWorld(player) ?: return null
         val region = selection.selectionRegion(player) ?: return null
         val pos1 = selection.getPlayerPos1(player) ?: return null
         val pos2 = selection.getPlayerPos2(player) ?: return null
-        if (!checkProtection(player, pos1, pos2, needBreak)) return null
+        if (!checkProtection(player, pos1, pos2, requirement)) return null
         return ValidatedSelection(region, world)
     }
 
@@ -380,11 +384,19 @@ class EditPipeline(private val selection: SelectionManager) {
      * 这里是全部"写方块 / 读选区"操作的**唯一收口**: 装了哪几层保护 (Dominion / Residence /
      * WorldGuard) 交给 [ProtectionHooks] 逐个问, 任何一层拒绝、或任何一层无法确认都拒绝。
      *
+     * 权限要求由调用方声明成 [AreaPermission] (放置 / 破坏 / 两项都要 / 只读), 不再用一个"要不要破坏"
+     * 的布尔 —— 覆盖类操作必须**两项都过**, 只用布尔会让"只许放置"的玩家也能清空/覆盖 (R5)。
+     *
      * 抽成一处的理由没变: 选区操作拿 pos1/pos2 去查, 而圆柱**没有选区**, 只能拿它的外接长方体
      * 去查 —— 但"拒绝 / 无法确认"的处理必须一模一样, 不能各写一份。
      */
-    internal fun checkProtection(player: Player, corner1: Location, corner2: Location, needBreak: Boolean): Boolean {
-        return when (val check = ProtectionHooks.checkAreaEdit(player, corner1, corner2, needBreak)) {
+    internal fun checkProtection(
+        player: Player,
+        corner1: Location,
+        corner2: Location,
+        requirement: AreaPermission
+    ): Boolean {
+        return when (val check = ProtectionHooks.checkAreaEdit(player, corner1, corner2, requirement)) {
             is ProtectionCheck.Allowed -> true
             is ProtectionCheck.Denied -> {
                 // 提示里带上是谁拦的 (source) 与它的原因 (detail): 三个钩子共用这一条消息
