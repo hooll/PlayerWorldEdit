@@ -28,6 +28,7 @@ import org.bukkit.Bukkit
 import org.bukkit.Location
 import org.bukkit.Material
 import org.bukkit.Particle
+import org.bukkit.World
 import org.bukkit.entity.Player
 import org.bukkit.inventory.ItemStack
 import org.bukkit.util.Vector
@@ -47,6 +48,7 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReferenceArray
 import kotlin.math.abs
+import kotlin.math.ceil
 import kotlin.math.floor
 import kotlin.math.max
 
@@ -978,6 +980,179 @@ class WorldEditManager {
     }
 
     /**
+     * 把选区里的建筑沿视线方向平移 [blocks] 格 (对齐 WE 的 `//move`)
+     *
+     * 目标区 = 源区 (选区) 沿方向平移; 写入目标区 (源内容)、源区清成空气; **选区本身不动**
+     * (WE 的 `//move` 默认也不动, `-s` 之类的 flag 不做)。
+     *
+     * 两轮管线 (重叠安全的关键): 第一轮在区块线程上**只读**源区, 压成一维快照; 玩家线程统计材料 →
+     * [consumeAll]; 第二轮写入只查第一轮的快照 ([WorldEditTool.writeBlocks] 的 `stateAt` 是纯查表),
+     * **写入阶段一次世界读都没有** —— 源区与目标区可能重叠 (steps < 选区尺寸), 而各区块任务的执行
+     * 顺序不可依赖, 只有"一切以第一轮快照为准"才能保证搬出去的内容和搬之前一模一样。
+     *
+     * 越界 = **整体不动作**: 目标框只要出去一格, 那部分内容就永远丢了 (源区已经清掉、目标区又写不
+     * 进去), 所以宁可不动也不丢 —— 与 expand/paste 的"夹取后照常执行"是有意的两套策略。
+     *
+     * @param blocks 平移格数, 内部 clamp 到 1..[SELECTION_EDIT_MAX_BLOCKS]
+     */
+    fun moveSelection(player: Player, blocks: Int) {
+        val region = selectionRegion(player) ?: return
+        val steps = blocks.coerceIn(1, SELECTION_EDIT_MAX_BLOCKS)
+        val (axis, positive) = snapAxis(player.eyeLocation.direction)
+        val min = intArrayOf(region.minimumPoint.x(), region.minimumPoint.y(), region.minimumPoint.z())
+        val max = intArrayOf(region.maximumPoint.x(), region.maximumPoint.y(), region.maximumPoint.z())
+        // 位移只在吸附到的那一轴上
+        val delta = intArrayOf(0, 0, 0)
+        delta[axis] = if (positive) steps else -steps
+        val targetMin = intArrayOf(min[0] + delta[0], min[1] + delta[1], min[2] + delta[2])
+        val targetMax = intArrayOf(max[0] + delta[0], max[1] + delta[1], max[2] + delta[2])
+        if (!moveTargetInWorld(player, targetMin, targetMax)) {
+            player.sendLang("message-move-out-of-bounds", pluginId to "pluginId")
+            return
+        }
+        // 领地校验覆盖**会被改动的全部方块**: 源区 ∪ 目标区的包围盒 (清源区 + 覆盖目标区, 所以按
+        // 替换操作要求破坏权限, 与 replace/paste 同类)。fail-closed。
+        val checkMin = intArrayOf(minOf(min[0], targetMin[0]), minOf(min[1], targetMin[1]), minOf(min[2], targetMin[2]))
+        val checkMax = intArrayOf(maxOf(max[0], targetMax[0]), maxOf(max[1], targetMax[1]), maxOf(max[2], targetMax[2]))
+        if (!checkDominion(player, locationOf(player, checkMin), locationOf(player, checkMax), needBreak = true)) return
+        if (!beginEdit(player)) return
+        EditBudget.configure(blocksPerTick())
+        val world = player.world
+        // 第一轮: 只读源区。写入阶段全靠这份快照, 所以它必须完整
+        val source = arrayOfNulls<BlockState>(region.volume.toInt())
+        val index = BoxIndex(min, max)
+        runOnChunkThreads(
+            region.splitByChunk(),
+            world,
+            work = { _, slice ->
+                val weWorld = BukkitAdapter.adapt(world)
+                for (vector in slice.region) {
+                    source[index.indexOf(vector.x(), vector.y(), vector.z())] = weWorld.getBlock(vector)
+                }
+            },
+            done = { timedOut ->
+                // 统计是纯内存操作, 顺手在区块线程上做, 玩家线程只拿结果
+                val moved = if (timedOut) emptyMap() else countMaterials(source)
+                onPlayerThread(player) {
+                    if (timedOut) {
+                        // 源区没读完: 什么都还没扣、也没写, 直接收尾
+                        endEdit(player)
+                        player.sendLang("message-edit-failed", pluginId to "pluginId")
+                        return@onPlayerThread
+                    }
+                    if (moved.isEmpty()) {
+                        // 源区全是空气: 没有可搬的。照字面执行会把目标区清空, 但那不是玩家要的"搬
+                        // 东西", 所以直接不动 (与 expand 的"没有可复制的"同一处理)
+                        endEdit(player)
+                        player.sendLang("message-move-empty", pluginId to "pluginId")
+                        return@onPlayerThread
+                    }
+                    // 目标区写下去的就是源区这份内容, 所以用量 = 源区的统计 (与 expand 同口径:
+                    // 搬出来的方块算"新放上的", 要按材料扣; 源区清空气不退料, 同 contract)
+                    if (!consumeAll(player, moved)) {
+                        endEdit(player)
+                        return@onPlayerThread
+                    }
+                    val actor = actorOf(player)
+                    // 源 ∪ 目标 的并集按区块切分: 同一区块只出现一次、只取一份快照 —— 源区与目标区
+                    // 重叠时若分成两批处理, 后一批的快照会拍到前一批刚写下去的内容, 撤销就还原不回去
+                    val union = CuboidRegion(
+                        BlockVector3.at(checkMin[0], checkMin[1], checkMin[2]),
+                        BlockVector3.at(checkMax[0], checkMax[1], checkMax[2])
+                    )
+                    prepareEdit(union.volume.toInt(), player)
+                    val regions = union.splitByChunk()
+                    // 每个区块实际写下去多少 (空气也记: 撤销要能还原被清掉的源区), 收尾时当成本表
+                    val written = AtomicReferenceArray<HashMap<Material, Int>?>(regions.size)
+                    val air = BlockTypes.AIR!!.defaultState
+                    writeChunks(
+                        player,
+                        regions,
+                        "message-move-susses",
+                        charged = moved,
+                        costs = { regions.indices.map { written.get(it) ?: emptyMap() } }
+                    ) { chunkIndex, slice, _ ->
+                        val counts = written.get(chunkIndex)
+                            ?: HashMap<Material, Int>().also { written.set(chunkIndex, it) }
+                        WorldEditTool.writeBlocks(
+                            world,
+                            slice.region,
+                            actor,
+                            // 只查第一轮的源快照, 一次世界读都没有: 源/目标重叠也不会读到刚写下去的内容
+                            stateAt = { x, y, z ->
+                                when {
+                                    // 目标区: 取源快照里 (减去位移) 的那一格
+                                    x in targetMin[0]..targetMax[0] &&
+                                        y in targetMin[1]..targetMax[1] &&
+                                        z in targetMin[2]..targetMax[2] ->
+                                        source[index.indexOf(x - delta[0], y - delta[1], z - delta[2])]
+                                    // 源区里、目标区之外的部分: 清成空气
+                                    x in min[0]..max[0] && y in min[1]..max[1] && z in min[2]..max[2] -> air
+                                    // 并集里既不属于源也不属于目标的格子: 不动
+                                    else -> null
+                                }
+                            },
+                            onWritten = { state -> counts.add(state.blockType) }
+                        )
+                    }
+                }
+            }
+        )
+    }
+
+    /**
+     * 目标框是不是完全在世界内 (世界高度 + X/Z 世界边界)
+     *
+     * 只有 move 用它做"整体拒绝": 出去一格就意味着有方块搬不过去 (源区清了、目标区写不上),
+     * 所以这里不像 expand/paste 那样夹取。世界边界读不到时只按高度判断 (退回改动前的行为)。
+     */
+    private fun moveTargetInWorld(player: Player, min: IntArray, max: IntArray): Boolean {
+        val weWorld = BukkitAdapter.adapt(player.world)
+        if (min[AXIS_Y] < weWorld.minY || max[AXIS_Y] > weWorld.maxY) return false
+        val border = worldBorderBounds(player.world) ?: return true
+        return min[AXIS_X] >= border[0] && max[AXIS_X] <= border[1] &&
+            min[AXIS_Z] >= border[2] && max[AXIS_Z] <= border[3]
+    }
+
+    /**
+     * 世界边界 (方块坐标闭区间, 依次是 minX / maxX / minZ / maxZ), 读不到就返回 null
+     *
+     * 编译期用的精简 API 里 `org.bukkit.WorldBorder` 只有 `getCenter()/getSize()/isInside()`,
+     * **没有** Paper 的 `getMinX()/getMaxX()/getMinZ()/getMaxZ()` (javap 实测, 见报告), WE 的
+     * `BukkitWorld` 也没有等价入口 —— 所以按 Bukkit 自己的算式从中心与边长推:
+     * min = center - size / 2、max = center + size / 2, 再取"方块中心落在边界内"的方块范围
+     * (方块 x 的中心是 x + 0.5, 所以 min 上取整、max 下取整后再各让半格)。
+     */
+    private fun worldBorderBounds(world: World): IntArray? {
+        val border = runCatching { world.worldBorder }.getOrNull() ?: return null
+        val half = border.size / 2.0
+        // 边界还没初始化 (size <= 0) 时不把它当边界用, 免得把所有操作都夹没了
+        if (half <= 0.0) return null
+        val center = border.center
+        return intArrayOf(
+            ceil(center.x - half - 0.5).toInt(),
+            floor(center.x + half - 0.5).toInt(),
+            ceil(center.z - half - 0.5).toInt(),
+            floor(center.z + half - 0.5).toInt()
+        )
+    }
+
+    /**
+     * 长方体里"方块坐标 → 一维下标"的换算 (y → z → x, 与 WE 的区域遍历顺序一致)
+     *
+     * move 的第一轮快照与第二轮查表必须按同一个顺序寻址, 所以共用一个下标器。
+     * [ClipboardVolume] 里那份是"相对剪贴板原点"的偏移下标, 这里要的是绝对坐标, 不通用。
+     */
+    private class BoxIndex(private val min: IntArray, private val max: IntArray) {
+
+        private val sizeX = max[AXIS_X] - min[AXIS_X] + 1
+        private val sizeZ = max[AXIS_Z] - min[AXIS_Z] + 1
+
+        fun indexOf(x: Int, y: Int, z: Int): Int =
+            ((y - min[AXIS_Y]) * sizeZ + (z - min[AXIS_Z])) * sizeX + (x - min[AXIS_X])
+    }
+
+    /**
      * 跑一遍写方块管线: 每个区块先读整片快照 (写之前), 再把这一片交给 [writeSlice] 写; 全部跑完
      * 后回玩家线程收尾 ([finishEdit])。
      *
@@ -1813,14 +1988,24 @@ class WorldEditManager {
     }
 
     /**
-     * 选区校验: 区域必须完整, 且没有领地拦截
+     * 选区必须完整, 返回它的 WorldEdit 区域; 没选齐就提示并返回 null
+     *
+     * 抽出来是因为 move 要按"源区 ∪ 目标区"的包围盒单独查领地 (见 [moveSelection]), 那一处只取
+     * 区域、不能走 [validatedRegion] 里那套"按选区查领地"。
      */
-    private fun validatedRegion(player: Player, needBreak: Boolean): CuboidRegion? {
+    private fun selectionRegion(player: Player): CuboidRegion? {
         if (!hasRegion(player)) {
             player.sendLang("message-no-region", pluginId to "pluginId")
             return null
         }
-        val region = getWERegion(player) ?: return null
+        return getWERegion(player)
+    }
+
+    /**
+     * 选区校验: 区域必须完整, 且没有领地拦截
+     */
+    private fun validatedRegion(player: Player, needBreak: Boolean): CuboidRegion? {
+        val region = selectionRegion(player) ?: return null
         val pos1 = getPlayerPos1(player) ?: return null
         val pos2 = getPlayerPos2(player) ?: return null
         if (!checkDominion(player, pos1, pos2, needBreak)) return null

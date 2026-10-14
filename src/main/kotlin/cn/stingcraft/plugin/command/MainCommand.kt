@@ -53,6 +53,9 @@ object MainCommand {
     val contract = CommandContract.command
 
     @CommandBody(permission = "PlayerWorldEdit.Use")
+    val move = CommandMove.command
+
+    @CommandBody(permission = "PlayerWorldEdit.Use")
     val wall = CommandWall.command
 
     @CommandBody(permission = "PlayerWorldEdit.Use")
