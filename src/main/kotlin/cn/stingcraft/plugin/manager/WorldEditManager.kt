@@ -69,6 +69,15 @@ class WorldEditManager {
      */
     private val clipboards = ConcurrentHashMap<UUID, ClipboardVolume>()
 
+    /**
+     * 形状尺寸选择器里"待确认"的半径 / 高度 (半径 to 高度)
+     *
+     * 箱式菜单没有输入框, 玩家点 ± 之后新值要留在某处等下一次点击或确认, 所以按 UUID 存一份;
+     * 和剪贴板一样挂在 [clearPlayerPos] 的退出清理路径上 —— 直接按 ESC 走人的玩家没人回收这份
+     * 状态, 绝不能变成"按 UUID 只增不删"的表。确认生成时即用即弃 ([forgetShapeSize])。
+     */
+    private val pendingShapeSizes = ConcurrentHashMap<UUID, Pair<Int, Int>>()
+
     // 选区可视化 (半透明玻璃盒子), 用不了时退回粒子边框
     private val areaDisplay = AreaDisplay()
 
@@ -251,6 +260,8 @@ class WorldEditManager {
         areaDisplay.forget(player)
         // 剪贴板同样按 UUID 只增不删, 退出时清掉 (不持久化, 下次登录就是空剪贴板)
         clipboards.remove(player.uniqueId)
+        // 形状尺寸选择器里那份待确认数值同理: 退出即丢, 下次登录重新从初值开始
+        forgetShapeSize(player)
         endEdit(player)
     }
 
@@ -440,6 +451,41 @@ class WorldEditManager {
     }
 
     /**
+     * 读取玩家正在调整的形状尺寸 (半径 to 高度)
+     *
+     * 该玩家还没有进行中的状态时返回 [SHAPE_SIZE_DEFAULT]: 那只是"还没调过"的默认显示, 不写进表里
+     * (点过 ± 才有条目), 所以只开一次选择器就按 ESC 的玩家什么都不会留下。
+     */
+    fun pendingShapeSize(player: Player): Pair<Int, Int> =
+        pendingShapeSizes[player.uniqueId] ?: SHAPE_SIZE_DEFAULT
+
+    /**
+     * 增减形状尺寸选择器里的数值, 结果 clamp 在 1..[SHAPE_MAX_SIZE] (点到顶/到底就停住, 不报错)
+     *
+     * 读改写用 compute 而不是 get + put: 同一个玩家的点击本来就串行, 但这样连"两次点击撞在一起"
+     * 的可能性都不用去论证。
+     */
+    fun adjustShapeSize(player: Player, radiusDelta: Int, heightDelta: Int) {
+        pendingShapeSizes.compute(player.uniqueId) { _, current ->
+            val (radius, height) = current ?: SHAPE_SIZE_DEFAULT
+            (radius + radiusDelta).coerceIn(1, SHAPE_MAX_SIZE) to
+                (height + heightDelta).coerceIn(1, SHAPE_MAX_SIZE)
+        }
+    }
+
+    /**
+     * 丢掉进行中的形状尺寸 (确认生成后即用即弃; 玩家退出时由 [clearPlayerPos] 一并清掉)
+     */
+    fun forgetShapeSize(player: Player) {
+        pendingShapeSizes.remove(player.uniqueId)
+    }
+
+    /**
+     * 形状尺寸的上限 (选择器的提示文案要用) —— 与 [SHAPE_MAX_SIZE] 是同一份定义, 界面层不另抄一个数
+     */
+    fun shapeSizeMax(): Int = SHAPE_MAX_SIZE
+
+    /**
      * 圆柱的几何与校验 —— 和墙的区别在于它**完全不看选区**
      *
      * 中心 = 玩家所在的那一格, 底面 = 玩家脚下方块 (低于世界最低高度时先往上贴到 minY), 向上
@@ -458,6 +504,9 @@ class WorldEditManager {
         successKey: String
     ) {
         if (!validateShapeSize(player, radius, height)) return
+        // 走到这里就是真的在生成了: 选择器里那份待确认数值到此用掉 (即用即弃)。命令行调用时表里
+        // 本来就没有这个键, 删它是空操作 —— 两个入口共用这一处收尾, 界面层不用自己记着清。
+        forgetShapeSize(player)
         val weWorld = BukkitAdapter.adapt(player.world)
         val location = player.location
         val centerX = location.blockX
@@ -1779,6 +1828,14 @@ class WorldEditManager {
          * 挡住手滑敲出来的一长串数字。
          */
         const val SHAPE_MAX_SIZE = 256
+
+        /**
+         * 形状尺寸选择器的初值 (半径 to 高度)
+         *
+         * 没有进行中的状态时用它起一份; 取 5 是为了和旧的 3x3 预设里最小的一档一致 —— 界面一打开
+         * 就跳到一个玩家没见过的大数字, 比多按几次 ± 更让人意外。
+         */
+        val SHAPE_SIZE_DEFAULT = 5 to 5
 
         /**
          * 剪贴板允许的旋转角度

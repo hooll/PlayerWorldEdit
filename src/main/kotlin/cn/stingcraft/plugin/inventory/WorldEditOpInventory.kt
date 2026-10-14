@@ -18,6 +18,13 @@ import taboolib.platform.util.sendLang
 
 object WorldEditOpInventory {
 
+    /**
+     * 步进选择器一次点击动多少格 (每排的按钮是 ±1 与 ±[SHAPE_STEP] 两档)
+     *
+     * 只活在界面层: 数值的上下限与初值都在 manager (那里才做校验), 这里纯粹是"点一下动多少"的手感。
+     */
+    private const val SHAPE_STEP = 10
+
     private val worldEditManager = PlayerWorldEdit.worldEditManager
 
     fun open(player: Player) {
@@ -124,10 +131,11 @@ object WorldEditOpInventory {
                 name = "&f| 实心圆柱"
                 lore += "&7| 以你的位置为中心生成实心圆柱"
                 lore += "&7| 下一步选半径与高度"
+                lore += "&7| 半径和高度可以自己增减"
                 colored()
             }) {
                 openBlockPicker(player, "&f选择实心圆柱的方块") { material ->
-                    openSizePicker(player, "&f选择圆柱尺寸") { radius, height ->
+                    openNumberStepper(player, "&f选择圆柱尺寸", "半径", "高度") { radius, height ->
                         player.closeInventory()
                         worldEditManager.tryGenerateCylinder(player, material, radius, height)
                     }
@@ -138,10 +146,11 @@ object WorldEditOpInventory {
                 lore += "&7| 以你的位置为中心"
                 lore += "&7| 只生成半径处那一圈壳 (厚 1 格)"
                 lore += "&7| 内部方块不动"
+                lore += "&7| 下一步选半径与高度, 可以自己增减"
                 colored()
             }) {
                 openBlockPicker(player, "&f选择空心圆柱的方块") { material ->
-                    openSizePicker(player, "&f选择圆柱尺寸") { radius, height ->
+                    openNumberStepper(player, "&f选择圆柱尺寸", "半径", "高度") { radius, height ->
                         player.closeInventory()
                         worldEditManager.tryGenerateHollowCylinder(player, material, radius, height)
                     }
@@ -212,34 +221,73 @@ object WorldEditOpInventory {
     }
 
     /**
-     * 圆柱的半径 / 高度预设
+     * 形状尺寸的数字步进选择器 (半径 / 高度各一排)
      *
-     * 箱子界面没有输入框, 做一个"等玩家打字"的输入流程又要多一份 per-player 待输入状态
-     * (前几轮反复踩过按 UUID 只增不删的坑), 所以这里给 3x3 预设: 横轴半径、纵轴高度,
-     * 都是 5 / 10 / 20; 任意数值走命令行 `/pwe cyl <方块> <半径> <高度>`。
+     * 箱子界面没有输入框, 而"等玩家打字"的输入流程要多一份 per-player 待输入状态 (前几轮反复踩过
+     * 按 UUID 只增不删的坑), 所以改成点按钮增减: 每排 `-10 -1 [当前值] +1 +10`, 点完重开本菜单刷新
+     * 显示, 底部确认生成。待确认的数值本身存在 manager 里 (挂 clearPlayerPos 的退出清理路径),
+     * 这里只负责显示与派发。
+     *
+     * 实心圆柱与空心圆柱共用这一个组件: 只有标题、两排的标签和确认回调不同, 不为两个形状各写一份。
      */
-    private fun openSizePicker(player: Player, title: String, callback: (radius: Int, height: Int) -> Unit) {
+    private fun openNumberStepper(
+        player: Player,
+        title: String,
+        firstLabel: String,
+        secondLabel: String,
+        onConfirm: (first: Int, second: Int) -> Unit
+    ) {
+        val (first, second) = worldEditManager.pendingShapeSize(player)
+        // 点完增减原地刷新: 重开同一个菜单即可 (扩缩按钮的既有写法)
+        val refresh = { openNumberStepper(player, title, firstLabel, secondLabel, onConfirm) }
         player.openMenu(buildMenu<ChestImpl>(title.colored()) {
             rows(4)
             // 和主菜单一样锁住整页: 没注册 onClick 的格子原本可以把物品拿走
             onClick(true) { }
             set(4, buildItem(XMaterial.PAPER) {
-                name = "&f| 半径 x 高度"
-                lore += "&7| 横着看是半径: &e5 &7/ &e10 &7/ &e20"
-                lore += "&7| 竖着看是高度: &e5 &7/ &e10 &7/ &e20"
-                lore += "&7| 要任意数值用命令: &f/pwe cyl <方块> <半径> <高度>"
+                name = "&f| $firstLabel / $secondLabel"
+                lore += "&7| 点两边的按钮增减, 到底/到顶就停住"
+                lore += "&7| 范围 1 - ${worldEditManager.shapeSizeMax()}"
+                lore += "&7| 点底部的按钮生成"
                 colored()
             })
-            val radii = listOf(5, 10, 20)
-            listOf(5, 10, 20).forEachIndexed { row, height ->
-                radii.forEachIndexed { column, radius ->
-                    set((row + 1) * 9 + 3 + column, buildItem(XMaterial.LIME_STAINED_GLASS_PANE) {
-                        name = "&f| 半径 $radius &7/ &f高度 $height"
-                        colored()
-                    }) {
-                        callback(radius, height)
-                    }
-                }
+            // 一排: -10 -1 [当前值] +1 +10 —— 半径与高度两排共用这段布局
+            fun row(startSlot: Int, label: String, value: Int, step: (Int) -> Unit) {
+                set(startSlot, buildItem(XMaterial.RED_STAINED_GLASS_PANE) {
+                    name = "&f| $label -$SHAPE_STEP"
+                    colored()
+                }) { step(-SHAPE_STEP) }
+                set(startSlot + 1, buildItem(XMaterial.RED_STAINED_GLASS_PANE) {
+                    name = "&f| $label -1"
+                    colored()
+                }) { step(-1) }
+                set(startSlot + 2, buildItem(XMaterial.PAPER) {
+                    name = "&f| $label: &e$value"
+                    colored()
+                })
+                set(startSlot + 3, buildItem(XMaterial.LIME_STAINED_GLASS_PANE) {
+                    name = "&f| $label +1"
+                    colored()
+                }) { step(1) }
+                set(startSlot + 4, buildItem(XMaterial.LIME_STAINED_GLASS_PANE) {
+                    name = "&f| $label +$SHAPE_STEP"
+                    colored()
+                }) { step(SHAPE_STEP) }
+            }
+            row(11, firstLabel, first) { delta ->
+                worldEditManager.adjustShapeSize(player, delta, 0)
+                refresh()
+            }
+            row(20, secondLabel, second) { delta ->
+                worldEditManager.adjustShapeSize(player, 0, delta)
+                refresh()
+            }
+            set(31, buildItem(XMaterial.EMERALD_BLOCK) {
+                name = "&f| 确认生成"
+                lore += "&7| 用当前的 $firstLabel / $secondLabel 生成"
+                colored()
+            }) {
+                onConfirm(first, second)
             }
         })
     }
