@@ -1121,6 +1121,9 @@ class WorldEditManager {
             done = { timedOut ->
                 onPlayerThread(player) {
                     endEdit(player)
+                    // 玩家在读取期间退出: 退出路径已经清过表 (clearPlayerPos), 这里再把剪贴板 put 回去
+                    // 就成了"按 UUID 只增不删"的泄漏, 而剪贴板不设上限 —— 离线玩家一律不发布
+                    if (!player.isOnline) return@onPlayerThread
                     // 超时、或者某个区块没读完 (数组里留下 null) 都算失败: 半份剪贴板贴出去比不贴更糟
                     if (timedOut || !clipboard.isComplete()) {
                         player.sendLang("message-edit-failed", pluginId to "pluginId")
