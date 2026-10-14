@@ -66,4 +66,7 @@ object MainCommand {
 
     @CommandBody(permission = "PlayerWorldEdit.Use")
     val rotate = CommandRotate.command
+
+    @CommandBody(permission = "PlayerWorldEdit.Use")
+    val paste = CommandPaste.command
 }

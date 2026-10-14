@@ -170,6 +170,16 @@ object WorldEditOpInventory {
                     worldEditManager.rotateClipboard(player, degrees)
                 }
             }
+            set(42, buildItem(XMaterial.STRUCTURE_BLOCK) {
+                name = "&f| 粘贴剪贴板"
+                lore += "&7| 剪贴板原点贴到你脚下"
+                lore += "&7| 空气会清掉目标位置的方块"
+                lore += "&7| 按材料消耗, 可撤销"
+                colored()
+            }) {
+                player.closeInventory()
+                worldEditManager.tryPaste(player)
+            }
         }
     }
 

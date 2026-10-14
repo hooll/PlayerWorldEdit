@@ -1160,6 +1160,87 @@ class WorldEditManager {
     }
 
     /**
+     * 把剪贴板贴到玩家所在的位置 (对齐 WE 的 `//paste`)
+     *
+     * 锚点: WE 的 `getPlacementPosition` 对玩家就是"玩家脚下那一格", 剪贴板**原点**落到这里 ——
+     * 所以"原地 copy → paste"就是原样贴回, 走 5 格再 paste 就是平移 5 格的副本。空气照写 (与 WE
+     * 一致: 剪贴板里的空气会把目标位置的方块清掉), 计费只算非空气 (与 `/pwe set air` 一致)。
+     *
+     * 写方块走 [writeChunks] 这条既有链路 (区域线程 + 每 tick 预算 + 看门狗 + 快照撤销), 玩家线程上
+     * 只做纯算术的计费和调度。
+     */
+    fun tryPaste(player: Player) {
+        val clipboard = clipboards[player.uniqueId] ?: run {
+            player.sendLang("message-clipboard-empty", pluginId to "pluginId")
+            return
+        }
+        val world = player.world
+        val weWorld = BukkitAdapter.adapt(world)
+        val anchor = player.location
+        val anchorX = anchor.blockX
+        val anchorY = anchor.blockY
+        val anchorZ = anchor.blockZ
+        // 目标框 = 剪贴板的偏移框平移到锚点。Y 夹进世界高度: 被夹掉的格子不写、也不计费
+        // (与形状生成同一个口径 —— 计费必须等于"真正会写的方块", 否则会多扣)
+        val minX = anchorX + clipboard.minX
+        val maxX = anchorX + clipboard.maxX
+        val minZ = anchorZ + clipboard.minZ
+        val maxZ = anchorZ + clipboard.maxZ
+        val minY = maxOf(anchorY + clipboard.minY, weWorld.minY)
+        val maxY = minOf(anchorY + clipboard.maxY, weWorld.maxY)
+        if (minY > maxY) {
+            // 整份剪贴板都落在世界高度之外
+            player.sendLang("message-shape-none", pluginId to "pluginId")
+            return
+        }
+        val box = CuboidRegion(BlockVector3.at(minX, minY, minZ), BlockVector3.at(maxX, maxY, maxZ))
+        // 领地校验覆盖整份要写的范围 (含空气会清到的那些格子); 粘贴会覆盖已有建筑, 所以按替换操作
+        // 要求破坏权限 (needBreak = true)
+        val corner1 = locationOf(player, intArrayOf(minX, minY, minZ))
+        val corner2 = locationOf(player, intArrayOf(maxX, maxY, maxZ))
+        if (!checkDominion(player, corner1, corner2, needBreak = true)) return
+        // 计费: 目标框里逐格查剪贴板, 非空气按材料累加 —— 纯算术、不读世界, 且与下面写的是同一份内容
+        val charges = LinkedHashMap<Material, Int>()
+        for (y in minY..maxY) {
+            for (z in minZ..maxZ) {
+                for (x in minX..maxX) {
+                    val state = clipboard.stateAt(x - anchorX, y - anchorY, z - anchorZ) ?: continue
+                    if (!state.blockType.isAir()) charges.add(state.blockType)
+                }
+            }
+        }
+        if (!beginEdit(player)) return
+        // 全有全无: 任何一种材料不够就一个方块都不写 (consumeAll 会把已扣的原样加回去)
+        if (!consumeAll(player, charges)) {
+            endEdit(player)
+            return
+        }
+        prepareEdit(box.volume.toInt(), player)
+        val actor = actorOf(player)
+        val regions = box.splitByChunk()
+        // 每个区块实际写下去多少 (空气也记: 撤销要能还原被清掉的位置), 收尾时当成本表用
+        val written = AtomicReferenceArray<HashMap<Material, Int>?>(regions.size)
+        writeChunks(
+            player,
+            regions,
+            "message-paste-susses",
+            charged = charges,
+            costs = { regions.indices.map { written.get(it) ?: emptyMap() } }
+        ) { index, slice, _ ->
+            val counts = written.get(index)
+                ?: HashMap<Material, Int>().also { written.set(index, it) }
+            WorldEditTool.writeBlocks(
+                world,
+                slice.region,
+                actor,
+                // 剪贴板就在内存里: 这里的查表是纯算术, 不读世界
+                stateAt = { x, y, z -> clipboard.stateAt(x - anchorX, y - anchorY, z - anchorZ) },
+                onWritten = { state -> counts.add(state.blockType) }
+            )
+        }
+    }
+
+    /**
      * 剪贴板支持的角度
      *
      * 命令补全与 GUI 的角度按钮都用它, 免得"能补全的角度"和"真能旋转的角度"各写一份对不上。
