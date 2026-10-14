@@ -10,9 +10,8 @@ import taboolib.common.platform.function.warning
 /**
  * Dominion 的领地保护钩子
  *
- * 这里是三个钩子里唯一"遍历相交区域"的实现: Dominion 的领地是立方体, 而且 API 直接把
- * `allDominions` 给出来, 所以能做到"只要相交就逐个查"的完整覆盖 —— Residence / WorldGuard
- * 只有按点查询的入口, 覆盖粒度见 [protectionProbePoints] 的说明。
+ * 遍历 `allDominions` 并把与操作框相交的领地逐个查 —— 三个钩子现在都是"完整覆盖" (WorldGuard 走
+ * 区域相交查询, Residence 走遍历 + 包围盒预筛), 所以同一个操作在三层保护下不会出现"谁漏了"。
  */
 object DominionHook : RegionProtectionHook {
 
