@@ -5,6 +5,7 @@ import cn.stingcraft.plugin.data.MaterialPack
 import cn.stingcraft.plugin.database.MaterialPackDataBase
 import org.bukkit.Material
 import org.bukkit.entity.Player
+import taboolib.common.platform.function.warning
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
@@ -60,10 +61,15 @@ class MaterialPackManager {
         }
     }
 
-    /** 把缓存写回数据库; 调用方必须已经持有这个玩家的锁 */
+    /**
+     * 把缓存写回数据库; 调用方必须已经持有这个玩家的锁
+     *
+     * 用 [MaterialPackDataBase.saveMaterialPackNow]: 容器 + 数据库一起写。退出/关服这条路径也走它 ——
+     * 少写一次库省不了什么, 但"退出前那一小段没落库"的窗口就没了。
+     */
     private fun flushLocked(uuid: UUID) {
         val materialPack = caches[uuid] ?: return
-        MaterialPackDataBase.saveMaterialPack(uuid, materialPack)
+        MaterialPackDataBase.saveMaterialPackNow(uuid, materialPack)
     }
 
     /**
@@ -83,6 +89,65 @@ class MaterialPackManager {
     /** 关服: 把所有还没落盘的缓存写回去 */
     fun flushAll() {
         caches.keys.toList().forEach { flush(it) }
+    }
+
+    /**
+     * 材料交易 (与玩家背包打交道的那几条路) 的结果
+     *
+     * 三态而不是布尔: "材料不够"和"账没落库"要分别告诉玩家, 也要让调用方知道**这次改动的账到底
+     * 记上了没有** —— 混成一个 false 就只能猜 (R10)。
+     */
+    enum class TradeResult {
+        /** 成功: 账已经落库 */
+        OK,
+        /** 材料不够, 什么都没改 */
+        NOT_ENOUGH,
+        /** 账没落库 (已经回滚), 调用方必须按失败处理: 别发物品 / 把物品还回去 */
+        PERSIST_FAILED
+    }
+
+    /**
+     * 把缓存**立刻落库**; 失败打日志并返回 false
+     *
+     * 与 [flush] 的区别: [flush] 是退出/关服时的收尾 (失败也无所谓, 反正要下线了), 这里给交易路径用,
+     * 调用方要按结果决定"发不发物品 / 收不收物品", 所以必须把失败报出来。
+     */
+    fun flushNow(player: Player): Boolean {
+        return synchronized(lockOf(player.uniqueId)) {
+            runCatching { flushLocked(player.uniqueId) }
+                .onFailure { warning("[PlayerWorldEdit] 材料包落库失败 (${player.name}): $it") }
+                .isSuccess
+        }
+    }
+
+    /**
+     * 取物: 扣缓存 + **立刻落库**, 落库失败就把扣的加回去
+     *
+     * 顺序是"先扣先落库, 再给物品": 崩在中间只会少一件物品, 不会凭空多出一件 (方向安全)。原来只改
+     * 内存、退出时才落盘 —— 崩在退出之前, 库里还是旧值, 重登后材料又回来了, 而物品已经在玩家背包里
+     * = 重复提现 (2026-10-14 的 R10)。
+     */
+    fun tryConsumeDurably(player: Player, material: Material, amount: Int): TradeResult {
+        if (!tryConsume(player, material, amount)) return TradeResult.NOT_ENOUGH
+        if (flushNow(player)) return TradeResult.OK
+        // 落库失败: 把这次扣的加回去 (加回去只改内存, 下一次落库会覆盖掉失败的这次)
+        addMaterial(player, material, amount)
+        return TradeResult.PERSIST_FAILED
+    }
+
+    /**
+     * 存入: 加缓存 + **立刻落库**, 落库失败就把加的撤回 (返回 [TradeResult.PERSIST_FAILED], 由调用方
+     * 把物品还给玩家)
+     *
+     * 存入这一路原来是 `submitAsync { addMaterials(...) }` —— 玩家物品已经从背包里拿走了, 而"加进
+     * 材料包"是个异步且不落库的动作: 崩在任务执行之前, 物品既不在背包里也不在库里 (凭空消失);
+     * 崩在落库之前同理。现在同步做、做完就落库, 失败还能把物品退回去 (R10)。
+     */
+    fun addMaterialsDurably(player: Player, materials: List<MaterialEntry>): TradeResult {
+        addMaterials(player, materials)
+        if (flushNow(player)) return TradeResult.OK
+        materials.forEach { removeMaterial(player, it.material, it.amount) }
+        return TradeResult.PERSIST_FAILED
     }
 
     /**

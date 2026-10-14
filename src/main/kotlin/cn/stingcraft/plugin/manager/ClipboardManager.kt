@@ -14,7 +14,7 @@ import com.sk89q.worldedit.math.Vector3
 import com.sk89q.worldedit.math.transform.AffineTransform
 import com.sk89q.worldedit.math.transform.Transform
 import com.sk89q.worldedit.regions.CuboidRegion
-import com.sk89q.worldedit.world.block.BlockState
+import com.sk89q.worldedit.world.block.BaseBlock
 import org.bukkit.Location
 import org.bukkit.Material
 import org.bukkit.World
@@ -31,6 +31,15 @@ import kotlin.math.floor
  * 剪贴板 + paste (含预览)
  *
  * 从 WorldEditManager 拆出来的第三块 (第 9 轮重构)。per-UUID 剪贴板与 paste 预览都挂在这里;
+ *
+ * **方块实体数据 (R8)**: 剪贴板存的是完整方块 ([com.sk89q.worldedit.world.block.BaseBlock]), 不只是
+ * 方块状态, 所以箱子里的物品 / 告示牌的文字会跟着复制、粘贴、搬迁:
+ * - copy 读 `getFullBlock` (带实体数据), paste 写回完整方块 —— 与 WE 的 `//copy` / `//paste` 一致
+ *   (复制一个装满的箱子, 贴出来也是装满的);
+ * - move 的第一轮快照同样是完整方块, 目标区写的是源内容的完整副本, 源区清成空气;
+ * - rotate / flip 只按属性变换**方块状态** (朝向等, 见 [ClipboardVolume.transformed]), 实体数据本身
+ *   原样保留 —— 与 WE 的 `//rotate` / `//flip` 一致 (牌子上的文字不会跟着转);
+ * - 实体 (掉落的物品、生物、画框) 不在快照范围内: 撤销与移动都只处理方块。
  * 写方块那一段仍然走 [EditPipeline.writeChunks], 选区与显示相关的判断走 [SelectionManager] ——
  * 子 manager 之间不互相引用, 只依赖这两个。
  */
@@ -79,7 +88,7 @@ class ClipboardManager(
             work = { _, slice ->
                 val weWorld = BukkitAdapter.adapt(world)
                 for (vector in slice.region) {
-                    clipboard.setBlock(vector.x(), vector.y(), vector.z(), weWorld.getBlock(vector))
+                    clipboard.setBlock(vector.x(), vector.y(), vector.z(), weWorld.getFullBlock(vector))
                 }
             },
             done = { result ->
@@ -400,7 +409,7 @@ class ClipboardManager(
         val maxX: Int,
         val maxY: Int,
         val maxZ: Int,
-        private val states: Array<BlockState?>
+        private val states: Array<BaseBlock?>
     ) {
         /** 剪贴板里的格子数 (提示玩家复制了多少格) */
         val volume = sizeOf(minX, maxX, minY, maxY, minZ, maxZ)
@@ -413,12 +422,12 @@ class ClipboardManager(
             ((dy - minY) * sizeZ + (dz - minZ)) * sizeX + (dx - minX)
 
         /** 按**绝对**方块坐标填一格 (copy 阶段用: 区块线程只碰自己那些下标) */
-        fun setBlock(x: Int, y: Int, z: Int, state: BlockState) {
+        fun setBlock(x: Int, y: Int, z: Int, state: BaseBlock) {
             put(x - originX, y - originY, z - originZ, state)
         }
 
         /** 相对偏移处的方块状态; 偏移落在剪贴板框外返回 null (调用方按框内遍历, 正常取不到 null) */
-        fun stateAt(dx: Int, dy: Int, dz: Int): BlockState? =
+        fun stateAt(dx: Int, dy: Int, dz: Int): BaseBlock? =
             if (dx in minX..maxX && dy in minY..maxY && dz in minZ..maxZ) states[indexOf(dx, dy, dz)] else null
 
         /** 每格都读到了 (区块跑失败会留下 null) */
@@ -495,7 +504,7 @@ class ClipboardManager(
         )
 
         /** 相对偏移写一格 (copy 与 rotate 共用; 下标一定在框内) */
-        private fun put(dx: Int, dy: Int, dz: Int, state: BlockState) {
+        private fun put(dx: Int, dy: Int, dz: Int, state: BaseBlock) {
             states[indexOf(dx, dy, dz)] = state
         }
 

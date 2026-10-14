@@ -17,7 +17,7 @@ import cn.stingcraft.plugin.util.runOnOwnThread
 import com.sk89q.worldedit.bukkit.BukkitAdapter
 import com.sk89q.worldedit.extension.platform.Actor
 import com.sk89q.worldedit.regions.CuboidRegion
-import com.sk89q.worldedit.world.block.BlockState
+import com.sk89q.worldedit.world.block.BaseBlock
 import com.sk89q.worldedit.world.block.BlockType
 import com.sk89q.worldedit.world.block.BlockTypes
 import org.bukkit.Bukkit
@@ -46,7 +46,7 @@ internal fun MutableMap<Material, Int>.add(type: BlockType) {
 }
 
 /** 数一层方块里每种材料各有多少个 (跳过空气); 纯内存, 不读世界 */
-internal fun countMaterials(states: Array<BlockState?>): Map<Material, Int> {
+internal fun countMaterials(states: Array<BaseBlock?>): Map<Material, Int> {
     val counts = LinkedHashMap<Material, Int>()
     states.forEach { state ->
         if (state != null && !state.blockType.isAir()) counts.add(state.blockType)
@@ -76,7 +76,7 @@ internal fun costOf(material: Material, count: Int): Map<Material, Int> =
  *
  * 放顶层是因为它不依赖任何实例状态 (只有 [ChunkBatchResult] 与快照数组), 这样可以脱离服务端直接测。
  */
-internal fun undoBatchesFor(result: ChunkBatchResult, snapshots: List<Array<BlockState?>?>): List<UndoBatch> {
+internal fun undoBatchesFor(result: ChunkBatchResult, snapshots: List<Array<BaseBlock?>?>): List<UndoBatch> {
     val batches = ArrayList<UndoBatch>()
     for (index in snapshots.indices) {
         val states = snapshots[index] ?: continue
@@ -210,14 +210,14 @@ class EditPipeline(private val selection: SelectionManager) {
         charged: Map<Material, Int>,
         costs: () -> List<Map<Material, Int>>,
         type: OperationType,
-        writeSlice: (index: Int, slice: RegionSlice, states: Array<BlockState?>) -> Unit
+        writeSlice: (index: Int, slice: RegionSlice, states: Array<BaseBlock?>) -> Unit
     ) {
-        val snapshots = AtomicReferenceArray<Array<BlockState?>?>(regions.size)
+        val snapshots = AtomicReferenceArray<Array<BaseBlock?>?>(regions.size)
         runOnChunkThreads(regions, operation.world,
             work = { index, slice ->
                 val chunk = regions[index]
                 val states = snapshots.get(index)
-                    ?: arrayOfNulls<BlockState>(chunk.volume.toInt()).also { snapshots.set(index, it) }
+                    ?: arrayOfNulls<BaseBlock>(chunk.volume.toInt()).also { snapshots.set(index, it) }
                 WorldEditTool.readBlocksInto(operation.world, slice.region, states, slice.offset)
                 writeSlice(index, slice, states)
             },
@@ -300,7 +300,7 @@ class EditPipeline(private val selection: SelectionManager) {
         player: Player,
         operation: EditOperation,
         result: ChunkBatchResult,
-        snapshots: List<Array<BlockState?>?>,
+        snapshots: List<Array<BaseBlock?>?>,
         charged: Map<Material, Int>,
         costs: List<Map<Material, Int>>,
         successKey: String,
@@ -357,7 +357,7 @@ class EditPipeline(private val selection: SelectionManager) {
     /**
      * 把"跑到哪了"翻译成撤销批次 —— 实现见顶层函数 [undoBatchesFor] (不依赖任何实例状态, 便于直接测)
      */
-    internal fun undoBatches(result: ChunkBatchResult, snapshots: List<Array<BlockState?>?>): List<UndoBatch> =
+    internal fun undoBatches(result: ChunkBatchResult, snapshots: List<Array<BaseBlock?>?>): List<UndoBatch> =
         undoBatchesFor(result, snapshots)
 
     /**

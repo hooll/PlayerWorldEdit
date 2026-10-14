@@ -12,7 +12,7 @@ import cn.stingcraft.plugin.util.splitByChunk
 import com.sk89q.worldedit.bukkit.BukkitAdapter
 import com.sk89q.worldedit.math.BlockVector3
 import com.sk89q.worldedit.regions.CuboidRegion
-import com.sk89q.worldedit.world.block.BlockState
+import com.sk89q.worldedit.world.block.BaseBlock
 import com.sk89q.worldedit.world.block.BlockTypes
 import org.bukkit.Material
 import org.bukkit.World
@@ -272,7 +272,7 @@ class ShapeManager(
         }
         pipeline.prepareEdit(amount, player)
         val actor = pipeline.actorOf(player)
-        val snapshots = AtomicReferenceArray<Array<BlockState?>?>(regions.size)
+        val snapshots = AtomicReferenceArray<Array<BaseBlock?>?>(regions.size)
         // 每个区块**实际**被接受的写入数 (不是 countIn 的预计值): 计费/退费/撤销都以它为准 (R2)
         val written = AtomicIntegerArray(regions.size)
         // 绑定一次, 别在每个切片里现建函数引用
@@ -281,12 +281,12 @@ class ShapeManager(
             work = { index, slice ->
                 val chunk = regions[index]
                 val states = snapshots.get(index)
-                    ?: arrayOfNulls<BlockState>(chunk.volume.toInt()).also { snapshots.set(index, it) }
+                    ?: arrayOfNulls<BaseBlock>(chunk.volume.toInt()).also { snapshots.set(index, it) }
                 // 快照照旧读整块: 撤销要把整块还原回去, 没改过的方块还原回去也没有副作用
                 WorldEditTool.readBlocksInto(world, slice.region, states, slice.offset)
                 written.addAndGet(
                     index,
-                    WorldEditTool.setBlocksIf(world, slice.region, blockType.defaultState, actor, inShape)
+                    WorldEditTool.setBlocksIf(world, slice.region, blockType.defaultState.toBaseBlock(), actor, inShape)
                 )
             },
             done = { result ->
@@ -552,14 +552,14 @@ class ShapeManager(
         EditBudget.configure(pipeline.blocksPerTick())
         // 源层沿 [axis] 平移复制, 平面内两个坐标原样对应, 所以把源层压成一维数组存起来最省事
         val plane = PlaneIndex(axis, writeMin, writeMax)
-        val source = arrayOfNulls<BlockState>(plane.size)
+        val source = arrayOfNulls<BaseBlock>(plane.size)
         runOnChunkThreads(
             slabRegion(axis, sourceCoord, sourceCoord, writeMin, writeMax).splitByChunk(),
             world,
             work = { _, slice ->
                 val weWorld = BukkitAdapter.adapt(world)
                 for (vector in slice.region) {
-                    source[plane.indexOf(vector.x(), vector.y(), vector.z())] = weWorld.getBlock(vector)
+                    source[plane.indexOf(vector.x(), vector.y(), vector.z())] = weWorld.getFullBlock(vector)
                 }
             },
             done = { readResult ->
@@ -646,7 +646,7 @@ class ShapeManager(
         pipeline.prepareEdit(regions.sumOf { it.volume.toInt() }, player)
         val actor = pipeline.actorOf(player)
         // AIR 一定存在 (哪个版本都有), WorldEdit 把这些常量标成可空只是因为老版本可能没有新方块
-        val air = BlockTypes.AIR!!.defaultState
+        val air = BlockTypes.AIR!!.defaultState.toBaseBlock()
         pipeline.writeChunks(
             player,
             edit,
@@ -713,7 +713,7 @@ class ShapeManager(
         val edit = pipeline.beginOperation(player, OperationType.MOVE, union, world) ?: return
         EditBudget.configure(pipeline.blocksPerTick())
         // 第一轮: 只读源区。写入阶段全靠这份快照, 所以它必须完整
-        val source = arrayOfNulls<BlockState>(region.volume.toInt())
+        val source = arrayOfNulls<BaseBlock>(region.volume.toInt())
         val index = BoxIndex(min, max)
         runOnChunkThreads(
             region.splitByChunk(),
@@ -721,7 +721,7 @@ class ShapeManager(
             work = { _, slice ->
                 val weWorld = BukkitAdapter.adapt(world)
                 for (vector in slice.region) {
-                    source[index.indexOf(vector.x(), vector.y(), vector.z())] = weWorld.getBlock(vector)
+                    source[index.indexOf(vector.x(), vector.y(), vector.z())] = weWorld.getFullBlock(vector)
                 }
             },
             done = { readResult ->
@@ -754,7 +754,7 @@ class ShapeManager(
                     val regions = union.splitByChunk()
                     // 每个区块实际写下去多少 (空气也记: 撤销要能还原被清掉的源区), 收尾时当成本表
                     val written = AtomicReferenceArray<HashMap<Material, Int>?>(regions.size)
-                    val air = BlockTypes.AIR!!.defaultState
+                    val air = BlockTypes.AIR!!.defaultState.toBaseBlock()
                     pipeline.writeChunks(
                         player,
                         edit,

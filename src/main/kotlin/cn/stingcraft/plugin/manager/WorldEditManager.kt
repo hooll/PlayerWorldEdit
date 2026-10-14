@@ -9,7 +9,7 @@ import cn.stingcraft.plugin.util.displayName
 import cn.stingcraft.plugin.util.runOnChunkThreads
 import cn.stingcraft.plugin.util.runOnOwnThread
 import cn.stingcraft.plugin.util.splitByChunk
-import com.sk89q.worldedit.world.block.BlockState
+import com.sk89q.worldedit.world.block.BaseBlock
 import org.bukkit.Bukkit
 import org.bukkit.Location
 import org.bukkit.Material
@@ -111,16 +111,16 @@ class WorldEditManager {
         pipeline.prepareEdit(amount, player)
         val actor = pipeline.actorOf(player)
         val regions = region.splitByChunk()
-        val snapshots = AtomicReferenceArray<Array<BlockState?>?>(regions.size)
+        val snapshots = AtomicReferenceArray<Array<BaseBlock?>?>(regions.size)
         // 每个区块**实际**被接受的写入数 (setBlocks 的返回值), 不是体积: 计费/退费/撤销都以它为准
         val written = AtomicIntegerArray(regions.size)
         runOnChunkThreads(regions, world,
             work = { index, slice ->
                 val chunk = regions[index]
                 val states = snapshots.get(index)
-                    ?: arrayOfNulls<BlockState>(chunk.volume.toInt()).also { snapshots.set(index, it) }
+                    ?: arrayOfNulls<BaseBlock>(chunk.volume.toInt()).also { snapshots.set(index, it) }
                 WorldEditTool.readBlocksInto(world, slice.region, states, slice.offset)
-                written.addAndGet(index, WorldEditTool.setBlocks(world, slice.region, blockType.defaultState, actor))
+                written.addAndGet(index, WorldEditTool.setBlocks(world, slice.region, blockType.defaultState.toBaseBlock(), actor))
             },
             done = { result ->
                 pipeline.onPlayerThread(player) {
@@ -162,13 +162,13 @@ class WorldEditManager {
         // 事件报的包围盒是整个选区: replace 只会改选区里匹配的那些方块, 但能改的范围就是选区
         val operation = pipeline.beginOperation(player, OperationType.REPLACE, region, world) ?: return
         val regions = region.splitByChunk()
-        val snapshots = AtomicReferenceArray<Array<BlockState?>?>(regions.size)
+        val snapshots = AtomicReferenceArray<Array<BaseBlock?>?>(regions.size)
         // 第一轮: 只读 (读不全的区块不算进"要替换的区块")
         runOnChunkThreads(regions, world,
             work = { index, slice ->
                 val chunk = regions[index]
                 val states = snapshots.get(index)
-                    ?: arrayOfNulls<BlockState>(chunk.volume.toInt()).also { snapshots.set(index, it) }
+                    ?: arrayOfNulls<BaseBlock>(chunk.volume.toInt()).also { snapshots.set(index, it) }
                 WorldEditTool.readBlocksInto(world, slice.region, states, slice.offset)
             },
             done = { readResult ->
@@ -176,7 +176,7 @@ class WorldEditManager {
                     // 第一轮跑完的区块才作数: 抛异常/没跑完的区块快照里有 null, 拿它统计会错
                     val targets = regions.indices.filter { readResult.isComplete(it) }
                     // 每个区块实际会被替换的数量, 收费和失败退费都以它为准
-                    val costs = targets.map { mapOf(to to replaceTargets(snapshots[it]!!, fromType.defaultState)) }
+                    val costs = targets.map { mapOf(to to replaceTargets(snapshots[it]!!, fromType.defaultState.toBaseBlock())) }
                     val amount = costs.sumOf { it.values.sum() }
                     if (amount <= 0) {
                         player.sendLang("message-replace-none", pluginId to "pluginId", from.displayName(player) to "material")
@@ -206,8 +206,8 @@ class WorldEditManager {
                                 WorldEditTool.replaceBlocks(
                                     world,
                                     slice.region,
-                                    fromType.defaultState,
-                                    toType.defaultState,
+                                    fromType.defaultState.toBaseBlock(),
+                                    toType.defaultState.toBaseBlock(),
                                     actor
                                 )
                             )
@@ -235,7 +235,7 @@ class WorldEditManager {
     /**
      * 统计快照里有多少方块会被替换
      */
-    private fun replaceTargets(states: Array<BlockState?>, from: BlockState): Int {
+    private fun replaceTargets(states: Array<BaseBlock?>, from: BaseBlock): Int {
         val fromBase = from.toBaseBlock()
         return states.count { it != null && it.toBaseBlock() == fromBase }
     }

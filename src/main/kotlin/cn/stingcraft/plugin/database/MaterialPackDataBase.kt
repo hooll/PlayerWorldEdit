@@ -24,6 +24,9 @@ import java.util.zip.GZIPOutputStream
 
 object MaterialPackDataBase {
 
+    /** 数据容器 / 数据库里存材料包的那一列 */
+    private const val MATERIAL_PACK_KEY = "materialPack"
+
     @Awake(LifeCycle.ENABLE)
     fun init(){
         setupPlayerDatabase(newFile(getDataFolder(), "data.db"))
@@ -55,15 +58,36 @@ object MaterialPackDataBase {
     }
 
     fun getMaterialPack(uuid: UUID): MaterialPack {
-        if (!uuid.getAutoDataContainer().keys().contains("materialPack")) {
+        if (!uuid.getAutoDataContainer().keys().contains(MATERIAL_PACK_KEY)) {
             val materialPack = MaterialPack(mutableSetOf())
             saveMaterialPack(uuid, materialPack)
             return materialPack
         }
-        return PlayerWorldEdit.gson.fromJson(decompressFromBase64(uuid.getAutoDataContainer()["materialPack"]!!), MaterialPack::class.java)
+        return PlayerWorldEdit.gson.fromJson(decompressFromBase64(uuid.getAutoDataContainer()[MATERIAL_PACK_KEY]!!), MaterialPack::class.java)
     }
+
+    /** 改内存里的数据容器 (真正落库要等 `releasePlayerDataContainer()`: 退出 / 关服) */
     fun saveMaterialPack(uuid: UUID, materialPack: MaterialPack) {
-        uuid.getAutoDataContainer()["materialPack"] = compressToBase64(PlayerWorldEdit.gson.toJson(materialPack))
+        uuid.getAutoDataContainer()[MATERIAL_PACK_KEY] = compressToBase64(PlayerWorldEdit.gson.toJson(materialPack))
+    }
+
+    /**
+     * **立刻**把材料包写进数据库 (材料交易用)
+     *
+     * [saveMaterialPack] 只改内存里的数据容器, 真正落库要等 `releasePlayerDataContainer()` (退出 /
+     * 关服) —— 交易路径等不起: 崩在那之前, 库里还是旧值, 玩家重登后材料会"回来", 而物品早就给出去了
+     * (重复提现); 存入那一路反过来会丢材料 (2026-10-14 的 R10)。这里在改容器的同时直接
+     * `Database.set(...)` 写库 (TabooLib 的 `Database.set(user, key, value)` 是直接写, 不是缓存)。
+     *
+     * 注意这不是"跨存储原子性": 玩家背包那一侧 (giveItem / 把物品拖进菜单) 是 Bukkit 自己管的, 与本
+     * 插件的库没有共同事务。能保证的是**顺序** —— 调用方先让这里落库, 再动背包, 所以崩溃窗口只会朝
+     * "少给一件物品"的方向偏, 不会凭空多出材料。
+     */
+    fun saveMaterialPackNow(uuid: UUID, materialPack: MaterialPack) {
+        val container = uuid.getAutoDataContainer()
+        val value = compressToBase64(PlayerWorldEdit.gson.toJson(materialPack))
+        container[MATERIAL_PACK_KEY] = value
+        container.database.set(uuid.toString(), MATERIAL_PACK_KEY, value)
     }
 
     private fun compressToBase64(json: String): String {

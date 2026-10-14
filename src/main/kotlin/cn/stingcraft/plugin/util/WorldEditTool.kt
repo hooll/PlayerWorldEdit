@@ -5,7 +5,7 @@ import com.sk89q.worldedit.WorldEdit
 import com.sk89q.worldedit.bukkit.BukkitAdapter
 import com.sk89q.worldedit.extension.platform.Actor
 import com.sk89q.worldedit.regions.Region
-import com.sk89q.worldedit.world.block.BlockState
+import com.sk89q.worldedit.world.block.BaseBlock
 import org.bukkit.World
 
 /**
@@ -32,24 +32,35 @@ object WorldEditTool {
      *
      * 顺序就是 [Region] 的迭代顺序 (y -> z -> x), [restoreBlocks] 按同样顺序写回。
      * 大选区不用先建临时 List 再拷一遍, 少一次分配和复制。
+     *
+     * 读的是 `getFullBlock` (带方块实体数据), 不是 `getBlock` (只有方块状态): 撤销要把箱子里的物品
+     * 一起还原回去 (R8)。读到保存不了的实体数据时**在写入这一片之前**抛异常 —— 这一片会被
+     * [runOnChunkThreads] 标成失败, 调用方不退费也不把它算成写成功, 而不是先改了世界、事后才发现
+     * 撤销记录里少了数据。
      */
-    fun readBlocksInto(world: World, region: Region, target: Array<BlockState?>, offset: Int) {
+    fun readBlocksInto(world: World, region: Region, target: Array<BaseBlock?>, offset: Int) {
         val weWorld = BukkitAdapter.adapt(world)
         var index = offset
         for (vector in region) {
-            target[index++] = weWorld.getBlock(vector)
+            val block = weWorld.getFullBlock(vector)
+            if (!canCaptureNbt(block)) {
+                throw IllegalStateException(
+                    "方块实体数据无法保存, 已在写入前拒绝这一片: ${block.blockType.id} @ $vector"
+                )
+            }
+            target[index++] = block
         }
     }
 
     /** 把整块长方体填成 [blockState]; 返回**被接受**的写入数 (越界被 Folia 拒掉的不算) */
-    fun setBlocks(world: World, region: Region, blockState: BlockState, actor: Actor? = null): Int {
+    fun setBlocks(world: World, region: Region, blockState: BaseBlock, actor: Actor? = null): Int {
         newSession(world, actor).use { session ->
             return session.setBlocks(region, blockState)
         }
     }
 
     /** 把区域里匹配 [from] 的方块换成 [to]; 返回**被接受**的写入数 */
-    fun replaceBlocks(world: World, region: Region, from: BlockState, to: BlockState, actor: Actor? = null): Int {
+    fun replaceBlocks(world: World, region: Region, from: BaseBlock, to: BaseBlock, actor: Actor? = null): Int {
         newSession(world, actor).use { session ->
             return session.replaceBlocks(region, setOf(from.toBaseBlock()), to)
         }
@@ -71,8 +82,8 @@ object WorldEditTool {
         world: World,
         region: Region,
         actor: Actor?,
-        stateAt: (x: Int, y: Int, z: Int) -> BlockState?,
-        onWritten: (BlockState) -> Unit = {}
+        stateAt: (x: Int, y: Int, z: Int) -> BaseBlock?,
+        onWritten: (BaseBlock) -> Unit = {}
     ): Int {
         newSession(world, actor).use { session ->
             var written = 0
@@ -91,7 +102,7 @@ object WorldEditTool {
     fun setBlocksIf(
         world: World,
         region: Region,
-        blockState: BlockState,
+        blockState: BaseBlock,
         actor: Actor?,
         contains: (x: Int, y: Int, z: Int) -> Boolean
     ): Int = writeBlocks(world, region, actor, { x, y, z -> if (contains(x, y, z)) blockState else null })
@@ -107,7 +118,7 @@ object WorldEditTool {
      * **失败不吞**: 底层抛出的异常直接往上抛 (调用方 [runOnChunkThreads] 会把该区块标成失败,
      * 撤销据此保留记录并重试 —— 原来吞掉异常会让"没还原成"被当成"还原完了", 材料照退、记录照删)。
      */
-    fun restoreBlocks(world: World, slice: RegionSlice, states: List<BlockState>, actor: Actor? = null): Int {
+    fun restoreBlocks(world: World, slice: RegionSlice, states: List<BaseBlock>, actor: Actor? = null): Int {
         val end = minOf(slice.offset + slice.size, states.size)
         newSession(world, actor).use { session ->
             var restored = 0

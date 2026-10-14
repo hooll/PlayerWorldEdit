@@ -1,10 +1,13 @@
 package cn.stingcraft.plugin.manager
 
 import cn.stingcraft.plugin.PlayerWorldEdit
+import cn.stingcraft.plugin.util.nbtFrom
+import cn.stingcraft.plugin.util.nbtOf
 import com.google.gson.reflect.TypeToken
 import com.sk89q.worldedit.math.BlockVector3
 import com.sk89q.worldedit.regions.CuboidRegion
 import com.sk89q.worldedit.registry.state.Property
+import com.sk89q.worldedit.world.block.BaseBlock
 import com.sk89q.worldedit.world.block.BlockState
 import com.sk89q.worldedit.world.block.BlockTypes
 import org.bukkit.Material
@@ -21,7 +24,7 @@ import java.util.zip.GZIPInputStream
 import java.util.zip.GZIPOutputStream
 
 /** 一次操作中单个区块的原始方块快照 */
-class UndoBatch(val region: CuboidRegion, val states: List<BlockState>)
+class UndoBatch(val region: CuboidRegion, val states: List<BaseBlock>)
 
 /**
  * 撤销记录
@@ -350,7 +353,10 @@ object UndoManager {
                     maxX = batch.region.maximumPoint.x,
                     maxY = batch.region.maximumPoint.y,
                     maxZ = batch.region.maximumPoint.z,
-                    states = batch.states.map { it.getAsString() }
+                    // 方块状态与方块实体数据分开存: 状态字符串沿用旧格式 (存量记录因此仍可读), 实体数据
+                    // 是新增的可空列 (SNBT 文本), 整批都没有实体数据时写 null (落盘格式与旧版一致)
+                    states = batch.states.map { it.toImmutableState().getAsString() },
+                    nbt = batch.states.map { nbtOf(it) }.takeIf { list -> list.any { it != null } }
                 )
             }
         )
@@ -384,13 +390,27 @@ private data class StoredUndoBatch(
     val maxX: Int,
     val maxY: Int,
     val maxZ: Int,
-    val states: List<String>
+    val states: List<String>,
+    /**
+     * 方块实体数据 (SNBT, 每格一个, 与 [states] 一一对应); null = 这一批没有方块实体数据
+     *
+     * **必须可空**: 改动前写下的记录没有这一列 (R8 之前只存方块状态), 反序列化后是 null, 还原时按
+     * "只有方块状态"处理 —— 存量记录照常能撤销, 那些记录里箱子的内容本来就是丢的 (改动前的行为)。
+     * 整批都没有实体数据时写 null 而不是一串 null, 落盘格式与旧版逐字一致。
+     */
+    val nbt: List<String?>? = null
 ) {
 
     fun toBatch(): UndoBatch {
+        val rawNbt = nbt
         return UndoBatch(
             CuboidRegion(BlockVector3.at(minX, minY, minZ), BlockVector3.at(maxX, maxY, maxZ)),
-            states.map { parseBlockState(it) }
+            states.mapIndexed { index, raw ->
+                val state = parseBlockState(raw)
+                val blockNbt = rawNbt?.getOrNull(index)
+                // 有实体数据就挂回去 (WE 的 BlockStateHolder.toBaseBlock(CompoundTag) 桥), 没有就只还原状态
+                if (blockNbt == null) state.toBaseBlock() else state.toBaseBlock(nbtFrom(blockNbt))
+            }
         )
     }
 }

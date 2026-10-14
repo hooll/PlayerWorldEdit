@@ -7,6 +7,7 @@ import cn.stingcraft.plugin.manager.MaterialPackManager
 import org.bukkit.entity.Player
 import org.bukkit.event.inventory.ClickType
 import org.bukkit.inventory.Inventory
+import taboolib.common.platform.function.pluginId
 import taboolib.library.xseries.XMaterial
 import taboolib.module.chat.colored
 import taboolib.module.ui.buildMenu
@@ -15,6 +16,7 @@ import taboolib.module.ui.type.impl.PageableChestImpl
 import taboolib.platform.util.Slots
 import taboolib.platform.util.buildItem
 import taboolib.platform.util.giveItem
+import taboolib.platform.util.sendLang
 
 object MaterialPackInventory {
 
@@ -27,6 +29,25 @@ object MaterialPackInventory {
     }
 
 
+
+    /**
+     * 取物: 扣账**先落库**, 落库成功才发物品
+     *
+     * 顺序反过来 (先发物品再落库) 崩溃时会变成"物品已经拿到、库里还记着材料" = 重复提现; 现在崩在
+     * 中间只会少一件 (方向安全)。落库失败就把这次扣的撤回, 并明确告诉玩家失败 —— 改完缓存就当成功
+     * 正是 R10 要修的 (2026-10-14)。
+     */
+    private fun takeDurably(player: Player, element: MaterialEntry, amount: Int) {
+        when (packManager.tryConsumeDurably(player, element.material, amount)) {
+            MaterialPackManager.TradeResult.OK -> {
+                player.giveItem(buildItem(element.material), amount)
+                open(player)
+            }
+            MaterialPackManager.TradeResult.NOT_ENOUGH -> Unit
+            MaterialPackManager.TradeResult.PERSIST_FAILED ->
+                player.sendLang("message-materialpack-take-failed", pluginId to "pluginId")
+        }
+    }
 
     private fun build(player: Player,  materialPack: MaterialPack):Inventory{
         return buildMenu<PageableChestImpl<MaterialEntry>>(
@@ -48,31 +69,13 @@ object MaterialPackInventory {
             }
 
             onClick { event, element ->
-                when(event.clickEvent().click){
-                    ClickType.LEFT -> {
-                        // 检查 + 扣除合成一次原子操作 (原来分两次调用, 中间别的线程也能通过检查)
-                        if (packManager.tryConsume(player, element.material, 1)){
-                            player.giveItem(buildItem(element.material),1)
-                            open(player)
-                        }
-                    }
-                    ClickType.RIGHT -> {
-                        if (packManager.tryConsume(player, element.material, 10)){
-                            player.giveItem(buildItem(element.material),10)
-                            open(player)
-                        }
-                    }
-                    ClickType.SHIFT_RIGHT -> {
-                        if (packManager.tryConsume(player, element.material, 64)){
-                            player.giveItem(buildItem(element.material),64)
-                            open(player)
-                        }
-                    }
-                    else -> {
-                        return@onClick
-                    }
-
+                val amount = when (event.clickEvent().click) {
+                    ClickType.LEFT -> 1
+                    ClickType.RIGHT -> 10
+                    ClickType.SHIFT_RIGHT -> 64
+                    else -> return@onClick
                 }
+                takeDurably(player, element, amount)
             }
 
             setNextPage(47) { page, hasNextPage ->
