@@ -15,7 +15,11 @@ import cn.stingcraft.plugin.until.runOnOwnThread
 import cn.stingcraft.plugin.until.splitByChunk
 import com.sk89q.worldedit.bukkit.BukkitAdapter
 import com.sk89q.worldedit.extension.platform.Actor
+import com.sk89q.worldedit.extent.transform.BlockTransformExtent
 import com.sk89q.worldedit.math.BlockVector3
+import com.sk89q.worldedit.math.Vector3
+import com.sk89q.worldedit.math.transform.AffineTransform
+import com.sk89q.worldedit.math.transform.Transform
 import com.sk89q.worldedit.regions.CuboidRegion
 import com.sk89q.worldedit.world.block.BlockState
 import com.sk89q.worldedit.world.block.BlockType
@@ -55,6 +59,15 @@ class WorldEditManager {
 
     // 正在执行编辑的玩家, 避免同一玩家并发跑两个选区操作
     private val editing = ConcurrentHashMap.newKeySet<UUID>()
+
+    /**
+     * 每个玩家一份的剪贴板 (copy / rotate / paste 用)
+     *
+     * 内存态、不持久化、不设上限 (与 WE 一致): 玩家退出时在 [clearPlayerPos] 里清掉, 关服随内存消失。
+     * 值是**不可变快照**, 替换时换整份新对象而不是改里面的数组, 所以并发读的一方永远看到一份完整的
+     * 剪贴板 (线程安全论证见 [ClipboardVolume])。
+     */
+    private val clipboards = ConcurrentHashMap<UUID, ClipboardVolume>()
 
     // 选区可视化 (半透明玻璃盒子), 用不了时退回粒子边框
     private val areaDisplay = AreaDisplay()
@@ -236,6 +249,8 @@ class WorldEditManager {
         // 用 forget 而不是 hideSelection: 选区彻底没了, 顺手把代号表的条目一起清掉,
         // 免得它按 UUID 只增不删
         areaDisplay.forget(player)
+        // 剪贴板同样按 UUID 只增不删, 退出时清掉 (不持久化, 下次登录就是空剪贴板)
+        clipboards.remove(player.uniqueId)
         endEdit(player)
     }
 
@@ -1082,6 +1097,211 @@ class WorldEditManager {
     }
 
     /**
+     * 把当前选区复制进玩家自己的剪贴板 (对齐 WE 的 `//copy`)
+     *
+     * 参考点 = **复制时玩家所在的那一格** (WE 的 clipboard origin 语义), 方块按相对原点的偏移存储。
+     * 不写方块、不扣材料、不记撤销, 成功后保留选区。读世界照旧走 [runOnChunkThreads]: 大选区不能在
+     * 玩家线程上读。
+     */
+    fun tryCopy(player: Player) {
+        val region = validatedRegion(player, needBreak = false) ?: return
+        if (!beginEdit(player)) return
+        val world = player.world
+        val origin = player.location
+        val clipboard = ClipboardVolume.of(region, origin.blockX, origin.blockY, origin.blockZ)
+        runOnChunkThreads(
+            region.splitByChunk(),
+            world,
+            work = { _, slice ->
+                val weWorld = BukkitAdapter.adapt(world)
+                for (vector in slice.region) {
+                    clipboard.setBlock(vector.x(), vector.y(), vector.z(), weWorld.getBlock(vector))
+                }
+            },
+            done = { timedOut ->
+                onPlayerThread(player) {
+                    endEdit(player)
+                    // 超时、或者某个区块没读完 (数组里留下 null) 都算失败: 半份剪贴板贴出去比不贴更糟
+                    if (timedOut || !clipboard.isComplete()) {
+                        player.sendLang("message-edit-failed", pluginId to "pluginId")
+                        return@onPlayerThread
+                    }
+                    clipboards[player.uniqueId] = clipboard
+                    player.sendLang("message-copy-susses", pluginId to "pluginId", clipboard.volume to "amount")
+                }
+            }
+        )
+    }
+
+    /**
+     * 绕 Y 轴旋转剪贴板 (对齐 WE 的 `//rotate <角度>`)
+     *
+     * 绕**剪贴板原点**转 (WE 的 `ClipboardHolder.transform` 保持 origin 不动), 所以 rotate 之后再
+     * paste, 原点还是落到玩家脚下。纯内存操作: 在玩家线程上做完即可, 不碰世界、不扣料、不记撤销。
+     */
+    fun rotateClipboard(player: Player, degrees: Int) {
+        if (degrees !in ROTATE_ANGLES) {
+            player.sendLang(
+                "message-rotate-invalid-angle",
+                pluginId to "pluginId",
+                ROTATE_ANGLES.joinToString("/") to "angles"
+            )
+            return
+        }
+        val clipboard = clipboards[player.uniqueId] ?: run {
+            player.sendLang("message-clipboard-empty", pluginId to "pluginId")
+            return
+        }
+        if (!beginEdit(player)) return
+        // 换一份新对象进表, 不动已经发布的那一份: 并发读的操作要么看到旋转前、要么看到旋转后
+        clipboards[player.uniqueId] = clipboard.rotated(degrees)
+        endEdit(player)
+        player.sendLang("message-rotate-susses", pluginId to "pluginId", degrees to "angle")
+    }
+
+    /**
+     * 剪贴板支持的角度
+     *
+     * 命令补全与 GUI 的角度按钮都用它, 免得"能补全的角度"和"真能旋转的角度"各写一份对不上。
+     */
+    fun rotateAngles(): List<Int> = ROTATE_ANGLES
+
+    /**
+     * 一次 copy 的结果: 剪贴板原点 + 相对原点的偏移框 + 逐格方块状态
+     *
+     * 原点 = 复制时玩家所在的那一格 (WE 的 clipboard origin 语义): [rotated] 绕它转, 粘贴时把它
+     * 落到玩家所在的那一格 —— 所以"原地 copy → paste"就是原样贴回。
+     *
+     * 线程安全: [states] 只在 copy 的区块线程阶段被填 (每个区块只碰自己那些下标), 填完才由
+     * [clipboards] 的 put 发布 —— ConcurrentHashMap 的 put/get 是 volatile 读写, 读的一方拿到引用
+     * 时能看到此前全部写入; 发布之后 [states] 一个格子都不再改, 旋转换的是整份新对象, 所以读的一方
+     * 不会看到半份剪贴板。同一玩家身上的 copy/rotate/paste 还被 [beginEdit] 串行化。
+     */
+    private class ClipboardVolume(
+        val originX: Int,
+        val originY: Int,
+        val originZ: Int,
+        val minX: Int,
+        val minY: Int,
+        val minZ: Int,
+        val maxX: Int,
+        val maxY: Int,
+        val maxZ: Int,
+        private val states: Array<BlockState?>
+    ) {
+        /** 剪贴板里的格子数 (提示玩家复制了多少格) */
+        val volume = sizeOf(minX, maxX, minY, maxY, minZ, maxZ)
+
+        private val sizeX = maxX - minX + 1
+        private val sizeZ = maxZ - minZ + 1
+
+        /** 相对偏移 → 一维下标 (y → z → x 展开, 与 WE 的区域遍历顺序一致) */
+        private fun indexOf(dx: Int, dy: Int, dz: Int): Int =
+            ((dy - minY) * sizeZ + (dz - minZ)) * sizeX + (dx - minX)
+
+        /** 按**绝对**方块坐标填一格 (copy 阶段用: 区块线程只碰自己那些下标) */
+        fun setBlock(x: Int, y: Int, z: Int, state: BlockState) {
+            put(x - originX, y - originY, z - originZ, state)
+        }
+
+        /** 相对偏移处的方块状态; 偏移落在剪贴板框外返回 null (调用方按框内遍历, 正常取不到 null) */
+        fun stateAt(dx: Int, dy: Int, dz: Int): BlockState? =
+            if (dx in minX..maxX && dy in minY..maxY && dz in minZ..maxZ) states[indexOf(dx, dy, dz)] else null
+
+        /** 每格都读到了 (区块跑失败会留下 null) */
+        fun isComplete(): Boolean = states.none { it == null }
+
+        /**
+         * 绕 Y 轴旋转 [degrees] 度 (只允许 90 的整数倍), 返回一份**新**剪贴板 (原点不动)
+         *
+         * 方块状态用 WE 自己的 [BlockTransformExtent.transform]: 它会按属性逐个旋转 ——
+         * facing 这类 [com.sk89q.worldedit.registry.state.DirectionalProperty] 走
+         * `Direction.findClosest(transform.apply(direction.toVector()))`, axis / half / shape /
+         * orientation / rotation 也各有处理, 所以楼梯、门、告示牌转完朝向跟着转。偏移用同一个
+         * [AffineTransform.rotateY] 变换 —— 与 WE 的 `ClipboardHolder.transform` 是同一套做法。
+         */
+        fun rotated(degrees: Int): ClipboardVolume {
+            // 90 的整数倍下 rotateY 的系数精确为 0/±1 (实测), 所以整数偏移转出来还是整数
+            val transform = AffineTransform().rotateY(degrees.toDouble())
+            // 先转 8 个角求出新的偏移框: 旋转后的框要用新下标, 得先知道边界再逐格搬
+            var newMinX = Int.MAX_VALUE
+            var newMaxX = Int.MIN_VALUE
+            var newMinY = Int.MAX_VALUE
+            var newMaxY = Int.MIN_VALUE
+            var newMinZ = Int.MAX_VALUE
+            var newMaxZ = Int.MIN_VALUE
+            for (dy in intArrayOf(minY, maxY)) {
+                for (dz in intArrayOf(minZ, maxZ)) {
+                    for (dx in intArrayOf(minX, maxX)) {
+                        val corner = transformedOffset(transform, dx, dy, dz)
+                        newMinX = minOf(newMinX, corner[0])
+                        newMaxX = maxOf(newMaxX, corner[0])
+                        newMinY = minOf(newMinY, corner[1])
+                        newMaxY = maxOf(newMaxY, corner[1])
+                        newMinZ = minOf(newMinZ, corner[2])
+                        newMaxZ = maxOf(newMaxZ, corner[2])
+                    }
+                }
+            }
+            val rotated = ClipboardVolume(
+                originX, originY, originZ,
+                newMinX, newMinY, newMinZ, newMaxX, newMaxY, newMaxZ,
+                arrayOfNulls(sizeOf(newMinX, newMaxX, newMinY, newMaxY, newMinZ, newMaxZ))
+            )
+            for (dy in minY..maxY) {
+                for (dz in minZ..maxZ) {
+                    for (dx in minX..maxX) {
+                        val state = states[indexOf(dx, dy, dz)] ?: continue
+                        val target = transformedOffset(transform, dx, dy, dz)
+                        rotated.put(target[0], target[1], target[2], BlockTransformExtent.transform(state, transform))
+                    }
+                }
+            }
+            return rotated
+        }
+
+        /** 相对偏移写一格 (copy 与 rotate 共用; 下标一定在框内) */
+        private fun put(dx: Int, dy: Int, dz: Int, state: BlockState) {
+            states[indexOf(dx, dy, dz)] = state
+        }
+
+        /**
+         * 把一个整数偏移交给 WE 的变换, 再取回整数偏移
+         *
+         * 取整用 floor: 与 WE 的 `BlockVector3.at(double)` 一致 (90 的整数倍下系数是精确的 0/±1,
+         * 取整方式不影响结果, 这里只是跟 WE 保持同一口径)。返回 IntArray 是为了省掉每格的装箱。
+         */
+        private fun transformedOffset(transform: Transform, dx: Int, dy: Int, dz: Int): IntArray {
+            val vector = transform.apply(Vector3.at(dx.toDouble(), dy.toDouble(), dz.toDouble()))
+            return intArrayOf(floor(vector.x()).toInt(), floor(vector.y()).toInt(), floor(vector.z()).toInt())
+        }
+
+        companion object {
+
+            /** 偏移框的格子数 —— copy 与 rotate 都要按框分配数组, 所以共用一个算式 */
+            private fun sizeOf(minX: Int, maxX: Int, minY: Int, maxY: Int, minZ: Int, maxZ: Int): Int =
+                (maxX - minX + 1) * (maxY - minY + 1) * (maxZ - minZ + 1)
+
+            /** 按选区与剪贴板原点建一份空剪贴板 (方块状态由 copy 的区块线程逐个填) */
+            fun of(region: CuboidRegion, originX: Int, originY: Int, originZ: Int): ClipboardVolume {
+                val min = region.minimumPoint
+                val max = region.maximumPoint
+                val minX = min.x() - originX
+                val minY = min.y() - originY
+                val minZ = min.z() - originZ
+                val maxX = max.x() - originX
+                val maxY = max.y() - originY
+                val maxZ = max.z() - originZ
+                return ClipboardVolume(
+                    originX, originY, originZ,
+                    minX, minY, minZ, maxX, maxY, maxZ,
+                    arrayOfNulls(sizeOf(minX, maxX, minY, maxY, minZ, maxZ))
+                )
+            }
+        }
+    }
+
+    /**
      * 撤销最近的操作
      *
      * 必须**严格串行**: 第 i 条完全还原、返还落库之后才取第 i+1 条。
@@ -1475,6 +1695,14 @@ class WorldEditManager {
          * 挡住手滑敲出来的一长串数字。
          */
         const val SHAPE_MAX_SIZE = 256
+
+        /**
+         * 剪贴板允许的旋转角度
+         *
+         * 只收 90 的整数倍: 方块状态里的朝向属性只能落到四个正交方向上, WE 的 `//rotate` 给别的角度
+         * 时也只能把朝向吸附到最接近的那个值, 与其做一件做不到位的事, 不如直接拒绝。
+         */
+        val ROTATE_ANGLES = listOf(90, 180, 270)
 
         /** 轴索引 (与 [snapAxis] 的 0=X, 1=Y, 2=Z 顺序一致) —— 6 个面里只有 Y 需要世界高度夹取 */
         const val AXIS_X = 0

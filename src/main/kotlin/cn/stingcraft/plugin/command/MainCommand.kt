@@ -60,4 +60,10 @@ object MainCommand {
 
     @CommandBody(permission = "PlayerWorldEdit.Use")
     val hcyl = CommandHcyl.command
+
+    @CommandBody(permission = "PlayerWorldEdit.Use")
+    val copy = CommandCopy.command
+
+    @CommandBody(permission = "PlayerWorldEdit.Use")
+    val rotate = CommandRotate.command
 }

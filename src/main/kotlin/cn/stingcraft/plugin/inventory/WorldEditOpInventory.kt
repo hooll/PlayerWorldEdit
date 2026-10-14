@@ -147,7 +147,58 @@ object WorldEditOpInventory {
                     }
                 }
             }
+            // 剪贴板: 复制 / 旋转 / 粘贴排在第 5 行的 38/40/42。旋转再点一次角度 —— 和圆柱尺寸
+            // 一样是连着选两次, 不算二级菜单。
+            set(38, buildItem(XMaterial.WRITABLE_BOOK) {
+                name = "&f| 复制选区"
+                lore += "&7| 把整个选区存进你的剪贴板"
+                lore += "&7| 不消耗材料, 不改变方块"
+                colored()
+            }) {
+                player.closeInventory()
+                worldEditManager.tryCopy(player)
+            }
+            set(40, buildItem(XMaterial.COMPASS) {
+                name = "&f| 旋转剪贴板"
+                lore += "&7| 绕复制时的位置水平旋转"
+                lore += "&7| 方块朝向会一起转"
+                lore += "&7| 下一步选角度"
+                colored()
+            }) {
+                openAnglePicker(player, "&f选择旋转角度") { degrees ->
+                    player.closeInventory()
+                    worldEditManager.rotateClipboard(player, degrees)
+                }
+            }
         }
+    }
+
+    /**
+     * 剪贴板旋转角度预设 (90 / 180 / 270)
+     *
+     * 与圆柱尺寸同一套做法: 箱子界面没有输入框, 做"等玩家打字"的输入流程又要多一份 per-player
+     * 待输入状态, 所以给三个按钮; 角度列表取自 manager, 不在这里另抄一份。
+     */
+    private fun openAnglePicker(player: Player, title: String, callback: (degrees: Int) -> Unit) {
+        val angles = worldEditManager.rotateAngles()
+        player.openMenu(buildMenu<ChestImpl>(title.colored()) {
+            rows(3)
+            // 和主菜单一样锁住整页: 没注册 onClick 的格子原本可以把物品拿走
+            onClick(true) { }
+            set(4, buildItem(XMaterial.PAPER) {
+                name = "&f| 旋转角度"
+                lore += "&7| 绕 Y 轴 (水平) 旋转剪贴板"
+                colored()
+            })
+            angles.forEachIndexed { index, degrees ->
+                set(11 + index * 2, buildItem(XMaterial.COMPASS) {
+                    name = "&f| 旋转 $degrees°"
+                    colored()
+                }) {
+                    callback(degrees)
+                }
+            }
+        })
     }
 
     /**
