@@ -16,6 +16,7 @@ import com.sk89q.worldedit.regions.CuboidRegion
 import com.sk89q.worldedit.world.block.BlockState
 import org.bukkit.Location
 import org.bukkit.Material
+import org.bukkit.World
 import org.bukkit.entity.Player
 import taboolib.common.platform.function.pluginId
 import taboolib.platform.util.sendLang
@@ -62,9 +63,11 @@ class ClipboardManager(
      * 玩家线程上读。
      */
     fun tryCopy(player: Player) {
-        val region = pipeline.validatedRegion(player, needBreak = false) ?: return
-        if (!pipeline.beginEdit(player)) return
-        val world = player.world
+        val validated = pipeline.validatedSelection(player, needBreak = false) ?: return
+        val world = validated.world
+        val region = validated.region
+        // copy 只读不写: 不触发操作前事件 (与既有行为一致), 但要拿编辑锁串行化同一个玩家的操作
+        val token = pipeline.beginEdit(player) ?: return
         val origin = player.location
         val clipboard = ClipboardVolume.of(region, origin.blockX, origin.blockY, origin.blockZ)
         runOnChunkThreads(
@@ -76,14 +79,15 @@ class ClipboardManager(
                     clipboard.setBlock(vector.x(), vector.y(), vector.z(), weWorld.getBlock(vector))
                 }
             },
-            done = { timedOut ->
+            done = { result ->
                 pipeline.onPlayerThread(player) {
-                    pipeline.endEdit(player)
+                    pipeline.endEdit(player, token)
                     // 玩家在读取期间退出: 退出路径已经清过表 (clearPlayerPos), 这里再把剪贴板 put 回去
                     // 就成了"按 UUID 只增不删"的泄漏, 而剪贴板不设上限 —— 离线玩家一律不发布
                     if (!player.isOnline) return@onPlayerThread
-                    // 超时、或者某个区块没读完 (数组里留下 null) 都算失败: 半份剪贴板贴出去比不贴更糟
-                    if (timedOut || !clipboard.isComplete()) {
+                    // 超时、区块抛异常、或者某个区块没读完 (数组里留下 null) 都算失败: 半份剪贴板贴出去
+                    // 比不贴更糟
+                    if (!result.isAllComplete() || !clipboard.isComplete()) {
                         player.sendLang("message-edit-failed", pluginId to "pluginId")
                         return@onPlayerThread
                     }
@@ -113,10 +117,10 @@ class ClipboardManager(
             player.sendLang("message-clipboard-empty", pluginId to "pluginId")
             return
         }
-        if (!pipeline.beginEdit(player)) return
+        val token = pipeline.beginEdit(player) ?: return
         // 换一份新对象进表, 不动已经发布的那一份: 并发读的操作要么看到旋转前、要么看到旋转后
         clipboards[player.uniqueId] = clipboard.rotated(degrees)
-        pipeline.endEdit(player)
+        pipeline.endEdit(player, token)
         player.sendLang("message-rotate-susses", pluginId to "pluginId", degrees to "angle")
     }
 
@@ -151,10 +155,10 @@ class ClipboardManager(
             player.sendLang("message-clipboard-empty", pluginId to "pluginId")
             return
         }
-        if (!pipeline.beginEdit(player)) return
+        val token = pipeline.beginEdit(player) ?: return
         // 与 rotate 一样换一份新对象进表: 并发读的一方要么看到镜像前、要么看到镜像后
         clipboards[player.uniqueId] = clipboard.flipped(axis)
-        pipeline.endEdit(player)
+        pipeline.endEdit(player, token)
         // 报轴名而不是回显输入: me 没有可回显的字面量, 而"沿哪一轴镜像"正是玩家想确认的
         player.sendLang("message-flip-susses", pluginId to "pluginId", axisName(axis) to "axis")
     }
@@ -171,7 +175,7 @@ class ClipboardManager(
      */
     fun tryPaste(player: Player) {
         val clipboard = clipboardOf(player) ?: return
-        val target = pasteTarget(player, clipboard) ?: return
+        val target = pasteTarget(player, clipboard, player.world) ?: return
         pasteAt(player, clipboard, target)
     }
 
@@ -183,7 +187,7 @@ class ClipboardManager(
      */
     fun previewPaste(player: Player) {
         val clipboard = clipboardOf(player) ?: return
-        val target = pasteTarget(player, clipboard) ?: return
+        val target = pasteTarget(player, clipboard, player.world) ?: return
         showPreview(player, target)
     }
 
@@ -197,7 +201,7 @@ class ClipboardManager(
      */
     fun pasteOrPreview(player: Player): Boolean {
         val clipboard = clipboardOf(player) ?: return false
-        val target = pasteTarget(player, clipboard) ?: return false
+        val target = pasteTarget(player, clipboard, player.world) ?: return false
         val preview = pastePreviews[player.uniqueId]
         val confirmed = preview != null &&
             preview.expiresAt >= System.currentTimeMillis() &&
@@ -229,6 +233,7 @@ class ClipboardManager(
      * 所以预览与真贴不可能对不上。
      */
     private class PasteTarget(
+        val world: World,
         val box: CuboidRegion,
         val charges: Map<Material, Int>,
         val anchorX: Int,
@@ -251,9 +256,12 @@ class ClipboardManager(
      * 预览与真贴**共用**这一份计算 (锚点数学、夹取、计费循环都只写一份): 夹取掉的格子不写也不计费,
      * 所以计费恒等于"真正会写的方块"。整份剪贴板落在世界高度之外、或目标框没有编辑权限时提示并返回
      * null —— 领地校验放在这里, 预览也会照做: 在没权限的地方画个框说"将覆盖 N 格"是骗人。
+     *
+     * [world] 由调用方在**开头**固定下来并一路带下去 (R4): 预览与真贴之间玩家可能传送, 真贴时再用
+     * `player.world` 会与预览报的框/数对不上, 校验也会落到另一个世界。
      */
-    private fun pasteTarget(player: Player, clipboard: ClipboardVolume): PasteTarget? {
-        val weWorld = BukkitAdapter.adapt(player.world)
+    private fun pasteTarget(player: Player, clipboard: ClipboardVolume, world: World): PasteTarget? {
+        val weWorld = BukkitAdapter.adapt(world)
         val anchor = player.location
         val anchorX = anchor.blockX
         val anchorY = anchor.blockY
@@ -273,14 +281,14 @@ class ClipboardManager(
         // 部分不写也不计费, "预览报的数 = 真贴扣的数"照样成立
         val min = intArrayOf(minX, minY, minZ)
         val max = intArrayOf(maxX, maxY, maxZ)
-        if (!clampXZToBorder(player.world, min, max)) {
+        if (!clampXZToBorder(world, min, max)) {
             player.sendLang("message-shape-none", pluginId to "pluginId")
             return null
         }
         val box = CuboidRegion(BlockVector3.at(min[0], min[1], min[2]), BlockVector3.at(max[0], max[1], max[2]))
         // 领地校验覆盖整份要写的范围 (含空气会清到的那些格子); 粘贴会覆盖已有建筑, 所以按替换操作
         // 要求破坏权限 (needBreak = true)
-        if (!pipeline.checkProtection(player, locationOf(player, min), locationOf(player, max), needBreak = true)) return null
+        if (!pipeline.checkProtection(player, locationOf(world, min), locationOf(world, max), needBreak = true)) return null
         // 计费: 目标框里逐格查剪贴板, 非空气按材料累加 —— 纯算术、不读世界, 且与下面写的是同一份内容
         val charges = LinkedHashMap<Material, Int>()
         for (y in min[1]..max[1]) {
@@ -291,7 +299,7 @@ class ClipboardManager(
                 }
             }
         }
-        return PasteTarget(box, charges, anchorX, anchorY, anchorZ)
+        return PasteTarget(world, box, charges, anchorX, anchorY, anchorZ)
     }
 
     /**
@@ -300,28 +308,28 @@ class ClipboardManager(
      * [target] 必须来自 [pasteTarget], 这样"预览报的数"和"这里扣的数"是同一份 charges。
      */
     private fun pasteAt(player: Player, clipboard: ClipboardVolume, target: PasteTarget) {
-        if (!pipeline.fireOperation(player, OperationType.PASTE, target.box)) return
-        if (!pipeline.beginEdit(player)) return
+        val edit = pipeline.beginOperation(player, OperationType.PASTE, target.box, target.world) ?: return
         // 全有全无: 任何一种材料不够就一个方块都不写 (consumeAll 会把已扣的原样加回去)
         if (!pipeline.consumeAll(player, target.charges)) {
-            pipeline.endEdit(player)
+            pipeline.endEdit(player, edit.token)
             return
         }
         // 贴过了: 预览到此作废 (再点按钮应该重新预览, 而不是拿旧框直接贴)
         pastePreviews.remove(player.uniqueId)
         pipeline.prepareEdit(target.cells, player)
-        val world = player.world
+        val world = target.world
         val actor = pipeline.actorOf(player)
         val regions = target.box.splitByChunk()
         // 每个区块实际写下去多少 (空气也记: 撤销要能还原被清掉的位置), 收尾时当成本表用
         val written = AtomicReferenceArray<HashMap<Material, Int>?>(regions.size)
         pipeline.writeChunks(
             player,
+            edit,
             regions,
             "message-paste-susses",
             charged = target.charges,
             costs = { regions.indices.map { written.get(it) ?: emptyMap() } },
-            operation = OperationType.PASTE
+            type = OperationType.PASTE
         ) { index, slice, _ ->
             val counts = written.get(index)
                 ?: HashMap<Material, Int>().also { written.set(index, it) }

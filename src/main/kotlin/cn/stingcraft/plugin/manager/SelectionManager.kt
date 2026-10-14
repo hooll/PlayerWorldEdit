@@ -122,7 +122,17 @@ internal fun snapAxis(direction: Vector): Pair<Int, Boolean> {
 }
 
 internal fun locationOf(player: Player, block: IntArray): Location {
-    return Location(player.world, block[0].toDouble(), block[1].toDouble(), block[2].toDouble())
+    return locationOf(player.world, block)
+}
+
+/**
+ * 按**指定世界**把方块坐标拼成 Location
+ *
+ * 与 [locationOf] 的区别只在世界从哪来: 写操作的世界要在开头固定下来 (见 [EditOperation]), 之后
+ * 一律用固定的那个 —— 玩家中途传送到别处也不会把校验、事件、写入拆到两个世界 (R4)。
+ */
+internal fun locationOf(world: World, block: IntArray): Location {
+    return Location(world, block[0].toDouble(), block[1].toDouble(), block[2].toDouble())
 }
 
 /**
@@ -180,29 +190,32 @@ class SelectionManager {
 
     /**
      * 设置点1
+     *
+     * 存的是**副本**: 调用方 (listener / API) 手里那个 Location 实例还在外面传, 直接存进来的话
+     * 对方之后 `setX()` 一下就把选区改了 —— 选区是插件的内部状态, 不该被外部引用改到 (R9)。
      * @param player 玩家
      * @param pos1 点1
      */
     fun setPlayerPos1(player: Player, pos1: Location) {
         if (playerpos[player] == null) {
-            playerpos[player] = Pair(pos1,null)
+            playerpos[player] = Pair(pos1.clone(),null)
             return
         }
-        playerpos[player] = Pair(pos1,playerpos[player]!!.second)
+        playerpos[player] = Pair(pos1.clone(),playerpos[player]!!.second)
         showSelection(player)
     }
 
     /**
-     * 设置点2
+     * 设置点2 (同样存副本, 见 [setPlayerPos1])
      * @param player 玩家
      * @param pos2 点2
      */
     fun setPlayerPos2(player: Player, pos2: Location) {
         if (playerpos[player] == null) {
-            playerpos[player] = Pair(null,pos2)
+            playerpos[player] = Pair(null,pos2.clone())
             return
         }
-        playerpos[player] = Pair(playerpos[player]?.first,pos2)
+        playerpos[player] = Pair(playerpos[player]?.first,pos2.clone())
         showSelection(player)
     }
 
@@ -295,22 +308,54 @@ class SelectionManager {
 
     /**
      * 获取点1
+     *
+     * 返回**副本**: 调用方 (命令 / GUI / 对外 API) 改它不该改到选区内部状态 (R9)。
      * @param player 玩家
      * @return 点1
      * @return null if not set
      */
     fun getPlayerPos1(player: Player): Location? {
-        return playerpos[player]?.first
+        return playerpos[player]?.first?.clone()
     }
 
     /**
-     * 获取点2
+     * 获取点2 (同样返回副本, 见 [getPlayerPos1])
      * @param player 玩家
      * @return 点2
      * @return null if not set
      */
     fun getPlayerPos2(player: Player): Location? {
-        return playerpos[player]?.second
+        return playerpos[player]?.second?.clone()
+    }
+
+    /**
+     * 选区所在世界: 两点必须同世界, 且与玩家当前所在世界一致
+     *
+     * 不一致就提示并返回 null (操作直接不做), 不做"取其中一个"的猜测 —— 领地校验用的是选点世界,
+     * 而写入原来读的是玩家当前世界, 两者不一致时校验与写入会落在不同的世界上 (R4)。返回的 World
+     * 由调用方固定下来, 之后整个操作 (校验 / 事件 / 读写 / 撤销) 都用它。
+     */
+    internal fun selectionWorld(player: Player): World? {
+        val pos1 = playerpos[player]?.first ?: return null
+        val pos2 = playerpos[player]?.second ?: return null
+        val first = pos1.world
+        val second = pos2.world
+        if (first == null || second == null || first.uid != second.uid) {
+            // listener 本来就拦了跨世界选点, 这里兜住"兜底路径塞进来的脏数据"
+            player.sendLang("message-different-world", pluginId to "pluginId")
+            return null
+        }
+        val current = player.world
+        if (first.uid != current.uid) {
+            player.sendLang(
+                "message-selection-world-changed",
+                pluginId to "pluginId",
+                first.name to "selection",
+                current.name to "current"
+            )
+            return null
+        }
+        return current
     }
 
     /**

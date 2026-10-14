@@ -49,6 +49,25 @@ class UndoRecord(
 }
 
 /**
+ * [UndoManager.poll] 的结果
+ *
+ * 三态是必须的: 原来"没有记录了"和"记录读不出来"都返回 null, 调用方于是把读取失败报成"没有可
+ * 撤销的操作", 而文件已经被删掉 —— 记录凭空消失 (2026-10-14 的 R3)。现在读失败会**保留记录**,
+ * 调用方也能把它当成"这一轮没撤成, 可重试"。
+ */
+sealed interface UndoPoll {
+
+    /** 取到一条记录 (取走即从队列/磁盘移除, 由调用方负责"没撤成就放回去") */
+    data class Record(val record: UndoRecord) : UndoPoll
+
+    /** 确实没有更多记录了 */
+    object Empty : UndoPoll
+
+    /** 读取失败: 记录没有被删除, 可以重试 */
+    data class Failed(val cause: Throwable) : UndoPoll
+}
+
+/**
  * 撤销记录
  *
  * 一条记录一个文件: `plugins/PlayerWorldEdit/undo/<uuid>/<时间戳>.json.gz`。
@@ -128,12 +147,15 @@ object UndoManager {
     }
 
     /**
-     * 取出最近一条撤销记录 (取走即删除), 没有则返回 null
+     * 取出最近一条撤销记录 (取走即删除), 没有则返回 [UndoPoll.Empty]
      *
      * 优先从内存队列拿; 队列空了才回落到磁盘 —— 服务端重启后队列是空的, 记录仍然在文件里,
      * 所以这条回落路径就是"从磁盘重建队列"。
+     *
+     * **读取失败不删文件**: 返回 [UndoPoll.Failed] 并把队列条目放回去, 玩家可以再试一次
+     * (原来是读失败也照删, 那条记录就永久丢了)。
      */
-    fun poll(player: Player): UndoRecord? {
+    fun poll(player: Player): UndoPoll {
         val uuid = player.uniqueId
         return synchronized(lockOf(uuid)) {
             migrateLegacy(uuid)
@@ -144,26 +166,35 @@ object UndoManager {
             // 跳过"已被取走、但文件还没删掉"的记录: 写盘线程在写完到删文件之间会短暂留下文件,
             // 不跳过的话"编辑后立刻 /pwe undo 2"会把刚撤销过的那条又撤销一次
             val newest = listRecords(uuid).lastOrNull { !consumed.contains(consumedKey(uuid, it.name)) }
-                ?: return@synchronized null
+                ?: return@synchronized UndoPoll.Empty
             val record = readRecord(newest)
+            if (record == null) {
+                // 读不出来 (文件损坏 / 写盘还没写完): 保留文件, 让玩家可以重试
+                return@synchronized UndoPoll.Failed(IllegalStateException("撤销记录读取失败: ${newest.name}"))
+            }
             newest.delete()
-            record
+            UndoPoll.Record(record)
         }
     }
 
-    /** 从队列里取走一条: 内存里还留着快照就直接给, 已经落盘则从文件读回来 */
-    private fun takeQueued(uuid: UUID, queued: QueuedRecord): UndoRecord? {
+    /** 从队列里取走一条: 内存里还留着快照就直接给, 已经落盘则从文件读回来 (读失败要放回队列) */
+    private fun takeQueued(uuid: UUID, queued: QueuedRecord): UndoPoll {
         val inMemory = queued.record
         if (inMemory != null) {
             // 写盘可能还没结束: 记一笔, 让写盘线程写完自己把文件删掉
             consumed.add(consumedKey(uuid, queued.name))
             queued.record = null
-            return inMemory
+            return UndoPoll.Record(inMemory)
         }
         val file = File(dirOf(uuid), queued.name)
         val record = readRecord(file)
+        if (record == null) {
+            // 读失败: 放回队尾 (记录还在文件里, 下次还能读到), 这一轮按"没撤成"处理
+            queueOf(uuid).addLast(queued)
+            return UndoPoll.Failed(IllegalStateException("撤销记录读取失败: ${queued.name}"))
+        }
         file.delete()
-        return record
+        return UndoPoll.Record(record)
     }
 
     /** 同步入队, 顺带把超出 [limit] 的旧记录裁掉 */

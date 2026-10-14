@@ -20,6 +20,7 @@ import taboolib.common.platform.function.pluginId
 import taboolib.platform.util.sendLang
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicIntegerArray
 import java.util.concurrent.atomic.AtomicReferenceArray
 import kotlin.math.abs
 import kotlin.math.floor
@@ -53,8 +54,16 @@ class ShapeManager(
      */
     fun tryGenerateWall(player: Player, material: Material) {
         // 墙保持"选区四周"的口径不变: 选区校验 (含 Dominion fail-closed) 与以前完全一样
-        val region = pipeline.validatedRegion(player, needBreak = false) ?: return
-        generateShape(player, ShapeKind.WALL, material, region, radius = 0, successKey = "message-wall-susses")
+        val validated = pipeline.validatedSelection(player, needBreak = false) ?: return
+        generateShape(
+            player,
+            ShapeKind.WALL,
+            material,
+            validated.region,
+            radius = 0,
+            successKey = "message-wall-susses",
+            world = validated.world
+        )
     }
 
     /**
@@ -130,7 +139,9 @@ class ShapeManager(
         // 走到这里就是真的在生成了: 选择器里那份待确认数值到此用掉 (即用即弃)。命令行调用时表里
         // 本来就没有这个键, 删它是空操作 —— 两个入口共用这一处收尾, 界面层不用自己记着清。
         forgetShapeSize(player)
-        val weWorld = BukkitAdapter.adapt(player.world)
+        // 世界在这一行固定下来 (R4): 后面校验、事件、读写、撤销都用它, 玩家中途传送不影响本次操作
+        val world = player.world
+        val weWorld = BukkitAdapter.adapt(world)
         val location = player.location
         val centerX = location.blockX
         val centerZ = location.blockZ
@@ -139,7 +150,6 @@ class ShapeManager(
         // 凭空吃掉几层。baseY 已经夹在 [minY, maxY] 内、height 又 >= 1 (见 validateShapeSize),
         // 所以 topY 恒 >= baseY —— 原来那条 "baseY > topY 就返回" 的守卫不可达, 第 9 轮删掉
         val topY = (baseY + height - 1).coerceAtMost(weWorld.maxY)
-        val world = player.world
         // X/Z 世界边界夹取 (REV-06): 夹掉的部分不写也不计费, 夹取后照常执行 (与 move 的整体拒绝
         // 相反)。形状仍由**未夹取**的外接框定义 —— ShapeVolume 的圆心是从框推出来的, 把框夹小会把
         // 圆柱挪位, 所以"形状定义框"和"实际写入范围"分开传给 generateShape。
@@ -159,8 +169,8 @@ class ShapeManager(
         // 领地校验按**实际会写到的范围** (夹取之后) 查, 而不是形状的外接框
         if (!pipeline.checkProtection(
                 player,
-                locationOf(player, writeMin),
-                locationOf(player, writeMax),
+                locationOf(world, writeMin),
+                locationOf(world, writeMax),
                 needBreak = false
             )
         ) {
@@ -173,6 +183,7 @@ class ShapeManager(
             box,
             radius,
             successKey,
+            world = world,
             writeBox = CuboidRegion(
                 BlockVector3.at(writeMin[0], writeMin[1], writeMin[2]),
                 BlockVector3.at(writeMax[0], writeMax[1], writeMax[2])
@@ -208,6 +219,7 @@ class ShapeManager(
         box: CuboidRegion,
         radius: Int,
         successKey: String,
+        world: World,
         // 实际要写的范围 (世界边界夹取之后)。形状仍由 [box] 定义 —— ShapeVolume 的圆心是从 [box]
         // 推出来的, 直接把它夹小会把圆柱挪位, 所以两者分开。墙没有夹取, 用默认值即可。
         writeBox: CuboidRegion = box
@@ -227,12 +239,11 @@ class ShapeManager(
             radius
         )
         val regions = writeBox.splitByChunk()
-        // 计费: 每个区块各数自己那一块里的形状方块, 加总就是总量。失败退费按区块退, 口径一致。
-        // 这里数的是"列 × 层", 与下面 work 里逐块判定的结果严格相等 (见 ShapeVolume.countIn)
-        val costs = regions.map { chunk ->
-            mapOf(material to shape.countIn(chunk.minimumPoint.x(), chunk.maximumPoint.x(), chunk.minimumPoint.z(), chunk.maximumPoint.z()))
+        // 预扣量: 每个区块各数自己那一块里的形状方块, 加总就是总量 (纯算术, 见 ShapeVolume.countIn)。
+        // 预扣按它算 (保证"全有全无"), 收尾时再按**实际写入数**退差额 —— 预计值与实际值不再混用。
+        val amount = regions.sumOf { chunk ->
+            shape.countIn(chunk.minimumPoint.x(), chunk.maximumPoint.x(), chunk.minimumPoint.z(), chunk.maximumPoint.z())
         }
-        val amount = costs.sumOf { it.values.sum() }
         if (amount <= 0) {
             // 形状一点都没落在选区里 (例如 1x1 的选区放半径 1 的空心圆柱): 别白留一条 0 材料的撤销记录
             player.sendLang("message-shape-none", pluginId to "pluginId")
@@ -245,39 +256,44 @@ class ShapeManager(
             ShapeKind.HOLLOW_CYLINDER -> OperationType.HCYL
         }
         // 事件报的是实际要写的范围 (世界边界夹取之后), 不是形状的外接框
-        if (!pipeline.fireOperation(player, operation, writeBox)) return
-        if (!pipeline.beginEdit(player)) return
-        // 同 trySetArea: 查与扣合成一次原子操作; 先扣, 有区块没跑成再按区块退
+        val edit = pipeline.beginOperation(player, operation, writeBox, world) ?: return
+        // 同 trySetArea: 查与扣合成一次原子操作; 先扣, 有区块没跑成再按**实际写入量**退
         if (!PlayerWorldEdit.packManager.tryConsume(player, material, amount)) {
             player.sendLang("message-materialpack-not-enough",
                 pluginId to "pluginId",
                 material.displayName(player) to "material",
                 amount to "amount")
-            pipeline.endEdit(player)
+            pipeline.endEdit(player, edit.token)
             return
         }
         pipeline.prepareEdit(amount, player)
         val actor = pipeline.actorOf(player)
         val snapshots = AtomicReferenceArray<Array<BlockState?>?>(regions.size)
+        // 每个区块**实际**被接受的写入数 (不是 countIn 的预计值): 计费/退费/撤销都以它为准 (R2)
+        val written = AtomicIntegerArray(regions.size)
         // 绑定一次, 别在每个切片里现建函数引用
         val inShape: (Int, Int, Int) -> Boolean = shape::contains
-        runOnChunkThreads(regions, player.world,
+        runOnChunkThreads(regions, world,
             work = { index, slice ->
                 val chunk = regions[index]
                 val states = snapshots.get(index)
                     ?: arrayOfNulls<BlockState>(chunk.volume.toInt()).also { snapshots.set(index, it) }
                 // 快照照旧读整块: 撤销要把整块还原回去, 没改过的方块还原回去也没有副作用
-                WorldEditTool.readBlocksInto(player.world, slice.region, states, slice.offset)
-                WorldEditTool.setBlocksIf(player.world, slice.region, blockType.defaultState, actor, inShape)
+                WorldEditTool.readBlocksInto(world, slice.region, states, slice.offset)
+                written.addAndGet(
+                    index,
+                    WorldEditTool.setBlocksIf(world, slice.region, blockType.defaultState, actor, inShape)
+                )
             },
-            done = { _ ->
+            done = { result ->
                 pipeline.onPlayerThread(player) {
                     pipeline.finishEdit(
                         player,
-                        regions,
+                        edit,
+                        result,
                         regions.indices.map { snapshots[it] },
                         mapOf(material to amount),
-                        costs,
+                        regions.indices.map { count -> costOf(material, written.get(count)) },
                         successKey,
                         operation
                     )
@@ -387,7 +403,7 @@ class ShapeManager(
      * @param expand true=扩展, false=收缩
      */
     fun resizeSelection(player: Player, blocks: Int, expand: Boolean) {
-        // 和 set/replace 一样: 没选齐两点就提示先选点。这里不走 validatedRegion —— 领地校验要等
+        // 和 set/replace 一样: 没选齐两点就提示先选点。这里不走 validatedSelection —— 领地校验要等
         // 移动后的包围盒算出来再做, 见下
         val pos1 = selection.getPlayerPos1(player) ?: run {
             player.sendLang("message-no-region", pluginId to "pluginId")
@@ -397,23 +413,25 @@ class ShapeManager(
             player.sendLang("message-no-region", pluginId to "pluginId")
             return
         }
+        // 世界在这里固定下来 (R4): 扩缩会真的读源层、写新层, 中途传送不能让它们落到另一个世界
+        val world = selection.selectionWorld(player) ?: return
         val steps = blocks.coerceIn(1, SELECTION_EDIT_MAX_BLOCKS)
         // 选区本来就按方块坐标存 (点的中心 5.5 落到方块 5), 这里同样取整: 全程按方块算, 不引入小数偏移
         val first = intArrayOf(floor(pos1.x).toInt(), floor(pos1.y).toInt(), floor(pos1.z).toInt())
         val second = intArrayOf(floor(pos2.x).toInt(), floor(pos2.y).toInt(), floor(pos2.z).toInt())
         val (axis, positive) = snapAxis(player.eyeLocation.direction)
-        val moved = moveSelectionFace(player, first, second, axis, positive, steps, expand) ?: return
+        val moved = moveSelectionFace(player, world, first, second, axis, positive, steps, expand) ?: return
         val min = IntArray(3) { minOf(first[it], second[it]) }
         val max = IntArray(3) { maxOf(first[it], second[it]) }
         // 领地校验覆盖**所有会被改动的方块**: 老选区 ∪ 新选区的包围盒。扩展动的是新层 (新选区 ⊇
         // 老选区), 收缩清掉的是被砍掉的层 (老选区 ⊇ 新选区), 取并集两条路都不会漏。fail-closed。
         val checkMin = IntArray(3) { minOf(min[it], moved.first[it], moved.second[it]) }
         val checkMax = IntArray(3) { maxOf(max[it], moved.first[it], moved.second[it]) }
-        if (!pipeline.checkProtection(player, locationOf(player, checkMin), locationOf(player, checkMax), needBreak = false)) {
+        if (!pipeline.checkProtection(player, locationOf(world, checkMin), locationOf(world, checkMax), needBreak = false)) {
             return
         }
-        if (expand) expandSelection(player, moved, axis, positive, min, max)
-        else contractSelection(player, moved, axis, positive, min, max)
+        if (expand) expandSelection(player, world, moved, axis, positive, min, max)
+        else contractSelection(player, world, moved, axis, positive, min, max)
     }
 
     /** [moveSelectionFace] 的结果: 移动后的两个点 (保持 pos1/pos2 的角色) */
@@ -429,6 +447,7 @@ class ShapeManager(
      */
     private fun moveSelectionFace(
         player: Player,
+        world: World,
         first: IntArray,
         second: IntArray,
         axis: Int,
@@ -462,7 +481,7 @@ class ShapeManager(
         // world.getMaxHeight() - 1), X/Z 用世界边界 (REV-06)。越界的选区点会让框画到世界外, 而且
         // 之后复制是按层数算的 —— 界外那一层根本放不上, 等于白算。被吃掉的那几格就丢掉, 但夹取后
         // 的结果照旧应用 (不整体放弃), 只额外提示一句, 免得玩家以为命令没生效。
-        val clamped = clampAxis(player.world, axis, after)
+        val clamped = clampAxis(world, axis, after)
         // 夹完必须真的朝那一面移动了才算扩展: 顶在边界上, 或者选区本来就在界外 (夹取结果反向) 都算
         // "到边界了" —— 只提示, 不写方块也不动选区
         if (if (positive) clamped <= before else clamped >= before) {
@@ -499,13 +518,13 @@ class ShapeManager(
      */
     private fun expandSelection(
         player: Player,
+        world: World,
         moved: MovedFace,
         axis: Int,
         positive: Boolean,
         min: IntArray,
         max: IntArray
     ) {
-        val world = player.world
         // 源层 = 老选区在朝向那一面最外的一层; 目标面 = 移动后的那一面 (被世界高度夹过, 可能少几层)
         val sourceCoord = if (positive) max[axis] else min[axis]
         val targetCoord =
@@ -523,8 +542,7 @@ class ShapeManager(
         }
         // 实际会写下去的那几层 —— 操作前事件报的就是它
         val targetSlab = slabRegion(axis, sourceCoord + if (positive) 1 else -1, targetCoord, writeMin, writeMax)
-        if (!pipeline.fireOperation(player, OperationType.EXPAND, targetSlab)) return
-        if (!pipeline.beginEdit(player)) return
+        val edit = pipeline.beginOperation(player, OperationType.EXPAND, targetSlab, world) ?: return
         EditBudget.configure(pipeline.blocksPerTick())
         // 源层沿 [axis] 平移复制, 平面内两个坐标原样对应, 所以把源层压成一维数组存起来最省事
         val plane = PlaneIndex(axis, writeMin, writeMax)
@@ -538,26 +556,26 @@ class ShapeManager(
                     source[plane.indexOf(vector.x(), vector.y(), vector.z())] = weWorld.getBlock(vector)
                 }
             },
-            done = { timedOut ->
+            done = { readResult ->
                 // 统计是纯内存操作, 顺手在区块线程上做, 玩家线程只拿结果
-                val perLayer = if (timedOut) emptyMap() else countMaterials(source)
+                val perLayer = if (readResult.isAllComplete()) countMaterials(source) else emptyMap()
                 pipeline.onPlayerThread(player) {
-                    if (timedOut) {
-                        // 源层没读完: 什么都还没扣、也没写, 直接收尾
-                        pipeline.endEdit(player)
+                    if (!readResult.isAllComplete()) {
+                        // 源层没读完 (超时 / 区块抛异常): 什么都还没扣、也没写, 直接收尾
+                        pipeline.endEdit(player, edit.token)
                         player.sendLang("message-edit-failed", pluginId to "pluginId")
                         return@onPlayerThread
                     }
                     if (perLayer.isEmpty()) {
                         // 源层全是空气: 没有可复制的, 一个方块都不写, 选区也不动
-                        pipeline.endEdit(player)
+                        pipeline.endEdit(player, edit.token)
                         player.sendLang("message-selection-expand-empty", pluginId to "pluginId")
                         return@onPlayerThread
                     }
                     // 每一层都照抄源层, 所以每种材料的用量 = 源层里该材料的个数 × 层数
                     val needed = perLayer.mapValues { it.value * layers }
                     if (!pipeline.consumeAll(player, needed)) {
-                        pipeline.endEdit(player)
+                        pipeline.endEdit(player, edit.token)
                         return@onPlayerThread
                     }
                     selection.updateSelection(player, moved.first, moved.second)
@@ -568,11 +586,12 @@ class ShapeManager(
                     val written = AtomicReferenceArray<HashMap<Material, Int>?>(targetChunks.size)
                     pipeline.writeChunks(
                         player,
+                        edit,
                         targetChunks,
                         "message-selection-expand-susses",
                         charged = needed,
                         costs = { targetChunks.indices.map { written.get(it) ?: emptyMap() } },
-                        operation = OperationType.EXPAND
+                        type = OperationType.EXPAND
                     ) { index, slice, _ ->
                         val counts = written.get(index)
                             ?: HashMap<Material, Int>().also { written.set(index, it) }
@@ -598,6 +617,7 @@ class ShapeManager(
      */
     private fun contractSelection(
         player: Player,
+        world: World,
         moved: MovedFace,
         axis: Int,
         positive: Boolean,
@@ -611,8 +631,7 @@ class ShapeManager(
         val to = if (positive) max[axis] else newCoord - 1
         val clearedLayers = slabRegion(axis, from, to, min, max)
         // 操作前事件必须在**任何状态改动之前**: 下面的 updateSelection 会真的动选区
-        if (!pipeline.fireOperation(player, OperationType.CONTRACT, clearedLayers)) return
-        if (!pipeline.beginEdit(player)) return
+        val edit = pipeline.beginOperation(player, OperationType.CONTRACT, clearedLayers, world) ?: return
         selection.updateSelection(player, moved.first, moved.second)
         val regions = clearedLayers.splitByChunk()
         // 每个区块被清掉多少非空气方块 —— 同一区块的切片在同一线程上顺序执行, 普通 IntArray 就够
@@ -624,17 +643,21 @@ class ShapeManager(
         val air = BlockTypes.AIR!!.defaultState
         pipeline.writeChunks(
             player,
+            edit,
             regions,
             "message-selection-contract-susses",
             charged = emptyMap(),
             costs = { regions.indices.map { index -> if (cleared[index] == 0) emptyMap() else mapOf(Material.AIR to cleared[index]) } },
-            operation = OperationType.CONTRACT
+            type = OperationType.CONTRACT
         ) { index, slice, states ->
+            // 先写, **写被接受了才算"清掉"**: 被 Folia 区域线程拒掉的切片一个都不记, 否则
+            // "报了多少格"与"世界真的清了多少格"又分叉 (R2)
+            val accepted = WorldEditTool.setBlocksIf(world, slice.region, air, actor) { _, _, _ -> true }
+            if (accepted <= 0) return@writeChunks
             for (position in slice.offset until slice.offset + slice.size) {
                 val state = states[position] ?: continue
                 if (!state.blockType.isAir()) cleared[index]++
             }
-            WorldEditTool.setBlocksIf(player.world, slice.region, air, actor) { _, _, _ -> true }
         }
     }
 
@@ -656,6 +679,8 @@ class ShapeManager(
      */
     fun moveSelection(player: Player, blocks: Int) {
         val region = selection.selectionRegion(player) ?: return
+        // 世界在开头固定 (R4): move 会读源区、写并集, 中途传送不能让它们落到另一个世界
+        val world = selection.selectionWorld(player) ?: return
         val steps = blocks.coerceIn(1, SELECTION_EDIT_MAX_BLOCKS)
         val (axis, positive) = snapAxis(player.eyeLocation.direction)
         val min = intArrayOf(region.minimumPoint.x(), region.minimumPoint.y(), region.minimumPoint.z())
@@ -665,7 +690,7 @@ class ShapeManager(
         delta[axis] = if (positive) steps else -steps
         val targetMin = intArrayOf(min[0] + delta[0], min[1] + delta[1], min[2] + delta[2])
         val targetMax = intArrayOf(max[0] + delta[0], max[1] + delta[1], max[2] + delta[2])
-        if (!moveTargetInWorld(player, targetMin, targetMax)) {
+        if (!moveTargetInWorld(world, targetMin, targetMax)) {
             player.sendLang("message-move-out-of-bounds", pluginId to "pluginId")
             return
         }
@@ -673,16 +698,14 @@ class ShapeManager(
         // 替换操作要求破坏权限, 与 replace/paste 同类)。fail-closed。
         val checkMin = intArrayOf(minOf(min[0], targetMin[0]), minOf(min[1], targetMin[1]), minOf(min[2], targetMin[2]))
         val checkMax = intArrayOf(maxOf(max[0], targetMax[0]), maxOf(max[1], targetMax[1]), maxOf(max[2], targetMax[2]))
-        if (!pipeline.checkProtection(player, locationOf(player, checkMin), locationOf(player, checkMax), needBreak = true)) return
+        if (!pipeline.checkProtection(player, locationOf(world, checkMin), locationOf(world, checkMax), needBreak = true)) return
         // 源 ∪ 目标的并集: 既是领地校验的框, 也是操作前事件报的范围、第二轮要写的范围 —— 一处算好
         val union = CuboidRegion(
             BlockVector3.at(checkMin[0], checkMin[1], checkMin[2]),
             BlockVector3.at(checkMax[0], checkMax[1], checkMax[2])
         )
-        if (!pipeline.fireOperation(player, OperationType.MOVE, union)) return
-        if (!pipeline.beginEdit(player)) return
+        val edit = pipeline.beginOperation(player, OperationType.MOVE, union, world) ?: return
         EditBudget.configure(pipeline.blocksPerTick())
-        val world = player.world
         // 第一轮: 只读源区。写入阶段全靠这份快照, 所以它必须完整
         val source = arrayOfNulls<BlockState>(region.volume.toInt())
         val index = BoxIndex(min, max)
@@ -695,27 +718,27 @@ class ShapeManager(
                     source[index.indexOf(vector.x(), vector.y(), vector.z())] = weWorld.getBlock(vector)
                 }
             },
-            done = { timedOut ->
+            done = { readResult ->
                 // 统计是纯内存操作, 顺手在区块线程上做, 玩家线程只拿结果
-                val moved = if (timedOut) emptyMap() else countMaterials(source)
+                val moved = if (readResult.isAllComplete()) countMaterials(source) else emptyMap()
                 pipeline.onPlayerThread(player) {
-                    if (timedOut) {
-                        // 源区没读完: 什么都还没扣、也没写, 直接收尾
-                        pipeline.endEdit(player)
+                    if (!readResult.isAllComplete()) {
+                        // 源区没读完 (超时 / 区块抛异常): 什么都还没扣、也没写, 直接收尾
+                        pipeline.endEdit(player, edit.token)
                         player.sendLang("message-edit-failed", pluginId to "pluginId")
                         return@onPlayerThread
                     }
                     if (moved.isEmpty()) {
                         // 源区全是空气: 没有可搬的。照字面执行会把目标区清空, 但那不是玩家要的"搬
                         // 东西", 所以直接不动 (与 expand 的"没有可复制的"同一处理)
-                        pipeline.endEdit(player)
+                        pipeline.endEdit(player, edit.token)
                         player.sendLang("message-move-empty", pluginId to "pluginId")
                         return@onPlayerThread
                     }
                     // 目标区写下去的就是源区这份内容, 所以用量 = 源区的统计 (与 expand 同口径:
                     // 搬出来的方块算"新放上的", 要按材料扣; 源区清空气不退料, 同 contract)
                     if (!pipeline.consumeAll(player, moved)) {
-                        pipeline.endEdit(player)
+                        pipeline.endEdit(player, edit.token)
                         return@onPlayerThread
                     }
                     val actor = pipeline.actorOf(player)
@@ -728,11 +751,12 @@ class ShapeManager(
                     val air = BlockTypes.AIR!!.defaultState
                     pipeline.writeChunks(
                         player,
+                        edit,
                         regions,
                         "message-move-susses",
                         charged = moved,
                         costs = { regions.indices.map { written.get(it) ?: emptyMap() } },
-                        operation = OperationType.MOVE
+                        type = OperationType.MOVE
                     ) { chunkIndex, slice, _ ->
                         val counts = written.get(chunkIndex)
                             ?: HashMap<Material, Int>().also { written.set(chunkIndex, it) }
@@ -768,10 +792,10 @@ class ShapeManager(
      * 只有 move 用它做"整体拒绝": 出去一格就意味着有方块搬不过去 (源区清了、目标区写不上),
      * 所以这里不像 expand/paste 那样夹取。世界边界读不到时只按高度判断 (退回改动前的行为)。
      */
-    private fun moveTargetInWorld(player: Player, min: IntArray, max: IntArray): Boolean {
-        val weWorld = BukkitAdapter.adapt(player.world)
+    private fun moveTargetInWorld(world: World, min: IntArray, max: IntArray): Boolean {
+        val weWorld = BukkitAdapter.adapt(world)
         if (min[AXIS_Y] < weWorld.minY || max[AXIS_Y] > weWorld.maxY) return false
-        val border = worldBorderBounds(player.world) ?: return true
+        val border = worldBorderBounds(world) ?: return true
         return min[AXIS_X] >= border[0] && max[AXIS_X] <= border[1] &&
             min[AXIS_Z] >= border[2] && max[AXIS_Z] <= border[3]
     }

@@ -22,6 +22,44 @@ import java.util.concurrent.atomic.AtomicLong
 class RegionSlice(val region: CuboidRegion, val offset: Int, val size: Int)
 
 /**
+ * 一批区块任务的执行结果
+ *
+ * 原来 [runOnChunkThreads] 只回报"是不是超时兜底收的尾", 于是"某个区块抛异常"和"某个区块被超时
+ * 截断"都会被调用方当成跑完了 —— 快照读完了就当写成功、撤销只还原了一半照样退料并删记录
+ * (2026-10-14 的 R2 / R3)。现在把每个区块的进度与失败一起带出来, 调用方按"实际写到哪"结账。
+ *
+ * @param timedOut 是不是超时兜底收的尾 (还有区块没跑完)
+ * @param failed 抛过异常 / 区块加载失败的区块下标 (这些区块只跑完了一部分)
+ * @param slices 与 regions 一一对应的切片布局 (撤销按切片粒度记账要用, 见 [EditPipeline.undoBatches])
+ * @param completed 与 regions 一一对应: 每个区块**完整跑完**的切片数
+ */
+class ChunkBatchResult(
+    val timedOut: Boolean,
+    val failed: Set<Int>,
+    val slices: List<List<RegionSlice>>,
+    val completed: IntArray
+) {
+
+    /** 这个区块是不是从头到尾跑完了 (没抛异常、也没被超时截断) */
+    fun isComplete(index: Int): Boolean = index !in failed && completed[index] == slices[index].size
+
+    /** 整批都跑完了 (所有区块的所有切片) */
+    fun isAllComplete(): Boolean = !timedOut && slices.indices.all { isComplete(it) }
+
+    /** 有没有区块真的动过 (至少完整跑完一片) —— 用来判断"这次操作是不是什么都没写成" */
+    fun hasProgress(): Boolean = completed.any { it > 0 }
+
+    /** 这个区块实际跑到第几片为止 (含可能写了一半的那一片, 见 [EditPipeline.undoBatches]) */
+    fun reachedSlices(index: Int): Int =
+        (completed[index] + if (index in failed) 1 else 0).coerceAtMost(slices[index].size)
+
+    companion object {
+        /** 空批次 (没有区块) 的结果: 什么都没跑, 也算"全部完成" */
+        fun empty(): ChunkBatchResult = ChunkBatchResult(false, emptySet(), emptyList(), IntArray(0))
+    }
+}
+
+/**
  * 把选区按区块切成若干小块, 顺序固定 (先 X 后 Z)。
  *
  * Folia 里一个区域线程只能改动自己拥有的区块, 而 WorldEdit 的 Folia 支持会把越界修改
@@ -81,20 +119,29 @@ fun CuboidRegion.sliceByY(maxBlocks: Int): List<RegionSlice> {
  * 单个区块抛错不会影响其余区块, 异常直接打到控制台; [done] 在最后一个完成的线程上运行,
  * 所以里面不要再碰玩家数据, 用 [runOnOwnThread] 切回玩家线程。
  *
- * [done] 的参数表示这次收尾是不是**超时兜底**触发的 (见 [STALL_TIMEOUT_MILLIS]): 超时说明还有
- * 区块没跑完, 调用方必须按"失败"处理 —— set/replace 靠快照里的 null 判断, undo 靠这个参数。
+ * [done] 拿到的 [ChunkBatchResult] 同时给出"是不是超时兜底"、"哪些区块抛了异常 / 加载失败"、
+ * "每个区块跑完了几片" —— 调用方必须按它结账: 没跑完的区块不能当成功, 跑了一半的区块要能撤销
+ * (见 [ChunkBatchResult])。
+ *
+ * 线程可见性: 每个区块的切片由同一条区域线程串行执行, 所以 [ChunkBatchResult.completed] 的每个
+ * 下标只有一个写者; 收尾线程是通过 `remaining` 的 CAS / `notified` 的 CAS 拿到结果的, 之前的写入
+ * 经由这两条原子操作建立 happens-before。看门狗线程那条路径 (超时) 只读一个快照值, 结论由
+ * `timedOut` 主导, 调用方本来就按"失败"处理。
  */
 fun runOnChunkThreads(
     regions: List<CuboidRegion>,
     world: World,
     work: (index: Int, slice: RegionSlice) -> Unit,
-    done: (timedOut: Boolean) -> Unit
+    done: (ChunkBatchResult) -> Unit
 ) {
     if (regions.isEmpty()) {
-        done(false)
+        done(ChunkBatchResult.empty())
         return
     }
     val slices = regions.map { it.sliceByY(EditBudget.sliceSize) }
+    // 每个区块完整跑完的切片数 / 抛过异常(或区块加载失败)的区块
+    val completed = IntArray(regions.size)
+    val failed = ConcurrentHashMap.newKeySet<Int>()
     val waves = regions.indices.chunked(minOf(regions.size, CHUNK_LOAD_WAVE))
     var waveIndex = 0
     val notified = AtomicBoolean(false)
@@ -116,12 +163,13 @@ fun runOnChunkThreads(
             watchdogs.remove(it)
             it.cancel()
         }
-        done(timedOut)
+        done(ChunkBatchResult(timedOut, failed.toSet(), slices, completed.copyOf()))
     }
 
     // 真的写完一片才算"有进展": 失败的切片会直接 finish, 不该刷新计时
     val trackedWork: (Int, RegionSlice) -> Unit = { index, slice ->
         work(index, slice)
+        completed[index]++
         lastProgress.set(System.currentTimeMillis())
     }
 
@@ -139,7 +187,7 @@ fun runOnChunkThreads(
         // 区块没跑成也要计数, 否则 done 永远不触发 (材料扣了却没有记录和提示)
         val completeOne = Runnable { if (remaining.decrementAndGet() == 0) nextWave() }
         wave.forEach { index ->
-            ChunkTask(world, regions[index], slices[index], index, trackedWork, aborted, completeOne).start()
+            ChunkTask(world, regions[index], slices[index], index, trackedWork, aborted, failed, completeOne).start()
         }
     }
 
@@ -165,6 +213,7 @@ private class ChunkTask(
     private val index: Int,
     private val work: (Int, RegionSlice) -> Unit,
     private val aborted: AtomicBoolean,
+    private val failed: MutableSet<Int>,
     private val complete: Runnable
 ) {
 
@@ -198,6 +247,8 @@ private class ChunkTask(
             work(index, slice)
             position++
         } catch (throwable: Throwable) {
+            // 抛异常 = 这一片只做了一半 (读可能成了、写没成): 记下这个区块, 由调用方按"部分完成"结账
+            failed.add(index)
             Bukkit.getLogger().warning("[PlayerWorldEdit] 区块操作失败 ${world.name} $chunkX,$chunkZ: $throwable")
             finish()
             return
@@ -219,7 +270,9 @@ private class ChunkTask(
      * @param delayTicks 0 表示立刻排到该区块所属的区域线程
      */
     private fun schedule(delayTicks: Long) {
-        loadChunkThen(world, chunkX, chunkZ, { dispatch(delayTicks) }, { finish() })
+        // 区块加载不出来也要标成失败: 否则这个区块"一片没跑"却和其他区块一样算跑完, 调用方会把
+        // 没写成的区块当成写成功 (材料不退、撤销记录里还留着它)
+        loadChunkThen(world, chunkX, chunkZ, { dispatch(delayTicks) }, { failed.add(index); finish() })
     }
 
     private fun dispatch(delayTicks: Long) {

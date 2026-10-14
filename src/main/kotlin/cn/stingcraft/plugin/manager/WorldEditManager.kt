@@ -18,6 +18,7 @@ import taboolib.common.platform.function.pluginId
 import taboolib.common.platform.function.submitAsync
 import taboolib.common.platform.function.warning
 import taboolib.platform.util.sendLang
+import java.util.concurrent.atomic.AtomicIntegerArray
 import java.util.concurrent.atomic.AtomicReferenceArray
 
 /**
@@ -49,13 +50,16 @@ class WorldEditManager {
      * 四张 per-UUID 状态表分散在四个 manager 里, 清理统一聚合在这里 —— 少清一处就是"按 UUID 只增
      * 不删"的表 (与拆分前逐条清理等价, 只是按 owner 归了组)。
      *
+     * **编辑锁不在这里释放**: 玩家退出 / 主动清选区时可能还有一个大编辑在跑, 那把锁是它的, 由它
+     * 自己的收尾释放 ([EditPipeline.endEdit] 只认自己的凭证)。在这里硬删会让"退出重登后再开一个
+     * 操作"与旧操作并发跑 —— 重复扣料、撤销记录交错 (2026-10-14 的 R1)。
+     *
      * @param player 玩家
      */
     fun clearPlayerPos(player: Player) {
         selection.forget(player)
         clipboards.forget(player)
         shapes.forgetShapeSize(player)
-        pipeline.endEdit(player)
     }
 
     /**
@@ -72,9 +76,14 @@ class WorldEditManager {
      * 所以选区按区块拆开, 每块在它自己的区域线程上"先读后写"。各区块互不重叠, 读到的
      * 一定还是填充前的方块, 可以直接当撤销快照。大选区再按 [EditBudget] 一片一片来,
      * 不会把区域线程一次占住。
+     *
+     * 计费以**实际被接受的写入数**为准 (不是选区体积): 预扣按体积算 (保证"全有全无"),
+     * 收尾时把"预扣 - 实际写入"退回去 —— 被 Folia 拒掉、或某片写失败的格子不该算钱 (R2)。
      */
     fun trySetArea(player: Player, material: Material) {
-        val region = pipeline.validatedRegion(player, needBreak = false) ?: return
+        val validated = pipeline.validatedSelection(player, needBreak = false) ?: return
+        val world = validated.world
+        val region = validated.region
         val blockType = pipeline.resolveBlockType(material) ?: run {
             player.sendLang("message-invalid-material", pluginId to "pluginId", material.name to "material")
             return
@@ -84,39 +93,41 @@ class WorldEditManager {
             player.sendLang("message-no-region", pluginId to "pluginId")
             return
         }
-        if (!pipeline.fireOperation(player, OperationType.SET, region)) return
-        if (!pipeline.beginEdit(player)) return
+        val operation = pipeline.beginOperation(player, OperationType.SET, region, world) ?: return
         // 检查与扣费必须在一次原子操作里完成: 原来是"查够不够"和"扣"两次调用,
         // 中间别的线程也能通过检查, 同一个玩家并发操作时会被各扣一次。
-        // 先扣材料, 有区块没执行成功再按体积退还。
+        // 先扣材料, 有区块没执行成功再按实际写入量退还。
         if (!PlayerWorldEdit.packManager.tryConsume(player, material, amount)) {
             player.sendLang("message-materialpack-not-enough",
                 pluginId to "pluginId",
                 material.displayName(player) to "material",
                 amount to "amount")
-            pipeline.endEdit(player)
+            pipeline.endEdit(player, operation.token)
             return
         }
         pipeline.prepareEdit(amount, player)
         val actor = pipeline.actorOf(player)
         val regions = region.splitByChunk()
         val snapshots = AtomicReferenceArray<Array<BlockState?>?>(regions.size)
-        runOnChunkThreads(regions, player.world,
+        // 每个区块**实际**被接受的写入数 (setBlocks 的返回值), 不是体积: 计费/退费/撤销都以它为准
+        val written = AtomicIntegerArray(regions.size)
+        runOnChunkThreads(regions, world,
             work = { index, slice ->
                 val chunk = regions[index]
                 val states = snapshots.get(index)
                     ?: arrayOfNulls<BlockState>(chunk.volume.toInt()).also { snapshots.set(index, it) }
-                WorldEditTool.readBlocksInto(player.world, slice.region, states, slice.offset)
-                WorldEditTool.setBlocks(player.world, slice.region, blockType.defaultState, actor)
+                WorldEditTool.readBlocksInto(world, slice.region, states, slice.offset)
+                written.addAndGet(index, WorldEditTool.setBlocks(world, slice.region, blockType.defaultState, actor))
             },
-            done = { _ ->
+            done = { result ->
                 pipeline.onPlayerThread(player) {
                     pipeline.finishEdit(
                         player,
-                        regions,
+                        operation,
+                        result,
                         regions.indices.map { snapshots[it] },
                         mapOf(material to amount),
-                        regions.map { mapOf(material to it.volume.toInt()) },
+                        regions.indices.map { count -> costOf(material, written.get(count)) },
                         "message-set-susses",
                         OperationType.SET
                     )
@@ -130,9 +141,14 @@ class WorldEditManager {
      *
      * 分两轮逐区块执行: 第一轮只读 (统计实际会被替换的方块数量并留作撤销快照), 校验材料
      * 扣费后再跑第二轮写入。收费按实际替换数量算, 收费和写入用的是同一份快照。
+     *
+     * **第二轮的结果单独跟踪** (R2): 第一轮快照读完只说明"知道要改哪些", 不能证明第二轮写成功。
+     * 收尾时按第二轮的**实际写入数**结账, 第二轮整批失败就全额退费、不留撤销记录。
      */
     fun tryReplaceArea(player: Player, from: Material, to: Material) {
-        val region = pipeline.validatedRegion(player, needBreak = true) ?: return
+        val validated = pipeline.validatedSelection(player, needBreak = true) ?: return
+        val world = validated.world
+        val region = validated.region
         val fromType = pipeline.resolveBlockType(from)
         val toType = pipeline.resolveBlockType(to)
         if (fromType == null || toType == null) {
@@ -141,26 +157,27 @@ class WorldEditManager {
             return
         }
         // 事件报的包围盒是整个选区: replace 只会改选区里匹配的那些方块, 但能改的范围就是选区
-        if (!pipeline.fireOperation(player, OperationType.REPLACE, region)) return
-        if (!pipeline.beginEdit(player)) return
+        val operation = pipeline.beginOperation(player, OperationType.REPLACE, region, world) ?: return
         val regions = region.splitByChunk()
         val snapshots = AtomicReferenceArray<Array<BlockState?>?>(regions.size)
-        runOnChunkThreads(regions, player.world,
+        // 第一轮: 只读 (读不全的区块不算进"要替换的区块")
+        runOnChunkThreads(regions, world,
             work = { index, slice ->
                 val chunk = regions[index]
                 val states = snapshots.get(index)
                     ?: arrayOfNulls<BlockState>(chunk.volume.toInt()).also { snapshots.set(index, it) }
-                WorldEditTool.readBlocksInto(player.world, slice.region, states, slice.offset)
+                WorldEditTool.readBlocksInto(world, slice.region, states, slice.offset)
             },
-            done = { _ ->
+            done = { readResult ->
                 pipeline.onPlayerThread(player) {
-                    val targets = regions.indices.filter { pipeline.isComplete(snapshots[it]) }
+                    // 第一轮跑完的区块才作数: 抛异常/没跑完的区块快照里有 null, 拿它统计会错
+                    val targets = regions.indices.filter { readResult.isComplete(it) }
                     // 每个区块实际会被替换的数量, 收费和失败退费都以它为准
                     val costs = targets.map { mapOf(to to replaceTargets(snapshots[it]!!, fromType.defaultState)) }
                     val amount = costs.sumOf { it.values.sum() }
                     if (amount <= 0) {
                         player.sendLang("message-replace-none", pluginId to "pluginId", from.displayName(player) to "material")
-                        pipeline.endEdit(player)
+                        pipeline.endEdit(player, operation.token)
                         return@onPlayerThread
                     }
                     // 同 trySetArea: 查与扣合成一次原子操作
@@ -169,25 +186,38 @@ class WorldEditManager {
                             pluginId to "pluginId",
                             to.displayName(player) to "material",
                             amount to "amount")
-                        pipeline.endEdit(player)
+                        pipeline.endEdit(player, operation.token)
                         return@onPlayerThread
                     }
                     pipeline.prepareEdit(amount, player)
                     val actor = pipeline.actorOf(player)
                     val batchRegions = targets.map { regions[it] }
                     val batchSnapshots = targets.map { snapshots[it] }
-                    runOnChunkThreads(batchRegions, player.world,
+                    // 第二轮**实际**被接受的写入数 (replaceBlocks 的返回值): 与第一轮的预扣量分开记,
+                    // 第二轮写失败/少写时按它退费 (R2)
+                    val written = AtomicIntegerArray(batchRegions.size)
+                    runOnChunkThreads(batchRegions, world,
                         work = { index, slice ->
-                            WorldEditTool.replaceBlocks(player.world, slice.region, fromType.defaultState, toType.defaultState, actor)
+                            written.addAndGet(
+                                index,
+                                WorldEditTool.replaceBlocks(
+                                    world,
+                                    slice.region,
+                                    fromType.defaultState,
+                                    toType.defaultState,
+                                    actor
+                                )
+                            )
                         },
-                        done = { _ ->
+                        done = { writeResult ->
                             pipeline.onPlayerThread(player) {
                                 pipeline.finishEdit(
                                     player,
-                                    batchRegions,
+                                    operation,
+                                    writeResult,
                                     batchSnapshots,
                                     mapOf(to to amount),
-                                    costs,
+                                    batchRegions.indices.map { count -> costOf(to, written.get(count)) },
                                     "message-replace-susses",
                                     OperationType.REPLACE
                                 )
@@ -216,37 +246,61 @@ class WorldEditManager {
      * `/pwe undo 3` 的最终结果不可预测。
      *
      * 所以这里改成一条接一条的链式回调: 异步线程取记录 → 区块线程还原 → 玩家线程返还 →
-     * 回到异步线程取吓一条。
+     * 回到异步线程取下一条。
      *
-     * 某一条超时 (见 [runOnChunkThreads] 的超时兜底) 时不退还材料、也不丢记录, 而是把它放回
-     * 队列并中止整轮 —— 只还原了一部分还照常退料等于白送, 直接丢掉则剩下的区块再也撤不回去。
+     * **任何一步没成都不退料、不丢记录, 而是把记录放回队列并中止整轮** (超时、区块抛异常、
+     * 区块加载失败、记录读不出来、排队就炸了 —— 2026-10-14 的 R3): 只还原了一部分还照常退料
+     * 等于白送, 直接丢掉则剩下的区块再也撤不回去。还原到快照是幂等的, 所以放回去让玩家重试,
+     * 已还原的部分重做一遍没有副作用; 也绝不越过这条记录去取更早的。
      *
      * @param player 玩家
      * @param times 次数
-     * @param onDone 整轮结束时回调一次, 参数是实际撤销的条数和"这轮是不是因为超时提前收的尾"
+     * @param onDone 整轮结束时回调一次, 参数是实际撤销的条数和"这轮是不是被中断提前收的尾"
+     *   (超时 / 失败 / 世界没加载都算中断: 记录已经放回队列, 可以重试)
      */
-    fun undo(player: Player, times: Int, onDone: (done: Int, timedOut: Boolean) -> Unit) {
-        if (!pipeline.beginEdit(player)) {
-            // 和其它出口一样走 finishUndo, 保证回调线程一致 (endEdit 对没进过集合的玩家是空操作)
-            finishUndo(player, 0, timedOut = false, onDone)
+    fun undo(player: Player, times: Int, onDone: (done: Int, interrupted: Boolean) -> Unit) {
+        val token = pipeline.beginEdit(player)
+        if (token == null) {
+            // **拿不到锁时绝不能走 endEdit**: 那把锁是正在跑的那个操作的, 删掉它等于让两个操作
+            // 并发跑 (R1)。只回报结果, 让调用方照常收到消息。
+            reportUndo(player, 0, interrupted = false, onDone)
             return
         }
         // 第一次取记录要读文件, 丢到异步线程; 之后每一步由链自己挑线程
-        submitAsync { undoStep(player, times, 0, onDone) }
+        submitAsync { undoStep(player, token, times, 0, onDone) }
     }
 
-    private fun undoStep(player: Player, times: Int, done: Int, onDone: (done: Int, timedOut: Boolean) -> Unit) {
+    private fun undoStep(
+        player: Player,
+        token: EditToken,
+        times: Int,
+        done: Int,
+        onDone: (done: Int, interrupted: Boolean) -> Unit
+    ) {
         if (done >= times) {
-            finishUndo(player, done, timedOut = false, onDone)
+            finishUndo(player, token, done, interrupted = false, onDone)
             return
         }
         // poll 要读撤销记录文件, 这一步在异步线程上跑
-        val record = UndoManager.poll(player) ?: return finishUndo(player, done, timedOut = false, onDone)
+        val polled = UndoManager.poll(player)
+        if (polled !is UndoPoll.Record) {
+            if (polled is UndoPoll.Failed) {
+                // 记录读不出来: 文件**没被删掉** (poll 只在成功读到后才删), 报"被中断"而不是
+                // "没有可撤销的操作" —— 后者会让玩家以为记录丢了 (R3)
+                warning("[PlayerWorldEdit] 撤销记录读取失败 (${player.name}): ${polled.cause}")
+                finishUndo(player, token, done, interrupted = true, onDone)
+            } else {
+                finishUndo(player, token, done, interrupted = false, onDone)
+            }
+            return
+        }
+        val record = polled.record
         val bukkitWorld = Bukkit.getWorld(record.worldName)
         if (bukkitWorld == null) {
             // 世界未加载: 把记录放回去并**中止整轮** —— 跳过后面的记录只会让撤销顺序错乱
             UndoManager.push(player, record, pipeline.undoLimit())
-            return finishUndo(player, done, timedOut = false, onDone)
+            finishUndo(player, token, done, interrupted = true, onDone)
+            return
         }
         EditBudget.configure(pipeline.blocksPerTick())
         val actor = pipeline.actorOf(player)
@@ -256,39 +310,43 @@ class WorldEditManager {
                 work = { index, slice ->
                     WorldEditTool.restoreBlocks(bukkitWorld, slice, record.batches[index].states, actor)
                 },
-                done = { timedOut ->
+                done = { result ->
                     // 同样不能只依赖 runOnOwnThread: 玩家中途退出时这里不执行的话,
                     // 这一条的返还就丢了, 而且整条撤销链会断在半路
                     pipeline.onPlayerThread(player) {
-                        if (timedOut) {
-                            // 超时: 这条记录只还原了一部分, 不能按"已撤销"退还材料 (那等于白送),
-                            // 也不能就这么丢掉 (剩下的区块就再也撤不回去了)。还原到快照是幂等的,
-                            // 所以把记录放回队列, 让玩家再 undo 一次 —— 已还原的区块重做一遍没有副作用。
-                            // 写盘是同步 IO, 丢到异步线程做。
-                            warning("[PlayerWorldEdit] 撤销超时 (${player.name}), 本条记录已放回队列, 可重试")
+                        if (result.timedOut || !result.isAllComplete()) {
+                            // 没还原完 (超时 / 某批抛异常 / 区块加载失败): 不能按"已撤销"退料 (那等于
+                            // 白送), 也不能丢掉记录 (剩下的区块就再也撤不回去了)。还原是幂等的, 所以
+                            // 放回队列让玩家再 undo 一次。写盘是同步 IO, 丢到异步线程做。
+                            warning(
+                                "[PlayerWorldEdit] 撤销未完成 (${player.name}): 超时=${result.timedOut} " +
+                                    "失败区块=${result.failed}, 本条记录已放回队列, 可重试"
+                            )
                             submitAsync {
                                 UndoManager.push(player, record, pipeline.undoLimit())
-                                // 告诉调用方这轮是被超时截断的: 记录已经放回去, 不是"没有可撤销的"
-                                finishUndo(player, done, timedOut = true, onDone)
+                                finishUndo(player, token, done, interrupted = true, onDone)
                             }
                         } else {
-                            // 返还先落库, 再取吓一条: 两条的返还都是同一份材料包的读改写, 不能并发。
+                            // 返还先落库, 再取下一条: 两条的返还都是同一份材料包的读改写, 不能并发。
                             // 一次操作可能扣了多种材料 (扩展), 所以按逐材料账逐项加回
                             record.refundableCharges().forEach { (material, count) ->
                                 pipeline.chargeMaterial(player, material, -count)
                             }
-                            // 回到异步线程取吓一条 (那里才能读文件)
-                            submitAsync { undoStep(player, times, done + 1, onDone) }
+                            // 回到异步线程取下一条 (那里才能读文件)
+                            submitAsync { undoStep(player, token, times, done + 1, onDone) }
                         }
                     }
                 }
             )
         }.onFailure {
-            // 排队阶段就炸了: 这条当作没撤成, 结束整轮
-            warning("[PlayerWorldEdit] 撤销失败: $it")
+            // 排队阶段就炸了: 记录已经取出来了, **必须放回去** —— 原来直接收尾会让这条记录凭空
+            // 消失 (既没还原也没法再撤) (R3)
+            warning("[PlayerWorldEdit] 撤销排队失败: $it")
+            runCatching { UndoManager.push(player, record, pipeline.undoLimit()) }
+                .onFailure { pushError -> warning("[PlayerWorldEdit] 撤销记录放回失败: $pushError") }
         }.isSuccess
         if (!started) {
-            finishUndo(player, done, timedOut = false, onDone)
+            finishUndo(player, token, done, interrupted = true, onDone)
         }
     }
 
@@ -299,15 +357,35 @@ class WorldEditManager {
      * 碰玩家会抛线程归属异常。玩家已经下线时没有玩家线程可回, 只能就地回调 —— 调用方那句
      * 消息发给离线玩家本来就是空操作。
      */
-    private fun finishUndo(player: Player, done: Int, timedOut: Boolean, onDone: (done: Int, timedOut: Boolean) -> Unit) {
-        pipeline.endEdit(player)
+    private fun finishUndo(
+        player: Player,
+        token: EditToken,
+        done: Int,
+        interrupted: Boolean,
+        onDone: (done: Int, interrupted: Boolean) -> Unit
+    ) {
+        pipeline.endEdit(player, token)
+        reportUndo(player, done, interrupted, onDone)
+    }
+
+    /**
+     * 只回报结果、**不碰锁** —— 没拿到锁的那条路径用它
+     *
+     * 拿到锁的路径一律走 [finishUndo] (释放 + 回报)。
+     */
+    private fun reportUndo(
+        player: Player,
+        done: Int,
+        interrupted: Boolean,
+        onDone: (done: Int, interrupted: Boolean) -> Unit
+    ) {
         if (!player.isOnline) {
-            onDone(done, timedOut)
+            onDone(done, interrupted)
             return
         }
         // runOnOwnThread 自身失败 (实体已退役等) 时也不能让调用方永远等不到结果
-        if (runCatching { player.runOnOwnThread { onDone(done, timedOut) } }.isFailure) {
-            onDone(done, timedOut)
+        if (runCatching { player.runOnOwnThread { onDone(done, interrupted) } }.isFailure) {
+            onDone(done, interrupted)
         }
     }
 

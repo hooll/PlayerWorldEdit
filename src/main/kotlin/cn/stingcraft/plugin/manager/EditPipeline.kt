@@ -6,6 +6,7 @@ import cn.stingcraft.plugin.api.event.WorldEditOperationCompleteEvent
 import cn.stingcraft.plugin.api.event.WorldEditOperationEvent
 import cn.stingcraft.plugin.hook.ProtectionCheck
 import cn.stingcraft.plugin.hook.ProtectionHooks
+import cn.stingcraft.plugin.util.ChunkBatchResult
 import cn.stingcraft.plugin.util.EditBudget
 import cn.stingcraft.plugin.util.RegionSlice
 import cn.stingcraft.plugin.util.WorldEditTool
@@ -21,11 +22,13 @@ import com.sk89q.worldedit.world.block.BlockTypes
 import org.bukkit.Bukkit
 import org.bukkit.Location
 import org.bukkit.Material
+import org.bukkit.World
 import org.bukkit.entity.Player
 import taboolib.common.platform.function.pluginId
 import taboolib.platform.util.sendLang
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReferenceArray
 
 /** WorldEdit 的方块类型 → Bukkit 的 Material (材质包按 Material 记账) */
@@ -51,6 +54,45 @@ internal fun countMaterials(states: Array<BlockState?>): Map<Material, Int> {
 }
 
 /**
+ * 单个区块的写入成本: **一个方块都没写成**就返回空表
+ *
+ * 空表与"写了 0 个"在结算里含义不同: [EditPipeline.finishEdit] 用"有没有成本"判断这个区块算不算
+ * 写成了 —— 一个方块都没写进去的区块不该进撤销记录, 也不该出现在完成事件的统计里 (R2)。
+ */
+internal fun costOf(material: Material, count: Int): Map<Material, Int> =
+    if (count <= 0) emptyMap() else mapOf(material to count)
+
+/**
+ * 把"跑到哪了"翻译成撤销批次: 每个区块按**切片**记账, 只收完整读到的那些切片
+ *
+ * 为什么按切片而不是整块: 快照是"读一片、写一片"填出来的, 一个区块写失败时它后面那些切片根本没读
+ * (states 里是 null)。整块记的话这条记录就含 null, 而还原是**按下标顺序**写回的, 长度对不上就会
+ * 错位。所以只收"读完整了"的切片; 失败区块里正在写的那一片也收进来 —— 它读完了, 可能已经写进去
+ * 一半, 还原它正好把这半截撤掉 (R2 的"已写部分必须可撤销")。
+ *
+ * 每片的 [UndoBatch.region] 都是原来那个区块里的一片 (X/Z 范围不变), 所以仍然落在同一个区块里 ——
+ * 撤销按区块排任务的前提不能破 (见 [runOnChunkThreads])。
+ *
+ * 放顶层是因为它不依赖任何实例状态 (只有 [ChunkBatchResult] 与快照数组), 这样可以脱离服务端直接测。
+ */
+internal fun undoBatchesFor(result: ChunkBatchResult, snapshots: List<Array<BlockState?>?>): List<UndoBatch> {
+    val batches = ArrayList<UndoBatch>()
+    for (index in snapshots.indices) {
+        val states = snapshots[index] ?: continue
+        val layout = result.slices.getOrNull(index) ?: continue
+        for (sliceIndex in 0 until result.reachedSlices(index)) {
+            val slice = layout[sliceIndex]
+            val end = minOf(slice.offset + slice.size, states.size)
+            val sliceStates = states.copyOfRange(slice.offset, end)
+            // 这一片没读完 (读的时候抛了异常): 后面的更不可能读完, 直接收工
+            if (sliceStates.any { it == null }) break
+            batches += UndoBatch(slice.region, sliceStates.map { it!! })
+        }
+    }
+    return batches
+}
+
+/**
  * 方块类型是不是空气
  *
  * WorldEdit 的 BlockType 没有 isAir(), 这里显式列出三种空气 —— 口径与 Bukkit 的
@@ -58,6 +100,73 @@ internal fun countMaterials(states: Array<BlockState?>): Map<Material, Int> {
  */
 internal fun BlockType.isAir(): Boolean =
     this == BlockTypes.AIR || this == BlockTypes.CAVE_AIR || this == BlockTypes.VOID_AIR
+
+/**
+ * 一次写操作的锁凭证
+ *
+ * 只是"这一次 [EditLocks.acquire] 拿到的号": [EditLocks.release] 要比对凭证才释放, 所以两类错误
+ * 都堵住了 —— 没拿到锁的调用方 (例如 undo 撞上正在跑的大编辑) 不会把**别人的**锁删掉; 旧操作迟到
+ * 的收尾回调也不会把**后来者**的锁删掉 (2026-10-14 的 R1)。
+ */
+class EditToken internal constructor(internal val id: Long) {
+    override fun toString(): String = "EditToken#$id"
+}
+
+/**
+ * 每个玩家一把编辑锁 (凭证式释放)
+ *
+ * 抽成独立的小类而不是直接写在 [EditPipeline] 里, 有两个原因: 它只依赖 UUID, 不碰玩家对象 ——
+ * 所以可以**脱离服务端直接测** (R1 的验收: 未取得锁不得释放锁、旧操作不能清新锁); 而且锁的所有权
+ * 规则只有这一份实现, 不会散在十几个 begin/end 调用点里。
+ *
+ * 没有 `forget(uuid)`: 锁**只能由持有者释放**。玩家退出时不能顺手清 (那个大编辑还在跑, 清了就
+ * 变成两个操作并发写), 由操作自己的收尾释放。
+ */
+class EditLocks {
+
+    private val holders = ConcurrentHashMap<UUID, EditToken>()
+
+    /** 凭证流水号 (只要单调递增就够, 不参与任何业务判断) */
+    private val sequence = AtomicLong()
+
+    /** 拿到锁返回凭证; 这个玩家已经有一把没释放的锁时返回 null (调用方负责提示) */
+    fun acquire(uuid: UUID): EditToken? {
+        val token = EditToken(sequence.incrementAndGet())
+        return if (holders.putIfAbsent(uuid, token) == null) token else null
+    }
+
+    /**
+     * 释放锁 —— **只有拿着同一个凭证的那次操作**能释放
+     *
+     * `remove(key, value)` 是"值相等才删"的原子操作: 凭证对不上就什么都不做 (R1)。
+     */
+    fun release(uuid: UUID, token: EditToken) {
+        holders.remove(uuid, token)
+    }
+
+    /** 这个玩家现在拿着的凭证 (没有则 null); 只给诊断/测试用 */
+    fun holder(uuid: UUID): EditToken? = holders[uuid]
+}
+
+/**
+ * 一次写操作的上下文: 启动时固定下来的目标世界 + 这次操作的锁
+ *
+ * 世界必须在这里定死: 领地校验用的是**选点所在世界**, 而写入原来每次都读 `player.world` —— 玩家
+ * 在大编辑中途传送到另一个世界, 校验、调度、写入、撤销就会落在不同的世界上 (2026-10-14 的 R4)。
+ * 之后所有读世界、写方块、排任务、记撤销都用 [world], 玩家中途传送不影响已经在跑的操作。
+ */
+internal class EditOperation(
+    val world: World,
+    internal val token: EditToken
+)
+
+/**
+ * 校验通过的选区: 区域 + 这次操作固定下来的世界
+ *
+ * 两者一起返回是刻意的: 选区几何是"世界无关"的 (CuboidRegion 只有坐标), 光有区域拿不到该往哪个
+ * 世界写 (R4)。
+ */
+internal class ValidatedSelection(val region: CuboidRegion, val world: World)
 
 /**
  * 写操作的共享基础设施: 编辑锁、领地校验、材料扣退、区块写管线与收尾
@@ -71,8 +180,12 @@ internal fun BlockType.isAir(): Boolean =
  */
 class EditPipeline(private val selection: SelectionManager) {
 
-    // 正在执行编辑的玩家, 避免同一玩家并发跑两个选区操作
-    private val editing = ConcurrentHashMap.newKeySet<UUID>()
+    /**
+     * 正在执行编辑的玩家 → 那次操作的锁凭证
+     *
+     * 锁与凭证的规则都在 [EditLocks] 里 (那份逻辑不碰玩家对象, 可以脱离服务端直接测)。
+     */
+    private val locks = EditLocks()
 
     private val settingManager = PlayerWorldEdit.settingManager
 
@@ -84,37 +197,40 @@ class EditPipeline(private val selection: SelectionManager) {
      * 无副作用, 所以只改一部分方块的操作用不着更细的快照。
      *
      * @param charged 这次操作预扣的材料 (整笔), 收尾时按"预扣 - 实际写入"退费
-     * @param costs 收尾时按区块给出"这一块实际写入了多少材料"
+     * @param costs 收尾时按区块给出"这一块**实际**写入了多少材料" —— 必须来自写入的返回值 /
+     *    `onWritten`, 不能用"预计要写多少"顶替 (部分切片失败时两者会分叉, 见 [finishEdit])
      * @param writeSlice 在区块线程上执行, 参数是该区块的快照数组与这一片
      */
     internal fun writeChunks(
         player: Player,
+        operation: EditOperation,
         regions: List<CuboidRegion>,
         successKey: String,
         charged: Map<Material, Int>,
         costs: () -> List<Map<Material, Int>>,
-        operation: OperationType,
+        type: OperationType,
         writeSlice: (index: Int, slice: RegionSlice, states: Array<BlockState?>) -> Unit
     ) {
         val snapshots = AtomicReferenceArray<Array<BlockState?>?>(regions.size)
-        runOnChunkThreads(regions, player.world,
+        runOnChunkThreads(regions, operation.world,
             work = { index, slice ->
                 val chunk = regions[index]
                 val states = snapshots.get(index)
                     ?: arrayOfNulls<BlockState>(chunk.volume.toInt()).also { snapshots.set(index, it) }
-                WorldEditTool.readBlocksInto(player.world, slice.region, states, slice.offset)
+                WorldEditTool.readBlocksInto(operation.world, slice.region, states, slice.offset)
                 writeSlice(index, slice, states)
             },
-            done = { _ ->
+            done = { result ->
                 onPlayerThread(player) {
                     finishEdit(
                         player,
-                        regions,
+                        operation,
+                        result,
                         regions.indices.map { snapshots[it] },
                         charged,
                         costs(),
                         successKey,
-                        operation
+                        type
                     )
                 }
             })
@@ -164,35 +280,45 @@ class EditPipeline(private val selection: SelectionManager) {
     }
 
     /**
-     * 编辑收尾 (走 [onPlayerThread]): 记录撤销、退还失败部分的材料、发完成事件并提示
+     * 编辑收尾 (走 [onPlayerThread]): 记录撤销、退还没写成的材料、发完成事件并提示
      *
-     * @param snapshots 与 regions 一一对应, null 或含 null 表示该区块没跑完
-     * @param charged 这次操作**预扣**的材料 (整笔; 填充/替换/形状是整块预扣, 扩展是按源层算出的整笔)
-     * @param costs 与 regions 一一对应, 表示该区块**实际写入**的材料数量
-     * @param operation 完成事件里报的操作类型 (与 [fireOperation] 用的是同一个值)
+     * 结算口径只有一条: **实际写进世界的量** ([ChunkBatchResult] + [costs])。原来是"快照读完了
+     * 就算写成功", 于是快照完整但写入抛异常时会全额扣费、还留一条其实没生效的撤销记录 (2026-10-14
+     * 的 R2)。现在:
+     * - 退费 = 预扣 - 实际写入 (部分区块只算它写成的那些);
+     * - 撤销只记**真的动过**的区块, 而且按切片粒度记 —— 写了一半的区块也能还原它写完的那部分;
+     * - 完成事件、成功提示与撤销记录里的费用表全部用同一个 `actual`, 不会一个说 N 一个说 M。
+     *
+     * @param result 这一批区块的读写结果 (哪些区块跑完了 / 哪些抛了异常 / 超时)
+     * @param snapshots 与写入时的区块一一对应, null 或含 null 表示该区块/该切片没读完
+     * @param charged 这次操作**预扣**的材料 (整笔)
+     * @param costs 与写入时的区块一一对应, 表示该区块**实际**写入的材料数量
+     * @param type 完成事件里报的操作类型 (与 [beginOperation] 用的是同一个值)
      */
     internal fun finishEdit(
         player: Player,
-        regions: List<CuboidRegion>,
+        operation: EditOperation,
+        result: ChunkBatchResult,
         snapshots: List<Array<BlockState?>?>,
         charged: Map<Material, Int>,
         costs: List<Map<Material, Int>>,
         successKey: String,
-        operation: OperationType
+        type: OperationType
     ) {
-        endEdit(player)
-        val succeeded = regions.indices.filter { isComplete(snapshots[it]) }
-        // 真正写进世界的账 = 跑成功那些区块的成本之和; 没跑完的区块按"没写成"处理
+        // 只释放自己那把锁: 没拿到锁的调用方 / 旧操作的迟到回调都不许动别人的锁 (R1)
+        endEdit(player, operation.token)
+        // 真正写进世界的账 = 每个区块实际写入量之和 (部分跑完的区块只贡献它写成的那些)
         val actual = LinkedHashMap<Material, Int>()
-        succeeded.forEach { index ->
-            costs[index].forEach { (material, count) -> actual.merge(material, count, Int::plus) }
-        }
+        costs.forEach { cost -> cost.forEach { (material, count) -> actual.merge(material, count, Int::plus) } }
         // 退费 = 预扣 - 实际写入。只退预扣过的材料: 收缩清空气没有预扣 (charged 为空), 也就没有退费。
         charged.forEach { (material, count) ->
             val used = actual[material] ?: 0
             if (count > used) chargeMaterial(player, material, -(count - used))
         }
-        if (succeeded.isEmpty()) {
+        // 可撤销的部分 = 至少跑完一片的区块, 按切片记账 (写了一半的区块还原它写完的那几片)
+        val batches = undoBatches(result, snapshots)
+        if (batches.isEmpty()) {
+            // 一片都没写成 (区块加载失败 / 第一片就抛异常): 没有可撤的东西, 材料已按上面退清
             player.sendLang("message-edit-failed", pluginId to "pluginId")
             return
         }
@@ -204,8 +330,8 @@ class EditPipeline(private val selection: SelectionManager) {
             UndoManager.pushAsync(
                 player,
                 UndoRecord(
-                    player.world.name,
-                    succeeded.map { UndoBatch(regions[it], snapshots[it]!!.filterNotNull()) },
+                    operation.world.name,
+                    batches,
                     single?.key ?: Material.AIR,
                     single?.value ?: 0,
                     if (single == null) actual.map { it.key to it.value } else emptyList()
@@ -213,29 +339,39 @@ class EditPipeline(private val selection: SelectionManager) {
                 undoLimit()
             )
         }
-        // 完成事件: 整个流程里只在这里发一次 (上面"没有区块成功"已经 return, 所以失败不发)。
-        // 报的是**实际写入**的统计而不是预扣量 —— 部分区块跑失败时与退费口径一致。
+        // 完成事件: 整个流程里只在这里发一次 (上面"一片都没写成"已经 return, 所以失败不发)。
+        // 报的是**实际写入**的统计而不是预扣量 —— 与退费、撤销记录同一口径。
         Bukkit.getPluginManager().callEvent(
-            WorldEditOperationCompleteEvent(player, operation, actual.values.sum(), actual)
+            WorldEditOperationCompleteEvent(player, type, actual.values.sum(), actual)
         )
-        // 只要有一个区块没跑完就算失败: 收缩这类不产生退费的操作, 只看退费会把它误报成成功。
+        // 有区块没跑完就算失败: 收缩这类不产生退费的操作, 只看退费会把它误报成成功。
         // {amount} 给扩展 / 收缩报"实际写入 / 清掉的方块数"; 其它操作的提示里没这个占位符, 忽略即可。
-        if (succeeded.size < regions.size) {
-            player.sendLang("message-edit-failed", pluginId to "pluginId")
-        } else {
+        if (result.isAllComplete()) {
             player.sendLang(successKey, pluginId to "pluginId", actual.values.sum() to "amount")
+        } else {
+            player.sendLang("message-edit-failed", pluginId to "pluginId")
         }
     }
 
     /**
-     * 选区校验: 区域必须完整, 且没有领地拦截
+     * 把"跑到哪了"翻译成撤销批次 —— 实现见顶层函数 [undoBatchesFor] (不依赖任何实例状态, 便于直接测)
      */
-    internal fun validatedRegion(player: Player, needBreak: Boolean): CuboidRegion? {
+    internal fun undoBatches(result: ChunkBatchResult, snapshots: List<Array<BlockState?>?>): List<UndoBatch> =
+        undoBatchesFor(result, snapshots)
+
+    /**
+     * 选区校验: 区域必须完整、两点与玩家同世界, 且没有领地拦截
+     *
+     * 返回的 [ValidatedSelection.world] 就是这次操作固定下来的世界 (见 [EditOperation])。
+     */
+    internal fun validatedSelection(player: Player, needBreak: Boolean): ValidatedSelection? {
+        // 世界先校验: 两点跨世界、或者玩家已经不在选区那个世界, 都不能往下走 (R4)
+        val world = selection.selectionWorld(player) ?: return null
         val region = selection.selectionRegion(player) ?: return null
         val pos1 = selection.getPlayerPos1(player) ?: return null
         val pos2 = selection.getPlayerPos2(player) ?: return null
         if (!checkProtection(player, pos1, pos2, needBreak)) return null
-        return region
+        return ValidatedSelection(region, world)
     }
 
     /**
@@ -270,21 +406,45 @@ class EditPipeline(private val selection: SelectionManager) {
     }
 
     /**
-     * 标记玩家开始编辑; 已经在跑别的选区操作就拒绝
+     * 标记玩家开始编辑, 返回这次操作的锁凭证; 已经在跑别的选区操作就拒绝 (返回 null)
      *
      * 大选区现在会跨很多个 tick 才做完, 玩家容易以为没生效而重复点, 两个操作叠在一起
      * 会重复扣材料、撤销记录也会错位。
      */
-    internal fun beginEdit(player: Player): Boolean {
-        if (!editing.add(player.uniqueId)) {
+    internal fun beginEdit(player: Player): EditToken? {
+        val token = locks.acquire(player.uniqueId)
+        if (token == null) {
             player.sendLang("message-edit-busy", pluginId to "pluginId")
-            return false
         }
-        return true
+        return token
     }
 
-    internal fun endEdit(player: Player) {
-        editing.remove(player.uniqueId)
+    /**
+     * 释放编辑锁 —— **只有拿着凭证的那次操作**能释放 (规则见 [EditLocks.release])
+     */
+    internal fun endEdit(player: Player, token: EditToken) {
+        locks.release(player.uniqueId, token)
+    }
+
+    /**
+     * 写操作的统一开头: 拿锁 → 触发操作前事件 (被取消就把锁还回去)
+     *
+     * 事件必须在**拿到锁之后**发: 监听器如果在前置事件里同步调同一个玩家的写 API, 原来会直接绕开
+     * 编辑锁重入 (事件发生在 [beginEdit] 之前), 递归下去就是无限嵌套 (2026-10-14 的 R9)。现在重入
+     * 会拿到"你正在编辑"而被拒; 取消时零写入零扣料零撤销, 并且把自己的锁释放掉, 不占着。
+     */
+    internal fun beginOperation(
+        player: Player,
+        type: OperationType,
+        box: CuboidRegion,
+        world: World
+    ): EditOperation? {
+        val token = beginEdit(player) ?: return null
+        if (!fireOperation(player, type, box, world)) {
+            endEdit(player, token)
+            return null
+        }
+        return EditOperation(world, token)
     }
 
     /**
@@ -301,21 +461,17 @@ class EditPipeline(private val selection: SelectionManager) {
      * 操作前的统一触发点: 返回 false = 被监听方取消, 调用方直接 return (零写入、零扣料、不记撤销)
      *
      * 事件对象只在这里构造一次, 各操作各调一行 —— 字段与取消语义只有一份实现, 不在每个方法里
-     * 各写一遍 callEvent。调用点都在领地校验之后、[beginEdit] 之前, 所以被取消时玩家不会先看到
-     * 一条"没有权限", 也不会占住编辑锁。
+     * 各写一遍 callEvent。事件里的两个角点用**这次操作固定下来的世界** ([world]), 不是玩家当前
+     * 所在的世界: 否则监听器拿到的坐标和真正会改的世界对不上 (R4)。
      */
-    internal fun fireOperation(player: Player, operation: OperationType, box: CuboidRegion): Boolean {
+    internal fun fireOperation(player: Player, type: OperationType, box: CuboidRegion, world: World): Boolean {
         val min = box.minimumPoint
         val max = box.maximumPoint
-        val corners = locationOf(player, intArrayOf(min.x(), min.y(), min.z())) to
-            locationOf(player, intArrayOf(max.x(), max.y(), max.z()))
-        val event = WorldEditOperationEvent(player, operation, corners)
+        val corners = locationOf(world, intArrayOf(min.x(), min.y(), min.z())) to
+            locationOf(world, intArrayOf(max.x(), max.y(), max.z()))
+        val event = WorldEditOperationEvent(player, type, corners)
         Bukkit.getPluginManager().callEvent(event)
         return !event.isCancelled
-    }
-
-    internal fun isComplete(states: Array<BlockState?>?): Boolean {
-        return states != null && states.none { it == null }
     }
 
     /**

@@ -25,10 +25,11 @@ object CommandUndo {
 
     private fun undo(player: Player, times: Int) {
         // undo 改成严格串行后不再同步返回条数: 一条完全结束才轮到下一条, 结果用回调给回来
-        PlayerWorldEdit.worldEditManager.undo(player, times.coerceIn(1, 10)) { done, timedOut ->
+        PlayerWorldEdit.worldEditManager.undo(player, times.coerceIn(1, 10)) { done, interrupted ->
             when {
-                // 超时不等于"没有可撤销的": 那条记录已经放回队列, 玩家可以重试
-                timedOut -> player.sendLang("message-undo-timeout", pluginId to "pluginId", done to "times")
+                // 中断不等于"没有可撤销的": 那条记录已经放回队列 (超时 / 还原失败 / 记录读不出来),
+                // 玩家可以再试一次
+                interrupted -> player.sendLang("message-undo-timeout", pluginId to "pluginId", done to "times")
                 done <= 0 -> player.sendLang("message-undo-none", pluginId to "pluginId")
                 else -> player.sendLang("message-undo-susses", pluginId to "pluginId", done to "times")
             }
