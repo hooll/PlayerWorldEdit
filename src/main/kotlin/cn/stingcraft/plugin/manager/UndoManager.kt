@@ -13,9 +13,10 @@ import com.sk89q.worldedit.world.block.BlockTypes
 import org.bukkit.Material
 import org.bukkit.entity.Player
 import taboolib.common.platform.function.getDataFolder
-import taboolib.common.platform.function.submitAsync
+import cn.stingcraft.plugin.util.submitCompletion
 import taboolib.common.platform.function.warning
 import taboolib.expansion.getAutoDataContainer
+import taboolib.expansion.releaseAutoDataContainer
 import java.io.File
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -112,7 +113,7 @@ object UndoManager {
     fun pushAsync(player: Player, record: UndoRecord, limit: Int) {
         val uuid = player.uniqueId
         val queued = enqueue(uuid, record, limit)
-        submitAsync {
+        submitCompletion {
             runCatching { writeToDisk(uuid, queued, limit) }.onFailure {
                 warning("[PlayerWorldEdit] 写入撤销记录失败: $it")
             }
@@ -312,29 +313,33 @@ object UndoManager {
         if (!migrated.add(uuid)) {
             return
         }
-        runCatching {
-            val container = uuid.getAutoDataContainer()
-            val raw = container[LEGACY_KEY] ?: return@runCatching
-            if (raw.isEmpty()) {
-                return@runCatching
-            }
-            val type = object : TypeToken<List<StoredUndoRecord>>() {}.type
-            val legacy: List<StoredUndoRecord> = PlayerWorldEdit.gson.fromJson(raw, type)
-            if (legacy.isEmpty()) {
-                return@runCatching
-            }
-            val dir = dirOf(uuid).apply { mkdirs() }
-            legacy.forEach { stored ->
-                runCatching {
-                    val file = File(dir, nextFileName())
-                    GZIPOutputStream(file.outputStream()).bufferedWriter(Charsets.UTF_8).use { writer ->
-                        PlayerWorldEdit.gson.toJson(stored, writer)
+        try {
+            runCatching {
+                val container = uuid.getAutoDataContainer()
+                val raw = container[LEGACY_KEY] ?: return@runCatching
+                if (raw.isEmpty()) {
+                    return@runCatching
+                }
+                val type = object : TypeToken<List<StoredUndoRecord>>() {}.type
+                val legacy: List<StoredUndoRecord> = PlayerWorldEdit.gson.fromJson(raw, type)
+                if (legacy.isEmpty()) {
+                    return@runCatching
+                }
+                val dir = dirOf(uuid).apply { mkdirs() }
+                legacy.forEach { stored ->
+                    runCatching {
+                        val file = File(dir, nextFileName())
+                        GZIPOutputStream(file.outputStream()).bufferedWriter(Charsets.UTF_8).use { writer ->
+                            PlayerWorldEdit.gson.toJson(stored, writer)
+                        }
                     }
                 }
+                container[LEGACY_KEY] = ""
+            }.onFailure {
+                warning("[PlayerWorldEdit] 迁移旧撤销记录失败: $it")
             }
-            container[LEGACY_KEY] = ""
-        }.onFailure {
-            warning("[PlayerWorldEdit] 迁移旧撤销记录失败: $it")
+        } finally {
+            uuid.releaseAutoDataContainer()
         }
     }
 

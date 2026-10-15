@@ -28,7 +28,7 @@ class RegionSlice(val region: CuboidRegion, val offset: Int, val size: Int)
  * 截断"都会被调用方当成跑完了 —— 快照读完了就当写成功、撤销只还原了一半照样退料并删记录
  * (2026-10-14 的 R2 / R3)。现在把每个区块的进度与失败一起带出来, 调用方按"实际写到哪"结账。
  *
- * @param timedOut 是不是超时兜底收的尾 (还有区块没跑完)
+ * @param timedOut 是否因无进展或停用而中断 (所有在途写者退出后才发布)
  * @param failed 抛过异常 / 区块加载失败的区块下标 (这些区块只跑完了一部分)
  * @param slices 与 regions 一一对应的切片布局 (撤销按切片粒度记账要用, 见 [EditPipeline.undoBatches])
  * @param completed 与 regions 一一对应: 每个区块**完整跑完**的切片数
@@ -125,8 +125,8 @@ fun CuboidRegion.sliceByY(maxBlocks: Int): List<RegionSlice> {
  *
  * 线程可见性: 每个区块的切片由同一条区域线程串行执行, 所以 [ChunkBatchResult.completed] 的每个
  * 下标只有一个写者; 收尾线程是通过 `remaining` 的 CAS / `notified` 的 CAS 拿到结果的, 之前的写入
- * 经由这两条原子操作建立 happens-before。看门狗线程那条路径 (超时) 只读一个快照值, 结论由
- * `timedOut` 主导, 调用方本来就按"失败"处理。
+ * 经由原子操作与 BatchDrain 门闩建立 happens-before。超时/停用关闭入口,
+ * 等待所有在途切片的 finally 汇报后才复制结果, 不在写者仍在运行时冻结统计。
  */
 fun runOnChunkThreads(
     regions: List<CuboidRegion>,
@@ -145,12 +145,11 @@ fun runOnChunkThreads(
     val waves = regions.indices.chunked(minOf(regions.size, CHUNK_LOAD_WAVE))
     var waveIndex = 0
     val notified = AtomicBoolean(false)
-    // 超时收尾之后不再往区域线程排新切片: 这一批已经按"失败"结账, 再写下去既不会有撤销记录
-    // 也不会退费, 那些改动就成了无主的
     val aborted = AtomicBoolean(false)
     // 每完成一片就刷新它; 计时器只盯"多久没有进展", 不盯"总共跑了多久"
     val lastProgress = AtomicLong(System.currentTimeMillis())
     var watchdog: PlatformExecutor.PlatformTask? = null
+    lateinit var drain: BatchDrain
 
     fun complete(timedOut: Boolean) {
         if (!notified.compareAndSet(false, true)) {
@@ -161,16 +160,36 @@ fun runOnChunkThreads(
         }
         watchdog?.let {
             watchdogs.remove(it)
-            it.cancel()
+            runCatching { it.cancel() }
         }
-        done(ChunkBatchResult(timedOut, failed.toSet(), slices, completed.copyOf()))
+        try {
+            done(ChunkBatchResult(timedOut, failed.toSet(), slices, completed.copyOf()))
+        } finally {
+            EditLifecycle.finished(drain)
+        }
     }
 
-    // 真的写完一片才算"有进展": 失败的切片会直接 finish, 不该刷新计时
-    val trackedWork: (Int, RegionSlice) -> Unit = { index, slice ->
-        work(index, slice)
-        completed[index]++
-        lastProgress.set(System.currentTimeMillis())
+    // enter 与 stop 在同一个门闩内串行化, 防止停机看到 0 后又有写者进入。
+    drain = BatchDrain { interrupted ->
+        if (interrupted) aborted.set(true)
+        complete(interrupted)
+    }
+    if (!EditLifecycle.register(drain)) {
+        drain.stop()
+        return
+    }
+    val trackedWork: (Int, RegionSlice) -> Unit = tracked@{ index, slice ->
+        if (!drain.enter()) return@tracked
+        try {
+            work(index, slice)
+            completed[index]++
+            lastProgress.set(System.currentTimeMillis())
+        } catch (error: Throwable) {
+            failed.add(index)
+            throw error
+        } finally {
+            drain.leave()
+        }
     }
 
     fun nextWave() {
@@ -179,7 +198,7 @@ fun runOnChunkThreads(
             return
         }
         if (waveIndex >= waves.size) {
-            complete(false)
+            drain.finish()
             return
         }
         val wave = waves[waveIndex++]
@@ -192,13 +211,19 @@ fun runOnChunkThreads(
     }
 
     // 兜底: 区块加载卡死、区域调度器把任务静默丢掉……任何原因导致 done 迟迟不来时, 只要
-    // [STALL_TIMEOUT_MILLIS] 内一片都没完成就强制收尾。盯"无进展"而不是"总时长"是因为插件不限制
+    // [STALL_TIMEOUT_MILLIS] 内一片都没完成就停止接单, 等在途切片退出后收尾。盯"无进展"是因为插件不限制
     // 操作大小, 一个超大选区正常跑也可能超过 30 秒, 按总时长收尾会把正常的大操作误判成失败。
-    watchdog = submitTask(now = false, async = false, delay = WATCHDOG_INTERVAL_TICKS, period = WATCHDOG_INTERVAL_TICKS) {
-        if (System.currentTimeMillis() - lastProgress.get() > STALL_TIMEOUT_MILLIS) {
-            complete(true)
-        }
-    }.also { watchdogs.add(it) }
+    try {
+        watchdog = submitTask(now = false, async = false, delay = WATCHDOG_INTERVAL_TICKS, period = WATCHDOG_INTERVAL_TICKS) {
+            if (System.currentTimeMillis() - lastProgress.get() > STALL_TIMEOUT_MILLIS) {
+                aborted.set(true)
+                drain.stop()
+            }
+        }.also { watchdogs.add(it) }
+    } catch (error: Throwable) {
+        drain.stop()
+        return
+    }
 
     nextWave()
 }
@@ -220,14 +245,14 @@ private class ChunkTask(
     private val chunkX = region.minimumPoint.x shr 4
     private val chunkZ = region.minimumPoint.z shr 4
     private var position = 0
-    private var finished = false
+    private val finished = AtomicBoolean(false)
 
     fun start() {
         schedule(0)
     }
 
     private fun runCurrent() {
-        if (finished) return
+        if (finished.get()) return
         // 整批已经超时收尾: 再写方块就是没人记录的改动, 直接停下
         if (aborted.get()) {
             finish()
@@ -272,7 +297,20 @@ private class ChunkTask(
     private fun schedule(delayTicks: Long) {
         // 区块加载不出来也要标成失败: 否则这个区块"一片没跑"却和其他区块一样算跑完, 调用方会把
         // 没写成的区块当成写成功 (材料不退、撤销记录里还留着它)
-        loadChunkThen(world, chunkX, chunkZ, { dispatch(delayTicks) }, { failed.add(index); finish() })
+        if (aborted.get()) { finish(); return }
+        try {
+            loadChunkThen(world, chunkX, chunkZ, {
+                try {
+                    if (aborted.get()) finish() else dispatch(delayTicks)
+                } catch (error: Throwable) {
+                    failed.add(index)
+                    finish()
+                }
+            }, { failed.add(index); finish() })
+        } catch (error: Throwable) {
+            failed.add(index)
+            finish()
+        }
     }
 
     private fun dispatch(delayTicks: Long) {
@@ -284,8 +322,7 @@ private class ChunkTask(
     }
 
     private fun finish() {
-        if (!finished) {
-            finished = true
+        if (finished.compareAndSet(false, true)) {
             complete.run()
         }
     }
@@ -367,4 +404,48 @@ private val watchdogs = ConcurrentHashMap.newKeySet<PlatformExecutor.PlatformTas
 fun cancelWatchdogs() {
     watchdogs.forEach { it.cancel() }
     watchdogs.clear()
+}
+
+/**
+ * 一批任务的在途门闩。停止仅关闭入口; 最后一位写者汇报后才发布最终结果。
+ * 回调在锁外执行, 可安全启动下一阶段, 且正常完成与停止竞争只发布一次。
+ */
+internal class BatchDrain(private val done: (Boolean) -> Unit) {
+    private var active = 0
+    private var closed = false
+    private var interrupted = false
+    private var delivered = false
+
+    @Synchronized fun enter(): Boolean {
+        if (closed) return false
+        active++
+        return true
+    }
+
+    fun leave() {
+        val result = synchronized(this) {
+            check(active > 0)
+            active--
+            takeResult()
+        }
+        result?.let(done)
+    }
+
+    fun stop() = request(true)
+    fun finish() = request(false)
+
+    private fun request(interrupt: Boolean) {
+        val result = synchronized(this) {
+            closed = true
+            interrupted = interrupted || interrupt
+            takeResult()
+        }
+        result?.let(done)
+    }
+
+    private fun takeResult(): Boolean? {
+        if (!closed || active != 0 || delivered) return null
+        delivered = true
+        return interrupted
+    }
 }

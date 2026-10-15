@@ -38,14 +38,15 @@ import java.util.Base64
 /** NBT 二进制里的根名 (NBT 二进制格式要求有个根名, 这里只是个占位, 读回时不看它) */
 private const val NBT_ROOT_NAME = "pwe"
 
-/** 方块实体数据 → Base64 文本; 这个方块没有实体数据 (或读不出来) 时返回 null */
+/** 方块实体数据 → Base64 文本; 仅真正没有实体数据时返回 null; 读取/编码失败抛异常 */
 internal fun nbtOf(block: BaseBlock): String? {
-    val tag = runCatching { block.nbtReference?.value }.getOrNull() ?: return null
-    return runCatching {
+    val reference = block.nbtReference ?: return null
+    val tag = checkNotNull(reference.value) { "NBT reference returned null" }
+    return run {
         val bytes = ByteArrayOutputStream()
         NBTOutputStream(bytes).use { it.writeNamedTag(NBT_ROOT_NAME, LinBusConverter.toJnbtTag(tag)) }
         Base64.getEncoder().encodeToString(bytes.toByteArray())
-    }.getOrNull()
+    }
 }
 
 /** Base64 文本 → 方块实体数据 (JNBT 的 CompoundTag, 直接喂给 `BlockStateHolder.toBaseBlock`); 解析失败抛异常 */
@@ -64,5 +65,12 @@ internal fun nbtFrom(raw: String): CompoundTag {
  */
 internal fun canCaptureNbt(block: BaseBlock): Boolean {
     val encoded = nbtOf(block) ?: return true
-    return runCatching { nbtFrom(encoded) }.isSuccess
+    nbtFrom(encoded)
+    return true
+}
+
+/** 强制读取并验证后固定 NBT, 避免稍后的编码/懒读取失败发生在破坏源区之后。 */
+internal fun captureBlock(block: BaseBlock): BaseBlock {
+    val encoded = nbtOf(block) ?: return block
+    return block.toImmutableState().toBaseBlock(nbtFrom(encoded))
 }

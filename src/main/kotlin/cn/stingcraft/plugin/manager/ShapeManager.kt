@@ -4,6 +4,7 @@ import cn.stingcraft.plugin.PlayerWorldEdit
 import cn.stingcraft.plugin.api.event.OperationType
 import cn.stingcraft.plugin.hook.AreaPermission
 import cn.stingcraft.plugin.util.EditBudget
+import cn.stingcraft.plugin.util.captureBlock
 import cn.stingcraft.plugin.util.RegionSlice
 import cn.stingcraft.plugin.util.WorldEditTool
 import cn.stingcraft.plugin.util.displayName
@@ -284,10 +285,9 @@ class ShapeManager(
                     ?: arrayOfNulls<BaseBlock>(chunk.volume.toInt()).also { snapshots.set(index, it) }
                 // 快照照旧读整块: 撤销要把整块还原回去, 没改过的方块还原回去也没有副作用
                 WorldEditTool.readBlocksInto(world, slice.region, states, slice.offset)
-                written.addAndGet(
-                    index,
-                    WorldEditTool.setBlocksIf(world, slice.region, blockType.defaultState.toBaseBlock(), actor, inShape)
-                )
+                WorldEditTool.setBlocksIf(world, slice.region, blockType.defaultState.toBaseBlock(), actor, inShape) {
+                    written.incrementAndGet(index)
+                }
             },
             done = { result ->
                 pipeline.onPlayerThread(player) {
@@ -548,6 +548,7 @@ class ShapeManager(
         }
         // 实际会写下去的那几层 —— 操作前事件报的就是它
         val targetSlab = slabRegion(axis, sourceCoord + if (positive) 1 else -1, targetCoord, writeMin, writeMax)
+        val stamp = selection.selectionStamp(player)
         val edit = pipeline.beginOperation(player, OperationType.EXPAND, targetSlab, world) ?: return
         EditBudget.configure(pipeline.blocksPerTick())
         // 源层沿 [axis] 平移复制, 平面内两个坐标原样对应, 所以把源层压成一维数组存起来最省事
@@ -559,7 +560,7 @@ class ShapeManager(
             work = { _, slice ->
                 val weWorld = BukkitAdapter.adapt(world)
                 for (vector in slice.region) {
-                    source[plane.indexOf(vector.x(), vector.y(), vector.z())] = weWorld.getFullBlock(vector)
+                    source[plane.indexOf(vector.x(), vector.y(), vector.z())] = captureBlock(weWorld.getFullBlock(vector))
                 }
             },
             done = { readResult ->
@@ -584,7 +585,7 @@ class ShapeManager(
                         pipeline.endEdit(player, edit.token)
                         return@onPlayerThread
                     }
-                    selection.updateSelection(player, moved.first, moved.second)
+                    selection.updateSelection(player, world, stamp, moved.first, moved.second)
                     pipeline.prepareEdit(needed.values.sum(), player)
                     val actor = pipeline.actorOf(player)
                     val targetChunks = targetSlab.splitByChunk()
@@ -637,8 +638,9 @@ class ShapeManager(
         val to = if (positive) max[axis] else newCoord - 1
         val clearedLayers = slabRegion(axis, from, to, min, max)
         // 操作前事件必须在**任何状态改动之前**: 下面的 updateSelection 会真的动选区
+        val stamp = selection.selectionStamp(player)
         val edit = pipeline.beginOperation(player, OperationType.CONTRACT, clearedLayers, world) ?: return
-        selection.updateSelection(player, moved.first, moved.second)
+        selection.updateSelection(player, world, stamp, moved.first, moved.second)
         val regions = clearedLayers.splitByChunk()
         // 每个区块被清掉多少非空气方块 —— 同一区块的切片在同一线程上顺序执行, 普通 IntArray 就够
         val cleared = IntArray(regions.size)
@@ -658,12 +660,14 @@ class ShapeManager(
         ) { index, slice, states ->
             // 先写, **写被接受了才算"清掉"**: 被 Folia 区域线程拒掉的切片一个都不记, 否则
             // "报了多少格"与"世界真的清了多少格"又分叉 (R2)
-            val accepted = WorldEditTool.setBlocksIf(world, slice.region, air, actor) { _, _, _ -> true }
-            if (accepted <= 0) return@writeChunks
-            for (position in slice.offset until slice.offset + slice.size) {
-                val state = states[position] ?: continue
-                if (!state.blockType.isAir()) cleared[index]++
-            }
+            var position = slice.offset
+            WorldEditTool.writeBlocks(world, slice.region, actor,
+                stateAt = { _, _, _ ->
+                    val previous = states[position++]
+                    if (previous != null && !previous.blockType.isAir()) air else null
+                },
+                onWritten = { cleared[index]++ }
+            )
         }
     }
 
@@ -721,7 +725,7 @@ class ShapeManager(
             work = { _, slice ->
                 val weWorld = BukkitAdapter.adapt(world)
                 for (vector in slice.region) {
-                    source[index.indexOf(vector.x(), vector.y(), vector.z())] = weWorld.getFullBlock(vector)
+                    source[index.indexOf(vector.x(), vector.y(), vector.z())] = captureBlock(weWorld.getFullBlock(vector))
                 }
             },
             done = { readResult ->

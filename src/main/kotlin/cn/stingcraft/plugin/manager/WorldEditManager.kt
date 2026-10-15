@@ -16,7 +16,8 @@ import org.bukkit.Material
 import org.bukkit.entity.Player
 import org.bukkit.inventory.ItemStack
 import taboolib.common.platform.function.pluginId
-import taboolib.common.platform.function.submitAsync
+import cn.stingcraft.plugin.util.submitCompletion
+import cn.stingcraft.plugin.util.EditLifecycle
 import taboolib.common.platform.function.warning
 import taboolib.platform.util.sendLang
 import java.util.concurrent.atomic.AtomicIntegerArray
@@ -58,9 +59,10 @@ class WorldEditManager {
      * @param player 玩家
      */
     fun clearPlayerPos(player: Player) {
-        selection.forget(player)
-        clipboards.forget(player)
+        runCatching { selection.forget(player) }.onFailure { warning("[PlayerWorldEdit] 清理选区显示失败: $it") }
+        runCatching { clipboards.forget(player) }.onFailure { warning("[PlayerWorldEdit] 清理剪贴板失败: $it") }
         shapes.forgetShapeSize(player)
+        EditLifecycle.retire(player)
     }
 
     /**
@@ -120,7 +122,9 @@ class WorldEditManager {
                 val states = snapshots.get(index)
                     ?: arrayOfNulls<BaseBlock>(chunk.volume.toInt()).also { snapshots.set(index, it) }
                 WorldEditTool.readBlocksInto(world, slice.region, states, slice.offset)
-                written.addAndGet(index, WorldEditTool.setBlocks(world, slice.region, blockType.defaultState.toBaseBlock(), actor))
+                WorldEditTool.setBlocks(world, slice.region, blockType.defaultState.toBaseBlock(), actor) {
+                    written.incrementAndGet(index)
+                }
             },
             done = { result ->
                 pipeline.onPlayerThread(player) {
@@ -201,15 +205,15 @@ class WorldEditManager {
                     val written = AtomicIntegerArray(batchRegions.size)
                     runOnChunkThreads(batchRegions, world,
                         work = { index, slice ->
-                            written.addAndGet(
-                                index,
-                                WorldEditTool.replaceBlocks(
-                                    world,
-                                    slice.region,
-                                    fromType.defaultState.toBaseBlock(),
-                                    toType.defaultState.toBaseBlock(),
-                                    actor
-                                )
+                            val states = batchSnapshots[index]!!
+                            var position = slice.offset
+                            WorldEditTool.writeBlocks(world, slice.region, actor,
+                                stateAt = { _, _, _ ->
+                                    if (states[position++] == fromType.defaultState.toBaseBlock()) {
+                                        toType.defaultState.toBaseBlock()
+                                    } else null
+                                },
+                                onWritten = { written.incrementAndGet(index) }
                             )
                         },
                         done = { writeResult ->
@@ -270,7 +274,7 @@ class WorldEditManager {
             return
         }
         // 第一次取记录要读文件, 丢到异步线程; 之后每一步由链自己挑线程
-        submitAsync { undoStep(player, token, times, 0, onDone) }
+        submitCompletion { undoStep(player, token, times, 0, onDone) }
     }
 
     private fun undoStep(
@@ -280,6 +284,10 @@ class WorldEditManager {
         done: Int,
         onDone: (done: Int, interrupted: Boolean) -> Unit
     ) {
+        if (!EditLifecycle.accepting) {
+            finishUndo(player, token, done, interrupted = true, onDone)
+            return
+        }
         if (done >= times) {
             finishUndo(player, token, done, interrupted = false, onDone)
             return
@@ -325,7 +333,7 @@ class WorldEditManager {
                                 "[PlayerWorldEdit] 撤销未完成 (${player.name}): 超时=${result.timedOut} " +
                                     "失败区块=${result.failed}, 本条记录已放回队列, 可重试"
                             )
-                            submitAsync {
+                            submitCompletion {
                                 UndoManager.push(player, record, pipeline.undoLimit())
                                 finishUndo(player, token, done, interrupted = true, onDone)
                             }
@@ -336,7 +344,7 @@ class WorldEditManager {
                                 pipeline.chargeMaterial(player, material, -count)
                             }
                             // 回到异步线程取下一条 (那里才能读文件)
-                            submitAsync { undoStep(player, token, times, done + 1, onDone) }
+                            submitCompletion { undoStep(player, token, times, done + 1, onDone) }
                         }
                     }
                 }

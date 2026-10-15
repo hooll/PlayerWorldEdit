@@ -9,6 +9,7 @@ import cn.stingcraft.plugin.hook.ProtectionCheck
 import cn.stingcraft.plugin.hook.ProtectionHooks
 import cn.stingcraft.plugin.util.ChunkBatchResult
 import cn.stingcraft.plugin.util.EditBudget
+import cn.stingcraft.plugin.util.EditLifecycle
 import cn.stingcraft.plugin.util.RegionSlice
 import cn.stingcraft.plugin.util.WorldEditTool
 import cn.stingcraft.plugin.util.displayName
@@ -245,6 +246,7 @@ class EditPipeline(private val selection: SelectionManager) {
      * 并不受 [beginEdit] 约束, 玩家可以一边等扩展一边从包里取东西)。
      */
     internal fun consumeAll(player: Player, charges: Map<Material, Int>): Boolean {
+        if (!EditLifecycle.accepting) return false
         val done = ArrayList<Pair<Material, Int>>()
         for ((material, amount) in charges) {
             if (!PlayerWorldEdit.packManager.tryConsume(player, material, amount)) {
@@ -271,13 +273,9 @@ class EditPipeline(private val selection: SelectionManager) {
      * [runOnOwnThread] 自身失败 (实体已退役等) 时同样就地跑, 否则收尾一样会丢。
      */
     internal fun onPlayerThread(player: Player, block: () -> Unit) {
-        if (!player.isOnline) {
-            block()
-            return
-        }
-        if (runCatching { player.runOnOwnThread(block) }.isFailure) {
-            block()
-        }
+        EditLifecycle.dispatch({ task ->
+            if (!player.isOnline || Bukkit.getPlayer(player.uniqueId) !== player) task() else player.runOnOwnThread(task)
+        }, block, player)
     }
 
     /**
@@ -307,50 +305,56 @@ class EditPipeline(private val selection: SelectionManager) {
         type: OperationType
     ) {
         // 只释放自己那把锁: 没拿到锁的调用方 / 旧操作的迟到回调都不许动别人的锁 (R1)
-        endEdit(player, operation.token)
-        // 真正写进世界的账 = 每个区块实际写入量之和 (部分跑完的区块只贡献它写成的那些)
-        val actual = LinkedHashMap<Material, Int>()
-        costs.forEach { cost -> cost.forEach { (material, count) -> actual.merge(material, count, Int::plus) } }
-        // 退费 = 预扣 - 实际写入。只退预扣过的材料: 收缩清空气没有预扣 (charged 为空), 也就没有退费。
-        charged.forEach { (material, count) ->
-            val used = actual[material] ?: 0
-            if (count > used) chargeMaterial(player, material, -(count - used))
-        }
-        // 可撤销的部分 = 至少跑完一片的区块, 按切片记账 (写了一半的区块还原它写完的那几片)
-        val batches = undoBatches(result, snapshots)
-        if (batches.isEmpty()) {
-            // 一片都没写成 (区块加载失败 / 第一片就抛异常): 没有可撤的东西, 材料已按上面退清
-            player.sendLang("message-edit-failed", pluginId to "pluginId")
-            return
-        }
-        // 有实际改动才记撤销: 收缩的层全是空气时 actual 为空, 没有可撤的东西, 别留一条 0 材料的记录。
-        // 只有一种材料就写成 material + amount (旧格式, 文件更小也更好读); 多种材料才写 charges
-        // (扩展会一次扣多种)。
-        if (actual.isNotEmpty()) {
-            val single = actual.entries.singleOrNull()
-            UndoManager.pushAsync(
-                player,
-                UndoRecord(
-                    operation.world.name,
-                    batches,
-                    single?.key ?: Material.AIR,
-                    single?.value ?: 0,
-                    if (single == null) actual.map { it.key to it.value } else emptyList()
-                ),
-                undoLimit()
+        try {
+            // 已接受写入 + 提交结果不明的单格尝试。异常尝试保守计费, 撤销时可退还。
+            val actual = LinkedHashMap<Material, Int>()
+            costs.forEach { cost -> cost.forEach { (material, count) -> actual.merge(material, count, Int::plus) } }
+            // 可撤销的部分 = 至少跑完一片的区块, 按切片记账 (写了一半的区块还原它写完的那几片)
+            val batches = undoBatches(result, snapshots)
+            if (batches.isEmpty()) {
+                charged.forEach { (material, count) -> chargeMaterial(player, material, -count) }
+                if (!EditLifecycle.accepting || !player.isOnline) return
+                // 一片都没写成 (区块加载失败 / 第一片就抛异常): 没有可撤的东西, 材料已按上面退清
+                player.sendLang("message-edit-failed", pluginId to "pluginId")
+                return
+            }
+            // 有实际改动才记撤销: 收缩的层全是空气时 actual 为空, 没有可撤的东西, 别留一条 0 材料的记录。
+            // 只有一种材料就写成 material + amount (旧格式, 文件更小也更好读); 多种材料才写 charges
+            // (扩展会一次扣多种)。
+            if (actual.isNotEmpty()) {
+                val single = actual.entries.singleOrNull()
+                UndoManager.pushAsync(
+                    player,
+                    UndoRecord(
+                        operation.world.name,
+                        batches,
+                        single?.key ?: Material.AIR,
+                        single?.value ?: 0,
+                        if (single == null) actual.map { it.key to it.value } else emptyList()
+                    ),
+                    undoLimit()
+                )
+            }
+            // 退费 = 预扣 - 实际写入。只退预扣过的材料: 收缩清空气没有预扣 (charged 为空), 也就没有退费。
+            charged.forEach { (material, count) ->
+                val used = actual[material] ?: 0
+                if (count > used) chargeMaterial(player, material, -(count - used))
+            }
+            if (!EditLifecycle.accepting || !player.isOnline) return
+            // 完成事件: 整个流程里只在这里发一次 (上面"一片都没写成"已经 return, 所以失败不发)。
+            // 与退费、撤销记录使用同一成本表; 失败时可能包含提交不明的尝试, 不声称精确落地数。
+            Bukkit.getPluginManager().callEvent(
+                WorldEditOperationCompleteEvent(player, type, actual.values.sum(), actual)
             )
-        }
-        // 完成事件: 整个流程里只在这里发一次 (上面"一片都没写成"已经 return, 所以失败不发)。
-        // 报的是**实际写入**的统计而不是预扣量 —— 与退费、撤销记录同一口径。
-        Bukkit.getPluginManager().callEvent(
-            WorldEditOperationCompleteEvent(player, type, actual.values.sum(), actual)
-        )
-        // 有区块没跑完就算失败: 收缩这类不产生退费的操作, 只看退费会把它误报成成功。
-        // {amount} 给扩展 / 收缩报"实际写入 / 清掉的方块数"; 其它操作的提示里没这个占位符, 忽略即可。
-        if (result.isAllComplete()) {
-            player.sendLang(successKey, pluginId to "pluginId", actual.values.sum() to "amount")
-        } else {
-            player.sendLang("message-edit-failed", pluginId to "pluginId")
+            // 有区块没跑完就算失败: 收缩这类不产生退费的操作, 只看退费会把它误报成成功。
+            // {amount} 给扩展 / 收缩报"实际写入 / 清掉的方块数"; 其它操作的提示里没这个占位符, 忽略即可。
+            if (result.isAllComplete()) {
+                player.sendLang(successKey, pluginId to "pluginId", actual.values.sum() to "amount")
+            } else {
+                player.sendLang("message-edit-failed", pluginId to "pluginId")
+            }
+        } finally {
+            endEdit(player, operation.token)
         }
     }
 
@@ -424,6 +428,7 @@ class EditPipeline(private val selection: SelectionManager) {
      * 会重复扣材料、撤销记录也会错位。
      */
     internal fun beginEdit(player: Player): EditToken? {
+        if (!EditLifecycle.accepting) return null
         val token = locks.acquire(player.uniqueId)
         if (token == null) {
             player.sendLang("message-edit-busy", pluginId to "pluginId")
@@ -452,7 +457,13 @@ class EditPipeline(private val selection: SelectionManager) {
         world: World
     ): EditOperation? {
         val token = beginEdit(player) ?: return null
-        if (!fireOperation(player, type, box, world)) {
+        val permitted = try {
+            fireOperation(player, type, box, world) && EditLifecycle.accepting
+        } catch (error: Throwable) {
+            endEdit(player, token)
+            throw error
+        }
+        if (!permitted) {
             endEdit(player, token)
             return null
         }

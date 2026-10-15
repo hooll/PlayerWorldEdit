@@ -4,6 +4,8 @@ import com.sk89q.worldedit.EditSession
 import com.sk89q.worldedit.WorldEdit
 import com.sk89q.worldedit.bukkit.BukkitAdapter
 import com.sk89q.worldedit.extension.platform.Actor
+import com.sk89q.worldedit.extent.Extent
+import com.sk89q.worldedit.math.BlockVector3
 import com.sk89q.worldedit.regions.Region
 import com.sk89q.worldedit.world.block.BaseBlock
 import org.bukkit.World
@@ -15,7 +17,8 @@ import org.bukkit.World
  * 在 Folia 核心上从别的线程写入会被 WorldEdit 静默丢弃。
  *
  * **每个写入方法都返回"这次真正被接受的写入数"**, 调用方用它记账 (计费 / 退费 / 撤销统计),
- * 而不是用"遍历了多少格"去估 —— 两者的差额就是被拒掉的那部分 (2026-10-14 的 R2)。证据:
+ * 而不是用"遍历了多少格"去估。抛错的那一格无法证明有没有提交, 成本回调保守计一格,
+ * 不将可能已经写入的改动免费送出; 撤销覆盖该片并退还所记成本。证据:
  * `FoliaExtentListener$1.setBlock` 对 `!Bukkit.isOwnedByCurrentRegion(pos)` 直接 `return false`
  * (字节码 `ifeq -> iconst_0`), 而 `EditSession.setBlocks` 只统计 `setBlock` 返回 true 的格子
  * (`RegionVisitor.resume` 里 `if (function.apply(pos)) affected++`), 所以返回值天然排除了
@@ -42,42 +45,26 @@ object WorldEditTool {
         val weWorld = BukkitAdapter.adapt(world)
         var index = offset
         for (vector in region) {
-            val block = weWorld.getFullBlock(vector)
-            if (!canCaptureNbt(block)) {
-                throw IllegalStateException(
-                    "方块实体数据无法保存, 已在写入前拒绝这一片: ${block.blockType.id} @ $vector"
-                )
-            }
-            target[index++] = block
+            target[index++] = captureBlock(weWorld.getFullBlock(vector))
         }
     }
 
-    /** 把整块长方体填成 [blockState]; 返回**被接受**的写入数 (越界被 Folia 拒掉的不算) */
-    fun setBlocks(world: World, region: Region, blockState: BaseBlock, actor: Actor? = null): Int {
-        newSession(world, actor).use { session ->
-            return session.setBlocks(region, blockState)
-        }
+    /** 每格接受后立即发布进度, 不依赖整个循环或 close 正常返回。 */
+    fun setBlocks(
+        world: World, region: Region, blockState: BaseBlock, actor: Actor? = null,
+        onWritten: (BaseBlock) -> Unit = {}
+    ): Int = writeBlocks(world, region, actor, { _, _, _ -> blockState }, onWritten)
+
+    fun replaceBlocks(
+        world: World, region: Region, from: BaseBlock, to: BaseBlock, actor: Actor? = null,
+        onWritten: (BaseBlock) -> Unit = {}
+    ): Int {
+        val session = newSession(world, actor)
+        return writeSession(session, { session.close() }, region, { vector ->
+            if (session.getFullBlock(vector) == from) to else null
+        }, onWritten)
     }
 
-    /** 把区域里匹配 [from] 的方块换成 [to]; 返回**被接受**的写入数 */
-    fun replaceBlocks(world: World, region: Region, from: BaseBlock, to: BaseBlock, actor: Actor? = null): Int {
-        newSession(world, actor).use { session ->
-            return session.replaceBlocks(region, setOf(from.toBaseBlock()), to)
-        }
-    }
-
-    /**
-     * 逐块写入: 对区域里每个方块调 [stateAt] 取"要写的状态", 返回 null 就跳过这一格;
-     * **被接受**的每次写入都会回调 [onWritten] (调用方用它记账), 返回值是接受的写入数。
-     *
-     * 形状 / 复制这类"要写的方块不是整块长方体"的操作用不了 `setBlocks(Region)` 那条快路径,
-     * 只能逐个 [EditSession.setBlock] —— 和 [restoreBlocks] 是同一条写入路径, 所以开销特征和
-     * 撤销一致: 都在区块所属的区域线程上跑, 都受每 tick 预算限流。[stateAt] 必须是纯判定或
-     * 纯查表, 不读世界。
-     *
-     * `onWritten` 只在 `setBlock` 返回 true 时回调: 被 Folia 区域线程拒掉的格子既不计费也不进
-     * 撤销统计, 否则"报了多少格"与"世界真的改了多少格"又会分叉 (R2)。
-     */
     fun writeBlocks(
         world: World,
         region: Region,
@@ -85,53 +72,78 @@ object WorldEditTool {
         stateAt: (x: Int, y: Int, z: Int) -> BaseBlock?,
         onWritten: (BaseBlock) -> Unit = {}
     ): Int {
-        newSession(world, actor).use { session ->
-            var written = 0
-            for (vector in region) {
-                val state = stateAt(vector.x(), vector.y(), vector.z()) ?: continue
-                if (session.setBlock(vector, state)) {
-                    written++
-                    onWritten(state)
-                }
-            }
-            return written
-        }
+        val session = newSession(world, actor)
+        return writeSession(session, { session.close() }, region,
+            { vector -> stateAt(vector.x(), vector.y(), vector.z()) }, onWritten)
     }
 
-    /** [writeBlocks] 的常量形式: 只写判定为真的那些方块 (形状生成用, 空气照写 = 清空) */
+    /**
+     * 与生产路径共用的 session 执行循环。接受进度立即发布, close 抛错也不丢掉进度。
+     * setBlock 抛错的尝试保守占用一格成本; 正常返回 false 不记账。
+     * 接受表示 extent 接受请求, 不声称关闭失败时已缓冲的写入一定全部落到世界。
+     */
+    internal fun writeSession(
+        extent: Extent,
+        close: () -> Unit,
+        region: Region,
+        stateAt: (BlockVector3) -> BaseBlock?,
+        onWritten: (BaseBlock) -> Unit
+    ): Int = AutoCloseable { close() }.use {
+        var written = 0
+        for (vector in region) {
+            val state = stateAt(vector) ?: continue
+            val accepted = try {
+                extent.setBlock(vector, state)
+            } catch (error: Throwable) {
+                // 第三方 extent 可能在写后抛错。该格是否提交无法确认, 保守记一格成本;
+                // 快照仍覆盖整片, 重试撤销后可退还此笔, 不将可能已写的格子免费送出。
+                onWritten(state)
+                throw error
+            }
+            if (accepted) {
+                written++
+                onWritten(state)
+            }
+        }
+        written
+    }
+
     fun setBlocksIf(
         world: World,
         region: Region,
         blockState: BaseBlock,
         actor: Actor?,
-        contains: (x: Int, y: Int, z: Int) -> Boolean
-    ): Int = writeBlocks(world, region, actor, { x, y, z -> if (contains(x, y, z)) blockState else null })
+        contains: (x: Int, y: Int, z: Int) -> Boolean,
+        onWritten: (BaseBlock) -> Unit = {}
+    ): Int = writeBlocks(world, region, actor,
+        { x, y, z -> if (contains(x, y, z)) blockState else null }, onWritten)
 
-    /**
-     * 按 [RegionSlice] 把整块快照里对应的那一段写回这片区域; 返回**被接受**的还原数
-     *
-     * 逐格先跟快照比一次, 相同就跳过。快照是按**整块**读的, 撤销的大部分格子本来就没被改过,
-     * 把原值写回去只有一个坏处: CoreProtect 会给这些"其实没动"的方块也记一笔 (2026-10-13 的
-     * 遗留项)。代价是每个方块多一次区域线程上的读 —— 读与写在同一次 [RegionSlice] 迭代里,
-     * 每 tick 的预算仍按写入量算, 所以不会额外多占 tick (见报告)。
-     *
-     * **失败不吞**: 底层抛出的异常直接往上抛 (调用方 [runOnChunkThreads] 会把该区块标成失败,
-     * 撤销据此保留记录并重试 —— 原来吞掉异常会让"没还原成"被当成"还原完了", 材料照退、记录照删)。
-     */
+    /** 只有完整方块(含 NBT)已经相同才能跳过。真正拒写必须使本次撤销失败。 */
     fun restoreBlocks(world: World, slice: RegionSlice, states: List<BaseBlock>, actor: Actor? = null): Int {
-        val end = minOf(slice.offset + slice.size, states.size)
-        newSession(world, actor).use { session ->
-            var restored = 0
-            var index = slice.offset
-            for (vector in slice.region) {
-                if (index >= end) break
-                val state = states[index++]
-                if (session.getBlock(vector) == state) continue
-                if (session.setBlock(vector, state)) restored++
-            }
-            return restored
-        }
+        val session = newSession(world, actor)
+        return restoreSession(session, { session.close() }, slice, states)
     }
+
+    internal fun restoreSession(
+        extent: Extent, close: () -> Unit, slice: RegionSlice, states: List<BaseBlock>
+    ): Int = AutoCloseable { close() }.use {
+        require(slice.offset + slice.size <= states.size) { "Incomplete undo snapshot" }
+        var restored = 0
+        var index = slice.offset
+        for (vector in slice.region) {
+            val target = states[index++]
+            if (sameFullBlock(extent.getFullBlock(vector), target)) continue
+            if (extent.setBlock(vector, target)) {
+                restored++
+            } else if (!sameFullBlock(extent.getFullBlock(vector), target)) {
+                throw IllegalStateException("Undo write rejected at $vector")
+            }
+        }
+        restored
+    }
+
+    private fun sameFullBlock(left: BaseBlock, right: BaseBlock): Boolean =
+        left.toImmutableState() == right.toImmutableState() && nbtOf(left) == nbtOf(right)
 
     /**
      * 建 EditSession。

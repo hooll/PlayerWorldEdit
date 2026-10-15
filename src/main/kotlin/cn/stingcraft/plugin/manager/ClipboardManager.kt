@@ -5,6 +5,7 @@ import cn.stingcraft.plugin.api.event.OperationType
 import cn.stingcraft.plugin.hook.AreaPermission
 import cn.stingcraft.plugin.util.RegionSlice
 import cn.stingcraft.plugin.util.WorldEditTool
+import cn.stingcraft.plugin.util.captureBlock
 import cn.stingcraft.plugin.util.runOnChunkThreads
 import cn.stingcraft.plugin.util.splitByChunk
 import com.sk89q.worldedit.bukkit.BukkitAdapter
@@ -15,6 +16,7 @@ import com.sk89q.worldedit.math.transform.AffineTransform
 import com.sk89q.worldedit.math.transform.Transform
 import com.sk89q.worldedit.regions.CuboidRegion
 import com.sk89q.worldedit.world.block.BaseBlock
+import org.bukkit.Bukkit
 import org.bukkit.Location
 import org.bukkit.Material
 import org.bukkit.World
@@ -79,6 +81,7 @@ class ClipboardManager(
         val world = validated.world
         val region = validated.region
         // copy 只读不写: 不触发操作前事件 (与既有行为一致), 但要拿编辑锁串行化同一个玩家的操作
+        val stamp = selection.selectionStamp(player)
         val token = pipeline.beginEdit(player) ?: return
         val origin = player.location
         val clipboard = ClipboardVolume.of(region, origin.blockX, origin.blockY, origin.blockZ)
@@ -88,7 +91,7 @@ class ClipboardManager(
             work = { _, slice ->
                 val weWorld = BukkitAdapter.adapt(world)
                 for (vector in slice.region) {
-                    clipboard.setBlock(vector.x(), vector.y(), vector.z(), weWorld.getFullBlock(vector))
+                    clipboard.setBlock(vector.x(), vector.y(), vector.z(), captureBlock(weWorld.getFullBlock(vector)))
                 }
             },
             done = { result ->
@@ -96,7 +99,7 @@ class ClipboardManager(
                     pipeline.endEdit(player, token)
                     // 玩家在读取期间退出: 退出路径已经清过表 (clearPlayerPos), 这里再把剪贴板 put 回去
                     // 就成了"按 UUID 只增不删"的泄漏, 而剪贴板不设上限 —— 离线玩家一律不发布
-                    if (!player.isOnline) return@onPlayerThread
+                    if (!player.isOnline || selection.selectionStamp(player) !== stamp || Bukkit.getPlayer(player.uniqueId) !== player) return@onPlayerThread
                     // 超时、区块抛异常、或者某个区块没读完 (数组里留下 null) 都算失败: 半份剪贴板贴出去
                     // 比不贴更糟
                     if (!result.isAllComplete() || !clipboard.isComplete()) {
@@ -215,10 +218,7 @@ class ClipboardManager(
         val clipboard = clipboardOf(player) ?: return false
         val target = pasteTarget(player, clipboard, player.world) ?: return false
         val preview = pastePreviews[player.uniqueId]
-        val confirmed = preview != null &&
-            preview.expiresAt >= System.currentTimeMillis() &&
-            preview.box.minimumPoint == target.box.minimumPoint &&
-            preview.box.maximumPoint == target.box.maximumPoint
+        val confirmed = preview?.confirms(target.world.uid, target.box, System.currentTimeMillis()) == true
         if (confirmed) {
             pasteAt(player, clipboard, target)
             return true
@@ -358,7 +358,7 @@ class ClipboardManager(
 
     private fun showPreview(player: Player, target: PasteTarget) {
         pastePreviews[player.uniqueId] =
-            PastePreview(target.box, System.currentTimeMillis() + PASTE_PREVIEW_SECONDS * 1000)
+            PastePreview(target.world.uid, target.box, System.currentTimeMillis() + PASTE_PREVIEW_SECONDS * 1000)
         // 关掉玻璃盒显示 (region-display) 时只报数不画框 (开关与材质都在 SelectionManager 里):
         // 预览的粒子版本不做 —— 粒子边框是按选区的两个点画的, 而预览框是另一个区域, 为它再写一套
         // 粒子逻辑不值当
@@ -372,7 +372,11 @@ class ClipboardManager(
         )
     }
 
-    private class PastePreview(val box: CuboidRegion, val expiresAt: Long)
+    internal class PastePreview(val worldId: UUID, val box: CuboidRegion, val expiresAt: Long) {
+        fun confirms(world: UUID, target: CuboidRegion, now: Long): Boolean =
+            worldId == world && expiresAt >= now &&
+                box.minimumPoint == target.minimumPoint && box.maximumPoint == target.maximumPoint
+    }
 
     /**
      * 剪贴板支持的角度

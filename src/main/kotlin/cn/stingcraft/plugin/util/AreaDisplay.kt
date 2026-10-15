@@ -2,6 +2,7 @@ package cn.stingcraft.plugin.util
 
 import com.sk89q.worldedit.regions.CuboidRegion
 import org.bukkit.Location
+import org.bukkit.Bukkit
 import org.bukkit.Material
 import org.bukkit.World
 import org.bukkit.entity.BlockDisplay
@@ -13,8 +14,10 @@ import taboolib.common.platform.function.submitAsync
 import taboolib.common.platform.function.warning
 import taboolib.common.platform.service.PlatformExecutor
 import taboolib.platform.BukkitPlugin
+import taboolib.platform.Folia
 import taboolib.platform.util.runTask
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -36,7 +39,8 @@ class AreaDisplay {
     private val boxes = ConcurrentHashMap<UUID, Box>()
 
     // 每次变更都 +1; 排队中的旧任务发现代号变了就自己把实体收掉, 免得快速连点留下孤儿实体
-    private val generations = ConcurrentHashMap<UUID, Int>()
+    private val generations = ConcurrentHashMap<UUID, Long>()
+    private val generationSequence = AtomicLong()
 
     // 自动收盒子的定时任务
     private val hideTasks = ConcurrentHashMap<UUID, PlatformExecutor.PlatformTask>()
@@ -59,7 +63,7 @@ class AreaDisplay {
         durationTicks: Long,
         onFailure: () -> Unit = {}
     ) {
-        if (!player.isOnline) return
+        if (!EditLifecycle.accepting || !player.isOnline || Bukkit.getPlayer(player.uniqueId) !== player) return
         val min = region.minimumPoint
         val max = region.maximumPoint
         // 选区是方块坐标, 盒子要盖住最后一个方块, 所以每一轴 +1
@@ -82,6 +86,8 @@ class AreaDisplay {
         hide(player)
         val generation = nextGeneration(player.uniqueId)
         world.runTask(origin.x, origin.z, Runnable {
+            if (!EditLifecycle.accepting || generations[player.uniqueId] != generation ||
+                Bukkit.getPlayer(player.uniqueId) !== player || player.world.uid != world.uid) return@Runnable
             val blockData = material.createBlockData()
             val spawned = ArrayList<BlockDisplay>(transformations.size)
             transformations.forEach { transformation ->
@@ -111,7 +117,8 @@ class AreaDisplay {
                 return@Runnable
             }
             // 选区已经变了或者玩家下线了, 这组实体就不要了
-            if (generations[player.uniqueId] != generation || !player.isOnline) {
+            if (generations[player.uniqueId] != generation || !player.isOnline ||
+                !EditLifecycle.accepting || Bukkit.getPlayer(player.uniqueId) !== player || player.world.uid != world.uid) {
                 spawned.forEach { runCatching { it.remove() } }
                 return@Runnable
             }
@@ -139,19 +146,21 @@ class AreaDisplay {
      * 玩家退出: 收掉盒子并把这个玩家的代号条目也删掉
      *
      * [hide] 只把代号 +1 (排队中的旧任务据此判断自己该不该收实体), 键本身会一直留着 ——
-     * 按 UUID 只增不删, 长期运行就是一张无界累积的表。玩家已经退出, 不会再有在途任务,
-     * 所以这里可以直接删掉整个条目。
+     * 按 UUID 只增不删会滞留。代号来自全局递增序列, 删除条目后也不会与旧回调重号。
      */
     fun forget(player: Player) {
-        hide(player)
-        generations.remove(player.uniqueId)
+        try { hide(player) } finally { generations.remove(player.uniqueId) }
     }
 
     /** 收掉所有盒子 (关插件/重载时用, 免得留下孤儿实体) */
     fun hideAll() {
         hideTasks.values.forEach { runCatching { it.cancel() } }
         hideTasks.clear()
-        boxes.keys.toList().forEach { uuid -> remove(boxes.remove(uuid)) }
+        generations.clear()
+        boxes.keys.toList().forEach { uuid ->
+            runCatching { remove(boxes.remove(uuid)) }
+                .onFailure { warning("[PlayerWorldEdit] 显示体清理失败 ($uuid): $it") }
+        }
     }
 
     /**
@@ -168,12 +177,21 @@ class AreaDisplay {
 
     private fun remove(box: Box?) {
         if (box == null) return
+        if (!plugin.isEnabled && !Folia.isFolia) {
+            // Bukkit 在 onDisable 前已设 disabled, 不再提交本插件的新任务。
+            box.entities.forEach { entity ->
+                runCatching { entity.remove() }.onFailure { warning("[PlayerWorldEdit] 删除显示体失败: $it") }
+            }
+            return
+        }
         box.world.runTask(box.x.toDouble(), box.z.toDouble(), Runnable {
-            box.entities.forEach { runCatching { it.remove() } }
+            box.entities.forEach { entity ->
+                runCatching { entity.remove() }.onFailure { warning("[PlayerWorldEdit] 删除显示体失败: $it") }
+            }
         })
     }
 
-    private fun nextGeneration(uuid: UUID): Int = generations.merge(uuid, 1, Int::plus) ?: 0
+    private fun nextGeneration(uuid: UUID): Long = generationSequence.incrementAndGet().also { generations[uuid] = it }
 
     /**
      * 6 个薄板: 每片只比选区厚 [WALL_THICKNESS], 拼成一个空心的盒子

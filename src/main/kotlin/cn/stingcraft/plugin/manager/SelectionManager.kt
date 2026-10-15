@@ -8,6 +8,7 @@ import com.sk89q.worldedit.bukkit.BukkitAdapter
 import com.sk89q.worldedit.math.BlockVector3
 import com.sk89q.worldedit.regions.CuboidRegion
 import org.bukkit.Location
+import org.bukkit.Bukkit
 import org.bukkit.Material
 import org.bukkit.Particle
 import org.bukkit.World
@@ -196,7 +197,9 @@ class SelectionManager {
      * @param player 玩家
      * @param pos1 点1
      */
+    @Synchronized
     fun setPlayerPos1(player: Player, pos1: Location) {
+        if (!player.isOnline || Bukkit.getPlayer(player.uniqueId) !== player) return
         if (playerpos[player] == null) {
             playerpos[player] = Pair(pos1.clone(),null)
             return
@@ -210,7 +213,9 @@ class SelectionManager {
      * @param player 玩家
      * @param pos2 点2
      */
+    @Synchronized
     fun setPlayerPos2(player: Player, pos2: Location) {
+        if (!player.isOnline || Bukkit.getPlayer(player.uniqueId) !== player) return
         if (playerpos[player] == null) {
             playerpos[player] = Pair(null,pos2.clone())
             return
@@ -228,6 +233,9 @@ class SelectionManager {
      * @param player 玩家
      */
     fun showSelection(player: Player) {
+        if (!player.isOnline || Bukkit.getPlayer(player.uniqueId) !== player) return
+        val points = playerpos[player] ?: return
+        if (points.first?.world?.uid != player.world.uid || points.second?.world?.uid != player.world.uid) return
         val region = getWERegion(player)
         if (region == null) {
             hideSelection(player)
@@ -288,14 +296,14 @@ class SelectionManager {
         particleTasks[player] = submitAsync(period = 20) {
             // 粒子跟着选区走 (和玻璃盒一致): 只在自己下线时停, 选区被清除时由 stopParticle 停。
             // 原来还有一条 60 秒自停, 那样会变成"选区还在、提示没了", 和"成功后保留选区"矛盾。
-            if (!player.isOnline) {
+            if (!player.isOnline || Bukkit.getPlayer(player.uniqueId) !== player || player.world.uid != world.uid) {
                 cancel()
                 particleTasks.remove(player)
                 return@submitAsync
             }
             pointsByChunk.forEach { (chunk, locations) ->
                 world.runTask(chunk.first * 16.0, chunk.second * 16.0, Runnable {
-                    if (!player.isOnline) return@Runnable
+                    if (!player.isOnline || Bukkit.getPlayer(player.uniqueId) !== player || player.world.uid != world.uid) return@Runnable
                     locations.forEach { player.spawnParticle(particle, it, 1) }
                 })
             }
@@ -362,7 +370,7 @@ class SelectionManager {
      * 收掉所有玩家的选区显示体 (关插件/重载时用, 免得留下孤儿实体)
      */
     fun clearDisplays() {
-        particleTasks.keys.toList().forEach { stopParticle(it) }
+        particleTasks.keys.toList().forEach { player -> runCatching { stopParticle(player) } }
         areaDisplay.hideAll()
     }
 
@@ -385,9 +393,15 @@ class SelectionManager {
         return region.volume.toInt()
     }
 
-    internal fun updateSelection(player: Player, first: IntArray, second: IntArray) {
-        setPlayerPos1(player, locationOf(player, first))
-        setPlayerPos2(player, locationOf(player, second))
+    internal fun selectionStamp(player: Player): Any? = playerpos[player]
+
+    /** 传送/退出/重新选点后保留当时选区, 不将旧回调发布为新世界或新会话的选区。 */
+    @Synchronized
+    internal fun updateSelection(player: Player, world: World, stamp: Any?, first: IntArray, second: IntArray) {
+        if (!player.isOnline || player.world.uid != world.uid || stamp == null || playerpos[player] !== stamp ||
+            Bukkit.getPlayer(player.uniqueId) !== player) return
+        playerpos[player] = locationOf(world, first) to locationOf(world, second)
+        showSelection(player)
     }
 
     /**
@@ -455,6 +469,7 @@ class SelectionManager {
      * 剪贴板 / paste 预览 / 形状尺寸这些 per-UUID 状态由各自的 manager 清, 统一由门面的
      * [WorldEditManager.clearPlayerPos] 聚合调用 —— 少清一处就是"按 UUID 只增不删"的表。
      */
+    @Synchronized
     internal fun forget(player: Player) {
         playerpos.remove(player)
         stopParticle(player)
