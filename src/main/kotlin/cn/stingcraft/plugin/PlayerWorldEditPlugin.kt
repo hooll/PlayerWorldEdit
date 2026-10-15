@@ -4,6 +4,9 @@ import cn.stingcraft.plugin.manager.SettingManager
 import cn.stingcraft.plugin.manager.MaterialPackManager
 import cn.stingcraft.plugin.manager.WorldEditManager
 import cn.stingcraft.plugin.util.cancelWatchdogs
+import cn.stingcraft.plugin.util.EditLifecycle
+import cn.stingcraft.plugin.inventory.MaterialTradeJournal
+import taboolib.common.platform.function.warning
 import com.google.gson.GsonBuilder
 import taboolib.common.platform.Plugin
 import taboolib.common.platform.function.info
@@ -21,16 +24,21 @@ object PlayerWorldEdit : Plugin() {
     val worldEditManager = WorldEditManager()
 
     override fun onEnable() {
+        EditLifecycle.start()
+        MaterialTradeJournal.unresolvedPlayers().forEach { uuid ->
+            packManager.suspendTrades(uuid)
+            warning("[PlayerWorldEdit] $uuid 存在待核对材料交易, 已暂停交易, 请检查 material-transactions")
+        }
         info("Successfully running PlayerWorldEdit!")
     }
 
     override fun onDisable() {
-        // 选区显示体是实体, 插件卸载/关服时收掉, 免得留下孤儿实体
-        worldEditManager.clearDisplays()
-        // 超时兜底计时器也停掉, 免得卸载后还在跑
-        cancelWatchdogs()
-        // 材料包缓存是唯一真相源, 关服前必须落盘, 否则在线玩家这一段时间的材料就丢了
-        packManager.flushAll()
+        val drained = runCatching { EditLifecycle.stop() }.getOrDefault(false)
+        if (!drained) warning("[PlayerWorldEdit] 停用时仍有操作未排空, 保留锁与在途快照, 不将其声明为完成")
+        runCatching { cancelWatchdogs() }.onFailure { warning("[PlayerWorldEdit] 停止计时器失败: $it") }
+        // 每份材料包独立保存。显示清理无论成功与否均不能阻断数据保存。
+        runCatching { packManager.flushAll() }.onFailure { warning("[PlayerWorldEdit] 材料保存失败: $it") }
+        runCatching { worldEditManager.clearDisplays() }.onFailure { warning("[PlayerWorldEdit] 显示清理失败: $it") }
     }
 
     /**

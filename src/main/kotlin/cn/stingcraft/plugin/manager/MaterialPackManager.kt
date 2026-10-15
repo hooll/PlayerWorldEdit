@@ -4,12 +4,29 @@ import cn.stingcraft.plugin.data.MaterialEntry
 import cn.stingcraft.plugin.data.MaterialPack
 import cn.stingcraft.plugin.database.MaterialPackDataBase
 import org.bukkit.Material
+import org.bukkit.Bukkit
+import cn.stingcraft.plugin.util.EditLifecycle
 import org.bukkit.entity.Player
 import taboolib.common.platform.function.warning
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
-class MaterialPackManager {
+internal interface MaterialPackStore {
+    fun read(uuid: UUID): MaterialPack
+    fun write(uuid: UUID, pack: MaterialPack)
+}
+
+class MaterialPackManager internal constructor(
+    private val store: MaterialPackStore,
+    private val log: (String) -> Unit
+) {
+    constructor() : this(MaterialPackDataBase, { warning(it) })
+
+    /** 无法判明数据库提交结果的账号拒绝后续交易, 等待管理员核对。 */
+    private val uncertain = ConcurrentHashMap.newKeySet<UUID>()
+
+    internal fun suspendTrades(uuid: UUID) { uncertain.add(uuid) }
+
 
     /**
      * 材料包是"读 → 改 → 全量写库"的复合操作, 而它会被三种线程调用:
@@ -22,10 +39,10 @@ class MaterialPackManager {
     private val locks = ConcurrentHashMap<UUID, Any>()
 
     /**
-     * per-player 材料包缓存 —— 玩家在线期间的**唯一真相源**。
+     * 在线编辑的 per-player 材料包缓存; GUI 交易在同一锁内同步提交后发布新缓存。
      *
      * 以前每次取物/扣费都要"base64 解码 + gzip 解压 + gson 解析"读一次, 再"gson + gzip + base64"
-     * 全量写一次, 一次点击就是两读一写。加了缓存之后, 操作只改内存, 退出 (或关服) 时才落一次盘。
+     * 全量写一次。普通编辑扣退先改缓存, 退出/停用保存; GUI 物品交易必须同步提交。
      *
      * 缓存里没有这个玩家时, 读改写会退回数据库直连 (见 [mutate]): 玩家已经退出、或者登录时的
      * 加载还没跑完, 走直连才不会把那次改动丢掉。
@@ -35,7 +52,7 @@ class MaterialPackManager {
     private fun lockOf(uuid: UUID): Any = locks.computeIfAbsent(uuid) { Any() }
 
     /**
-     * 登录后从数据库加载一次 (数据容器就绪之后调用)
+     * 登录后从数据库加载一次, 借用的 Auto 容器由 store 自己释放
      *
      * 已经有缓存就不重复加载 —— 加载必须是幂等的, 否则一次晚到的加载会用库里的旧数据
      * 盖掉内存里还没落盘的改动。
@@ -44,9 +61,12 @@ class MaterialPackManager {
         synchronized(lockOf(player.uniqueId)) {
             // 登录加载是异步的, 跑完时玩家可能已经退出: 那就不再往缓存里塞, 否则会留下一条
             // 永远不会落盘的缓存 (退出事件已经过去, 不会再有 unload 来 flush 它)
-            if (!player.isOnline) return
+            if (!player.isOnline || Bukkit.getPlayer(player.uniqueId) !== player || !EditLifecycle.accepting) return
             if (caches.containsKey(player.uniqueId)) return
-            caches[player.uniqueId] = MaterialPackDataBase.getMaterialPack(player.uniqueId)
+            val loaded = store.read(player.uniqueId)
+            if (player.isOnline && Bukkit.getPlayer(player.uniqueId) === player && EditLifecycle.accepting) {
+                caches[player.uniqueId] = loaded
+            }
         }
     }
 
@@ -64,12 +84,12 @@ class MaterialPackManager {
     /**
      * 把缓存写回数据库; 调用方必须已经持有这个玩家的锁
      *
-     * 用 [MaterialPackDataBase.saveMaterialPackNow]: 容器 + 数据库一起写。退出/关服这条路径也走它 ——
-     * 少写一次库省不了什么, 但"退出前那一小段没落库"的窗口就没了。
+     * 本依赖的 AutoDataContainer.set 同步写库, 不需要也不能重复调用 Database.set。
      */
     private fun flushLocked(uuid: UUID) {
+        if (uuid in uncertain) throw IllegalStateException("Material trade outcome unresolved: $uuid")
         val materialPack = caches[uuid] ?: return
-        MaterialPackDataBase.saveMaterialPackNow(uuid, materialPack)
+        store.write(uuid, materialPack)
     }
 
     /**
@@ -81,73 +101,99 @@ class MaterialPackManager {
      */
     fun unload(player: Player) {
         synchronized(lockOf(player.uniqueId)) {
-            flushLocked(player.uniqueId)
-            caches.remove(player.uniqueId)
+            val current = Bukkit.getPlayer(player.uniqueId)
+            if (current != null && current !== player) return
+            runCatching { flushLocked(player.uniqueId) }
+                .onSuccess { caches.remove(player.uniqueId) }
+                .onFailure { log("[PlayerWorldEdit] 退出保存失败 (${player.uniqueId}), 保留缓存: $it") }
         }
     }
 
     /** 关服: 把所有还没落盘的缓存写回去 */
     fun flushAll() {
-        caches.keys.toList().forEach { flush(it) }
-    }
-
-    /**
-     * 材料交易 (与玩家背包打交道的那几条路) 的结果
-     *
-     * 三态而不是布尔: "材料不够"和"账没落库"要分别告诉玩家, 也要让调用方知道**这次改动的账到底
-     * 记上了没有** —— 混成一个 false 就只能猜 (R10)。
-     */
-    enum class TradeResult {
-        /** 成功: 账已经落库 */
-        OK,
-        /** 材料不够, 什么都没改 */
-        NOT_ENOUGH,
-        /** 账没落库 (已经回滚), 调用方必须按失败处理: 别发物品 / 把物品还回去 */
-        PERSIST_FAILED
-    }
-
-    /**
-     * 把缓存**立刻落库**; 失败打日志并返回 false
-     *
-     * 与 [flush] 的区别: [flush] 是退出/关服时的收尾 (失败也无所谓, 反正要下线了), 这里给交易路径用,
-     * 调用方要按结果决定"发不发物品 / 收不收物品", 所以必须把失败报出来。
-     */
-    fun flushNow(player: Player): Boolean {
-        return synchronized(lockOf(player.uniqueId)) {
-            runCatching { flushLocked(player.uniqueId) }
-                .onFailure { warning("[PlayerWorldEdit] 材料包落库失败 (${player.name}): $it") }
-                .isSuccess
+        caches.keys.toList().forEach { uuid ->
+            runCatching { flush(uuid) }.onFailure { log("[PlayerWorldEdit] 材料保存失败 ($uuid), 保留缓存待重试: $it") }
         }
     }
 
-    /**
-     * 取物: 扣缓存 + **立刻落库**, 落库失败就把扣的加回去
-     *
-     * 顺序是"先扣先落库, 再给物品": 崩在中间只会少一件物品, 不会凭空多出一件 (方向安全)。原来只改
-     * 内存、退出时才落盘 —— 崩在退出之前, 库里还是旧值, 重登后材料又回来了, 而物品已经在玩家背包里
-     * = 重复提现 (2026-10-14 的 R10)。
-     */
-    fun tryConsumeDurably(player: Player, material: Material, amount: Int): TradeResult {
-        if (!tryConsume(player, material, amount)) return TradeResult.NOT_ENOUGH
-        if (flushNow(player)) return TradeResult.OK
-        // 落库失败: 把这次扣的加回去 (加回去只改内存, 下一次落库会覆盖掉失败的这次)
-        addMaterial(player, material, amount)
-        return TradeResult.PERSIST_FAILED
+    enum class TradeResult {
+        OK, NOT_ENOUGH, PERSIST_FAILED,
+        /** 写入抛错且回读也不能判明结果。禁止退物或重提, 原物进入待核对记录。 */
+        PERSIST_UNKNOWN
     }
 
-    /**
-     * 存入: 加缓存 + **立刻落库**, 落库失败就把加的撤回 (返回 [TradeResult.PERSIST_FAILED], 由调用方
-     * 把物品还给玩家)
-     *
-     * 存入这一路原来是 `submitAsync { addMaterials(...) }` —— 玩家物品已经从背包里拿走了, 而"加进
-     * 材料包"是个异步且不落库的动作: 崩在任务执行之前, 物品既不在背包里也不在库里 (凭空消失);
-     * 崩在落库之前同理。现在同步做、做完就落库, 失败还能把物品退回去 (R10)。
-     */
-    fun addMaterialsDurably(player: Player, materials: List<MaterialEntry>): TradeResult {
-        addMaterials(player, materials)
-        if (flushNow(player)) return TradeResult.OK
-        materials.forEach { removeMaterial(player, it.material, it.amount) }
-        return TradeResult.PERSIST_FAILED
+    fun flushNow(player: Player): Boolean = synchronized(lockOf(player.uniqueId)) {
+        runCatching { flushLocked(player.uniqueId) }
+            .onFailure { log("[PlayerWorldEdit] 材料包落库失败 (${player.uniqueId}): $it") }.isSuccess
+    }
+
+    fun tryConsumeDurably(player: Player, material: Material, amount: Int): TradeResult =
+        trade(player.uniqueId) { pack -> consume(pack, material, amount) }
+
+    fun addMaterialsDurably(player: Player, materials: List<MaterialEntry>): TradeResult =
+        trade(player.uniqueId) { pack ->
+            materials.forEach { entry ->
+                require(entry.amount > 0) { "Non-positive material deposit" }
+                val existing = pack.materials.find { it.material == entry.material }
+                if (existing == null) pack.materials.add(entry.copy())
+                else existing.amount = Math.addExact(existing.amount, entry.amount)
+            }
+            true
+        }
+
+    /** 整个加载/修改/单次提交/失败回读都在同一 UUID 锁内, 不在原包上做失败回滚。 */
+    internal fun trade(uuid: UUID, change: (MaterialPack) -> Boolean): TradeResult = synchronized(lockOf(uuid)) {
+        if (!EditLifecycle.accepting) return@synchronized TradeResult.PERSIST_FAILED
+        if (uuid in uncertain) return@synchronized TradeResult.PERSIST_UNKNOWN
+        val old: MaterialPack
+        val candidate: MaterialPack
+        try {
+            old = caches[uuid] ?: store.read(uuid)
+            candidate = copyPack(old)
+            if (!change(candidate)) return@synchronized TradeResult.NOT_ENOUGH
+        } catch (error: Throwable) {
+            log("[PlayerWorldEdit] 材料交易加载或准备失败 ($uuid): $error")
+            return@synchronized TradeResult.PERSIST_FAILED
+        }
+        try {
+            store.write(uuid, candidate)
+        } catch (writeError: Throwable) {
+            // 回读自身也可能抛错, 这种情况必须保留 UNKNOWN, 不可落入未提交分支。
+            val outcome = runCatching {
+                val committed = store.read(uuid)
+                when {
+                    equivalent(committed, candidate) -> TradeResult.OK
+                    equivalent(committed, old) -> TradeResult.PERSIST_FAILED
+                    else -> TradeResult.PERSIST_UNKNOWN
+                }
+            }.getOrDefault(TradeResult.PERSIST_UNKNOWN)
+            if (outcome == TradeResult.PERSIST_UNKNOWN) {
+                uncertain.add(uuid)
+                log("[PlayerWorldEdit] 材料交易提交结果不明 ($uuid), 已暂停交易, 必须人工核对: $writeError")
+            }
+            if (outcome != TradeResult.OK) return@synchronized outcome
+        }
+        // 到这里库已确认提交, 绝不再将后续错误转换成 PERSIST_FAILED 并要求退物。
+        if (caches.containsKey(uuid)) caches[uuid] = candidate
+        TradeResult.OK
+    }
+
+    private fun copyPack(pack: MaterialPack) = MaterialPack(pack.materials.mapTo(mutableSetOf()) { it.copy() })
+    private fun equivalent(left: MaterialPack, right: MaterialPack): Boolean =
+        left.materials.associate { it.material to it.amount } == right.materials.associate { it.material to it.amount }
+
+    private fun consume(pack: MaterialPack, material: Material, amount: Int): Boolean {
+        if (material.isAir || amount <= 0) return true
+        val iterator = pack.materials.iterator()
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            if (entry.material != material) continue
+            if (entry.amount < amount) return false
+            entry.amount -= amount
+            if (entry.amount == 0) iterator.remove()
+            return true
+        }
+        return false
     }
 
     /**
@@ -159,7 +205,7 @@ class MaterialPackManager {
      */
     fun getMaterialPack(player: Player): MaterialPack {
         return synchronized(lockOf(player.uniqueId)) {
-            val materialPack = caches[player.uniqueId] ?: MaterialPackDataBase.getMaterialPack(player.uniqueId)
+            val materialPack = caches[player.uniqueId] ?: store.read(player.uniqueId)
             MaterialPack(materialPack.materials.mapTo(mutableSetOf()) { it.copy() })
         }
     }
@@ -235,26 +281,8 @@ class MaterialPackManager {
      * @return 是否扣成功
      */
     fun tryConsume(player: Player, material: Material, amount: Int): Boolean {
-        if (material.isAir || amount <= 0) return true
-        return mutate(player.uniqueId) { materialPack ->
-            // 用迭代器删, 和 removeMaterial 保持一致: MaterialEntry 是 data class 且 amount 是 var,
-            // 元素进的是 LinkedHashSet, 先把 amount 减到 0 再 remove(entry) 时 hashCode 已经变了,
-            // 删不掉, 会留下一条"数量 0"的死记录。
-            val iterator = materialPack.materials.iterator()
-            while (iterator.hasNext()) {
-                val entry = iterator.next()
-                if (entry.material == material) {
-                    // 余额不足: 一个方块都不动
-                    if (entry.amount < amount) return@mutate false
-                    entry.amount -= amount
-                    if (entry.amount <= 0) {
-                        iterator.remove()
-                    }
-                    return@mutate true
-                }
-            }
-            false
-        }
+        if (!EditLifecycle.accepting) return false
+        return mutate(player.uniqueId) { consume(it, material, amount) }
     }
 
     /**
@@ -268,13 +296,20 @@ class MaterialPackManager {
      */
     private fun <T> mutate(uuid: UUID, block: (MaterialPack) -> T): T {
         synchronized(lockOf(uuid)) {
+            check(uuid !in uncertain) { "Material trade outcome unresolved: $uuid" }
             val cached = caches[uuid]
             if (cached != null) {
                 return block(cached)
             }
-            val materialPack = MaterialPackDataBase.getMaterialPack(uuid)
+            val materialPack = store.read(uuid)
             val result = block(materialPack)
-            MaterialPackDataBase.saveMaterialPack(uuid, materialPack)
+            try {
+                store.write(uuid, materialPack)
+            } catch (error: Throwable) {
+                // 离线返料失败不能丢掉待保存余额, 保留 UUID 缓存供保存重试。
+                caches[uuid] = materialPack
+                throw error
+            }
             return result
         }
     }

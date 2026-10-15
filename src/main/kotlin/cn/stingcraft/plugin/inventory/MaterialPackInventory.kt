@@ -3,6 +3,7 @@ package cn.stingcraft.plugin.inventory
 import cn.stingcraft.plugin.PlayerWorldEdit
 import cn.stingcraft.plugin.data.MaterialEntry
 import cn.stingcraft.plugin.data.MaterialPack
+import org.bukkit.inventory.ItemStack
 import cn.stingcraft.plugin.manager.MaterialPackManager
 import org.bukkit.entity.Player
 import org.bukkit.event.inventory.ClickType
@@ -30,22 +31,30 @@ object MaterialPackInventory {
 
 
 
-    /**
-     * 取物: 扣账**先落库**, 落库成功才发物品
-     *
-     * 顺序反过来 (先发物品再落库) 崩溃时会变成"物品已经拿到、库里还记着材料" = 重复提现; 现在崩在
-     * 中间只会少一件 (方向安全)。落库失败就把这次扣的撤回, 并明确告诉玩家失败 —— 改完缓存就当成功
-     * 正是 R10 要修的 (2026-10-14)。
-     */
+    /** 材料单次同步提交后才发物品。两份存储仍无共同事务, 保留阶段供人工核对。 */
     private fun takeDurably(player: Player, element: MaterialEntry, amount: Int) {
+        val item = ItemStack(element.material, amount)
+        val journal = runCatching { MaterialTradeJournal.prepare(player.uniqueId, "WITHDRAW", listOf(item)) }
+            .getOrElse {
+                player.sendLang("message-materialpack-take-failed", pluginId to "pluginId")
+                return
+            }
         when (packManager.tryConsumeDurably(player, element.material, amount)) {
             MaterialPackManager.TradeResult.OK -> {
-                player.giveItem(buildItem(element.material), amount)
+                journal.mark("COMMITTED")
+                player.giveItem(item)
+                journal.mark("DELIVERED")
                 open(player)
             }
-            MaterialPackManager.TradeResult.NOT_ENOUGH -> Unit
-            MaterialPackManager.TradeResult.PERSIST_FAILED ->
+            MaterialPackManager.TradeResult.NOT_ENOUGH -> journal.mark("NOT_ENOUGH")
+            MaterialPackManager.TradeResult.PERSIST_FAILED -> {
+                journal.mark("NOT_COMMITTED")
                 player.sendLang("message-materialpack-take-failed", pluginId to "pluginId")
+            }
+            MaterialPackManager.TradeResult.PERSIST_UNKNOWN -> {
+                journal.mark("UNKNOWN")
+                player.sendLang("message-materialpack-trade-unknown", pluginId to "pluginId")
+            }
         }
     }
 

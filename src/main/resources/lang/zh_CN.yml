@@ -102,3 +102,5 @@ message-paste-susses: '&8[&3&l{pluginId}&8] &7粘贴成功, 材料已按方块�
 message-paste-preview:
   - '&8[&3&l{pluginId}&8] &7将覆盖 &f{cells} &7格 (其中非空气 &f{blocks} &7格, 涉及 &f{kinds} &7种材料)'
   - '&8[&3&l{pluginId}&8] &7确认就再点一次粘贴按钮, 或输入 &f/pwe paste'
+
+message-materialpack-trade-unknown: "&c材料交易结果暂时无法确认，已暂停此账号交易。请联系管理员核对交易记录，不要重复操作。"
