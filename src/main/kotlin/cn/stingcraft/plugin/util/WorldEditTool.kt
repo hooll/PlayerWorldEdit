@@ -49,15 +49,22 @@ object WorldEditTool {
         }
     }
 
+    /** 保留既有 JVM 签名及 Kotlin 默认 actor 入口。 */
+    fun setBlocks(world: World, region: Region, blockState: BaseBlock, actor: Actor? = null): Int =
+        setBlocks(world, region, blockState, actor) {}
+
     /** 每格接受后立即发布进度, 不依赖整个循环或 close 正常返回。 */
-    fun setBlocks(
-        world: World, region: Region, blockState: BaseBlock, actor: Actor? = null,
-        onWritten: (BaseBlock) -> Unit = {}
+    internal fun setBlocks(
+        world: World, region: Region, blockState: BaseBlock, actor: Actor?,
+        onWritten: (BaseBlock) -> Unit
     ): Int = writeBlocks(world, region, actor, { _, _, _ -> blockState }, onWritten)
 
-    fun replaceBlocks(
-        world: World, region: Region, from: BaseBlock, to: BaseBlock, actor: Actor? = null,
-        onWritten: (BaseBlock) -> Unit = {}
+    fun replaceBlocks(world: World, region: Region, from: BaseBlock, to: BaseBlock, actor: Actor? = null): Int =
+        replaceBlocks(world, region, from, to, actor) {}
+
+    internal fun replaceBlocks(
+        world: World, region: Region, from: BaseBlock, to: BaseBlock, actor: Actor?,
+        onWritten: (BaseBlock) -> Unit
     ): Int {
         val session = newSession(world, actor)
         return writeSession(session, { session.close() }, region, { vector ->
@@ -109,12 +116,17 @@ object WorldEditTool {
     }
 
     fun setBlocksIf(
+        world: World, region: Region, blockState: BaseBlock, actor: Actor?,
+        contains: (x: Int, y: Int, z: Int) -> Boolean
+    ): Int = setBlocksIf(world, region, blockState, actor, contains) {}
+
+    internal fun setBlocksIf(
         world: World,
         region: Region,
         blockState: BaseBlock,
         actor: Actor?,
         contains: (x: Int, y: Int, z: Int) -> Boolean,
-        onWritten: (BaseBlock) -> Unit = {}
+        onWritten: (BaseBlock) -> Unit
     ): Int = writeBlocks(world, region, actor,
         { x, y, z -> if (contains(x, y, z)) blockState else null }, onWritten)
 
