@@ -2,7 +2,7 @@ package cn.stingcraft.plugin.hook
 
 import com.sk89q.worldedit.bukkit.BukkitAdapter
 import com.sk89q.worldedit.math.BlockVector3
-import com.sk89q.worldguard.LocalPlayer
+import com.sk89q.worldguard.protection.association.RegionAssociable
 import com.sk89q.worldguard.WorldGuard
 import com.sk89q.worldguard.bukkit.WorldGuardPlugin
 import com.sk89q.worldguard.protection.ApplicableRegionSet
@@ -51,8 +51,7 @@ private const val MAX_CELLS = 4096
  *    `BUILD 或 BLOCK_BREAK` (见 [testBuild]), 两项都要时**两项都要求** —— 原来 needBreak=true 时
  *    把 PLACE 换成了 BREAK, 覆盖类操作因此漏了放置权限 (R5)。
  *
- * 格元按立方体近似多边形区域: WG 的区域可以是多边形 (2D), 一个格元里多边形可能只覆盖一部分, 这时
- * 该格元按"区域适用"处理 —— 方向是**更严**而不是漏 (与"贴边也算相交"同一个取向)。
+ * 多边形或未知区域形状与操作相交时明确拒绝, 不用外接框近似放行。
  */
 object WorldGuardHook : RegionProtectionHook {
 
@@ -87,19 +86,24 @@ object WorldGuardHook : RegionProtectionHook {
      *
      * 只有全局区域适用时一次查询就够 (全局区域在任何位置都适用, 不存在"位置不同组合不同")。
      */
-    private fun firstDenied(
+    internal fun firstDenied(
         regionManager: RegionManager,
         box: ProtectedCuboidRegion,
-        player: LocalPlayer,
+        player: RegionAssociable,
         requirement: AreaPermission
     ): String? {
         val applicable = regionManager.getApplicableRegions(box)
         val named = applicable.regions.filter { it.id != GLOBAL_REGION_ID }
+        // 外接框切格只能证明轴对齐长方体内的成员集合不变。
+        // 非长方体不得将空间分离的优先级合并解析; 当前不支持精确划分, 明确拒绝。
+        require(named.all { it is ProtectedCuboidRegion }) {
+            "Non-cuboid WorldGuard region intersects the edit; exact permission coverage unavailable"
+        }
         if (named.isEmpty()) {
             return if (allowed(applicable, player, requirement)) null else regionNameAt(applicable)
         }
         for (cell in cellBoxes(box, named)) {
-            val cellSet = regionManager.getApplicableRegions(cell)
+            val cellSet = regionManager.getApplicableRegions(cell.minimumPoint)
             if (!allowed(cellSet, player, requirement)) {
                 return regionNameAt(cellSet)
             }
@@ -163,7 +167,7 @@ object WorldGuardHook : RegionProtectionHook {
      * "BUILD 或 BREAK", 两项都要就是两次都通过。原来 needBreak=true 时把 PLACE 换成 BREAK, 等于
      * "BUILD 或 BREAK", 放置那一项从来没查过 (R5)。
      */
-    private fun allowed(applicable: ApplicableRegionSet, player: LocalPlayer, requirement: AreaPermission): Boolean {
+    private fun allowed(applicable: ApplicableRegionSet, player: RegionAssociable, requirement: AreaPermission): Boolean {
         if (requirement.needsPlace && !testBuild(applicable, player, Flags.BLOCK_PLACE)) {
             return false
         }
@@ -185,7 +189,7 @@ object WorldGuardHook : RegionProtectionHook {
      * 把传进去的多个 flag 当"与", 而且不含 BUILD —— `testState(player, BUILD, PLACE)` 会变成
      * "BUILD 且 PLACE", 与 `testBuild` 的"BUILD 或 PLACE"不是一个语义。
      */
-    private fun testBuild(applicable: ApplicableRegionSet, player: LocalPlayer, flag: StateFlag): Boolean {
+    private fun testBuild(applicable: ApplicableRegionSet, player: RegionAssociable, flag: StateFlag): Boolean {
         val buildState = applicable.queryState(player, Flags.BUILD)
         val flagState = applicable.queryState(player, flag)
         return StateFlag.test(StateFlag.combine(StateFlag.denyToNone(buildState), flagState))

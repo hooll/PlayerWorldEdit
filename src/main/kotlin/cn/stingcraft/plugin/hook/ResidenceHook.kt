@@ -93,7 +93,7 @@ object ResidenceHook : RegionProtectionHook {
      * 裸露的那部分负责 —— 完全落在许可子领地里的操作不会被父领地拒掉; 反过来, 父领地的裸露部分
      * 依然照查 (不是简单交换父子顺序)。
      */
-    private fun firstDenied(
+    internal fun firstDenied(
         player: Player,
         residence: Any,
         box: ProtectionBox,
@@ -160,7 +160,7 @@ object ResidenceHook : RegionProtectionHook {
      * `com.bekvon.bukkit.residence.protection.Area`, 实际 **没有** 无参 `getArea()`, 类名也是
      * `CuboidArea`; 一个领地可以有多块区域, 所以用 `getAreaArray()` 逐块比。
      */
-    private class Targets(
+    internal class Targets(
         val residenceManager: Any,
         val getResidences: Method,
         val getSubzones: Method,
@@ -180,32 +180,39 @@ object ResidenceHook : RegionProtectionHook {
         fun allResidences(): List<Any> {
             val map = getResidences.invoke(residenceManager) as? Map<*, *>
                 ?: throw IllegalStateException("ResidenceManager.getResidences() 返回 null")
-            return map.values.filterNotNull()
+            return map.values.map { requireNotNull(it) { "Null Residence entry" } }
         }
 
         /** 子领地 (没有子领地时返回空表) */
         fun subzonesOf(residence: Any): List<Any> {
-            val subzones = getSubzones.invoke(residence) as? List<*> ?: return emptyList()
-            return subzones.filterNotNull()
+            val subzones = getSubzones.invoke(residence) as? List<*>
+                ?: throw IllegalStateException("Unreadable Residence subzones")
+            return subzones.map { requireNotNull(it) { "Null Residence subzone" } }
         }
 
         /**
          * 这个领地各块区域与操作框的**交集** (跨世界的区域跳过; 不相交的也不返回)
          *
          * 逐块 `CuboidArea` 比: 一个领地可以有多块区域 (getAreaArray), 每块带自己的世界名, 跨世界的
-         * 同名区域不能参与比较。取不到区域 (返回 null) 或位置读不出来时按"整块操作框都算这个领地的"
-         * 处理 —— 宁可多查一次旗, 也不能因为反射拿不到区域就把保护漏过去。
+         * 同名区域不能参与比较。未知几何必须抛错, 不可当成完整覆盖从父区扣除。
          *
          * 返回交集而不是布尔值: 父领地只对"自己独占的那部分"负责, 需要用它算盒减法 (R7)。
          */
         fun intersections(residence: Any, box: ProtectionBox): List<ProtectionBox> {
-            val areas = getAreaArray.invoke(residence) as? Array<*> ?: return listOf(box)
+            val areas = getAreaArray.invoke(residence) as? Array<*>
+                ?: throw IllegalStateException("Unreadable Residence geometry")
+            require(areas.isNotEmpty()) { "Empty Residence geometry" }
             val result = ArrayList<ProtectionBox>(areas.size)
             for (area in areas) {
-                if (area == null) continue
-                if (getWorldName.invoke(area) != box.worldName) continue
-                val low = getLowLocation.invoke(area) as? Location ?: return listOf(box)
-                val high = getHighLocation.invoke(area) as? Location ?: return listOf(box)
+                requireNotNull(area) { "Null Residence area" }
+                val worldName = getWorldName.invoke(area) as? String
+                    ?: throw IllegalStateException("Unreadable Residence world name")
+                require(worldName.isNotBlank()) { "Blank Residence world name" }
+                if (worldName != box.worldName) continue
+                val low = getLowLocation.invoke(area) as? Location
+                    ?: throw IllegalStateException("Unreadable Residence low corner")
+                val high = getHighLocation.invoke(area) as? Location
+                    ?: throw IllegalStateException("Unreadable Residence high corner")
                 val areaBox = ProtectionBox(
                     box.worldName,
                     intArrayOf(
