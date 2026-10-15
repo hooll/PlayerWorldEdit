@@ -6,6 +6,7 @@ import cn.stingcraft.plugin.manager.WorldEditManager
 import cn.stingcraft.plugin.util.cancelWatchdogs
 import cn.stingcraft.plugin.util.EditLifecycle
 import cn.stingcraft.plugin.inventory.MaterialTradeJournal
+import java.util.UUID
 import taboolib.common.platform.function.warning
 import com.google.gson.GsonBuilder
 import taboolib.common.platform.Plugin
@@ -24,7 +25,11 @@ object PlayerWorldEdit : Plugin() {
     val worldEditManager = WorldEditManager()
 
     override fun onEnable() {
-        EditLifecycle.start()
+        if (!EditLifecycle.tryStart()) {
+            warning("[PlayerWorldEdit] 拒绝启用: 上一次停用未排空, 可能有玩家账目待核对。" +
+                " 请保持本插件停止接单, 完整重启服务端后按日志核对 material-transactions 与 undo 记录")
+            return
+        }
         MaterialTradeJournal.unresolvedPlayers().forEach { uuid ->
             packManager.suspendTrades(uuid)
             warning("[PlayerWorldEdit] $uuid 存在待核对材料交易, 已暂停交易, 请检查 material-transactions")
@@ -34,10 +39,20 @@ object PlayerWorldEdit : Plugin() {
 
     override fun onDisable() {
         val drained = runCatching { EditLifecycle.stop() }.getOrDefault(false)
-        if (!drained) warning("[PlayerWorldEdit] 停用时仍有操作未排空, 保留锁与在途快照, 不将其声明为完成")
+        // 未排空时把"结算还没跑的玩家"点名; 这些结算之后只会改缓存, 不会再触发保存 (G1)。
+        val pending = if (drained) emptySet<UUID>() else EditLifecycle.pendingOwners()
+        // 交易日志的阶段标记是异步写的, 停用前把队列清空, 未决记录才可用于人工核对 (G6)。
+        runCatching { MaterialTradeJournal.flushPending() }
+            .onFailure { warning("[PlayerWorldEdit] 交易日志停用前未写完: $it") }
         runCatching { cancelWatchdogs() }.onFailure { warning("[PlayerWorldEdit] 停止计时器失败: $it") }
         // 每份材料包独立保存。显示清理无论成功与否均不能阻断数据保存。
         runCatching { packManager.flushAll() }.onFailure { warning("[PlayerWorldEdit] 材料保存失败: $it") }
+        // 对"停用后才改缓存"的退料/返料再补一次保存; 仍失败的与 pending 一起点名 (G1)。
+        val stillUnsaved = runCatching { packManager.flushUnsaved() }.getOrDefault(emptySet())
+        val affected = (pending + stillUnsaved)
+        if (affected.isNotEmpty()) {
+            warning("[PlayerWorldEdit] 停用未完全排空, 以下玩家的退料/返料可能未落库, 请对照材料库与 undo 记录人工核对: $affected")
+        }
         runCatching { worldEditManager.clearDisplays() }.onFailure { warning("[PlayerWorldEdit] 显示清理失败: $it") }
     }
 

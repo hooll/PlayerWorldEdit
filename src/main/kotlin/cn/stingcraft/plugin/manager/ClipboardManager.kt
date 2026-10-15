@@ -324,6 +324,9 @@ class ClipboardManager(
         // 全有全无: 任何一种材料不够就一个方块都不写 (consumeAll 会把已扣的原样加回去)
         if (!pipeline.consumeAll(player, target.charges)) {
             pipeline.endEdit(player, edit.token)
+            // 有意保留预览 (G4): 材料不足不代表"目标框作废", 玩家补足材料后在有效期内同框再点
+            // 仍可直接贴 —— pasteOrPreview 的确认只看世界/坐标框/有效期。预览只在真贴成功或
+            // 过期后清除; 失败清掉会强迫玩家对着同一个框反复预览, 没有安全收益 (此分支零写入)。
             return
         }
         // 贴过了: 预览到此作废 (再点按钮应该重新预览, 而不是拿旧框直接贴)

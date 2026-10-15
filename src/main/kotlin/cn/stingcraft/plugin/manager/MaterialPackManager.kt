@@ -25,6 +25,9 @@ class MaterialPackManager internal constructor(
     /** 无法判明数据库提交结果的账号拒绝后续交易, 等待管理员核对。 */
     private val uncertain = ConcurrentHashMap.newKeySet<UUID>()
 
+    /** 停用后排空窗口内只改了缓存的 UUID; onDisable 末尾补存一次, 仍失败的在日志点名 (G1)。 */
+    private val unsaved = ConcurrentHashMap.newKeySet<UUID>()
+
     internal fun suspendTrades(uuid: UUID) { uncertain.add(uuid) }
 
 
@@ -107,6 +110,17 @@ class MaterialPackManager internal constructor(
                 .onSuccess { caches.remove(player.uniqueId) }
                 .onFailure { log("[PlayerWorldEdit] 退出保存失败 (${player.uniqueId}), 保留缓存: $it") }
         }
+    }
+
+    /** 停用收尾: 对只改了缓存的 UUID 补一次保存; 返回仍失败的集合, 由调用方点名。 */
+    fun flushUnsaved(): Set<UUID> {
+        val snapshot = synchronized(unsaved) { unsaved.toList() }
+        snapshot.forEach { uuid ->
+            runCatching { synchronized(lockOf(uuid)) { flushLocked(uuid) } }
+                .onSuccess { unsaved.remove(uuid) }
+                .onFailure { log("[PlayerWorldEdit] 停用补存失败 ($uuid), 保留缓存待人工核对: $it") }
+        }
+        return unsaved.toSet()
     }
 
     /** 关服: 把所有还没落盘的缓存写回去 */
@@ -226,6 +240,7 @@ class MaterialPackManager internal constructor(
                     packMaterials.add(MaterialEntry(newEntry.material, newEntry.amount))
                 }
             }
+            true
         }
     }
 
@@ -244,6 +259,7 @@ class MaterialPackManager internal constructor(
             } else {
                 materialEntry.amount += amount
             }
+            true
         }
     }
 
@@ -266,6 +282,7 @@ class MaterialPackManager internal constructor(
                     break
                 }
             }
+            true
         }
     }
 
@@ -299,6 +316,9 @@ class MaterialPackManager internal constructor(
             check(uuid !in uncertain) { "Material trade outcome unresolved: $uuid" }
             val cached = caches[uuid]
             if (cached != null) {
+                if (!EditLifecycle.accepting && unsaved.add(uuid)) {
+                    log("[PlayerWorldEdit] 停用后的退料/返料只改了缓存 ($uuid), 已标记待人工核对, 不再自动触发落库")
+                }
                 return block(cached)
             }
             val materialPack = store.read(uuid)

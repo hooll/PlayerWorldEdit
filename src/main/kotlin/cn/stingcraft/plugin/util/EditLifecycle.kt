@@ -1,6 +1,8 @@
 package cn.stingcraft.plugin.util
 
 import taboolib.common.platform.function.submitAsync
+import org.bukkit.entity.Player
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -14,10 +16,32 @@ internal object EditLifecycle {
     private val completions = mutableSetOf<Completion>()
     private val failedSettlements = AtomicInteger()
 
-    @Synchronized fun start() {
-        check(batches.isEmpty() && completions.isEmpty() && failedSettlements.get() == 0) { "Previous operations have not drained" }
-        state = State.RUNNING
+    /** 重新启用: 上一停用未排空时拒绝并给出可读日志, 不把异常抛回启用流程 (G2)。 */
+    @Synchronized fun tryStart(): Boolean {
+        return try {
+            check(batches.isEmpty() && completions.isEmpty() && failedSettlements.get() == 0)
+                { "Previous operations have not drained" }
+            state = State.RUNNING
+            true
+        } catch (error: IllegalStateException) {
+            java.util.logging.Logger.getLogger("PlayerWorldEdit").warning(
+                "拒绝启用: 上一停用未排空 (在途批次=${batches.size}, 待结算=${completions.size}, 失败结算=${failedSettlements.get()})," +
+                    " 保持停止接单状态, 请完整重启服务端: $error"
+            )
+            false
+        }
     }
+
+    /** 已登记但尚未执行的结算归属 (结算可能在停用后才运行), 供停用收尾点名受影响玩家 (G1)。 */
+    @Synchronized fun pendingOwners(): Set<UUID> = completions.mapNotNull { completion ->
+        when (val owner = completion.owner) {
+            is UUID -> owner
+            is Player -> owner.uniqueId
+            else -> null
+        }
+    }.toSet()
+
+    /** 收尾后 (可能晚于停用) 的退料/返料记录在 MaterialPackManager.unsaved; 这里仅为归属对账预留。 */
 
     @Synchronized fun register(batch: BatchDrain): Boolean {
         if (!accepting) return false
