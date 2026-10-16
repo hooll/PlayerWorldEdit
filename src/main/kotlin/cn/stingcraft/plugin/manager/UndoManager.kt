@@ -3,7 +3,6 @@ package cn.stingcraft.plugin.manager
 import cn.stingcraft.plugin.PlayerWorldEdit
 import cn.stingcraft.plugin.util.nbtFrom
 import cn.stingcraft.plugin.util.nbtOf
-import com.google.gson.reflect.TypeToken
 import com.sk89q.worldedit.math.BlockVector3
 import com.sk89q.worldedit.regions.CuboidRegion
 import com.sk89q.worldedit.registry.state.Property
@@ -15,8 +14,6 @@ import org.bukkit.entity.Player
 import taboolib.common.platform.function.getDataFolder
 import cn.stingcraft.plugin.util.submitCompletion
 import taboolib.common.platform.function.warning
-import taboolib.expansion.getAutoDataContainer
-import taboolib.expansion.releaseAutoDataContainer
 import java.io.File
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -82,12 +79,8 @@ sealed interface UndoPoll {
  */
 object UndoManager {
 
-    /** 旧版本把记录写在玩家数据的这个键里, 第一次用到时会迁移过来 */
-    private const val LEGACY_KEY = "undoRecords"
-
     // 同一个玩家的读写不能交叉
     private val locks = ConcurrentHashMap<UUID, Any>()
-    private val migrated = ConcurrentHashMap.newKeySet<UUID>()
 
     /** 同一毫秒内写多条时用来区分文件名 */
     private val sequence = AtomicLong()
@@ -162,7 +155,6 @@ object UndoManager {
     fun poll(player: Player): UndoPoll {
         val uuid = player.uniqueId
         return synchronized(lockOf(uuid)) {
-            migrateLegacy(uuid)
             val queued = queueOf(uuid).removeLastOrNull()
             if (queued != null) {
                 return@synchronized takeQueued(uuid, queued)
@@ -204,7 +196,6 @@ object UndoManager {
     /** 同步入队, 顺带把超出 [limit] 的旧记录裁掉 */
     private fun enqueue(uuid: UUID, record: UndoRecord, limit: Int): QueuedRecord {
         synchronized(lockOf(uuid)) {
-            migrateLegacy(uuid)
             val queue = queueOf(uuid)
             val keep = limit.coerceAtLeast(1)
             while (queue.size >= keep) {
@@ -305,43 +296,6 @@ object UndoManager {
     private fun queueOf(uuid: UUID): ArrayDeque<QueuedRecord> = queues.computeIfAbsent(uuid) { ArrayDeque() }
 
     private fun consumedKey(uuid: UUID, name: String): String = "$uuid/$name"
-
-    /**
-     * 把旧版本存在玩家数据里的记录搬成文件, 每个玩家只做一次
-     */
-    private fun migrateLegacy(uuid: UUID) {
-        if (!migrated.add(uuid)) {
-            return
-        }
-        try {
-            runCatching {
-                val container = uuid.getAutoDataContainer()
-                val raw = container[LEGACY_KEY] ?: return@runCatching
-                if (raw.isEmpty()) {
-                    return@runCatching
-                }
-                val type = object : TypeToken<List<StoredUndoRecord>>() {}.type
-                val legacy: List<StoredUndoRecord> = PlayerWorldEdit.gson.fromJson(raw, type)
-                if (legacy.isEmpty()) {
-                    return@runCatching
-                }
-                val dir = dirOf(uuid).apply { mkdirs() }
-                legacy.forEach { stored ->
-                    runCatching {
-                        val file = File(dir, nextFileName())
-                        GZIPOutputStream(file.outputStream()).bufferedWriter(Charsets.UTF_8).use { writer ->
-                            PlayerWorldEdit.gson.toJson(stored, writer)
-                        }
-                    }
-                }
-                container[LEGACY_KEY] = ""
-            }.onFailure {
-                warning("[PlayerWorldEdit] 迁移旧撤销记录失败: $it")
-            }
-        } finally {
-            uuid.releaseAutoDataContainer()
-        }
-    }
 
     private fun UndoRecord.toStored(): StoredUndoRecord {
         return StoredUndoRecord(
